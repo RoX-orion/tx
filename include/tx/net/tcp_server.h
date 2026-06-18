@@ -31,8 +31,8 @@ public:
     void connect(const std::string& host, uint16_t port, ConnectCb cb);
 
     // Send data
-    void send(const uint8_t* data, size_t len);
-    void send(Buffer& buf);
+    bool send(const uint8_t* data, size_t len);
+    bool send(Buffer& buf);
 
     // Start/stop reading
     void start_read(ReadCallback cb);
@@ -52,6 +52,7 @@ public:
     // Remote address
     const std::string& remote_addr() const { return remote_addr_; }
     uint16_t remote_port() const { return remote_port_; }
+    size_t pending_write_bytes() const { return pending_write_bytes_; }
 
 private:
     static void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
@@ -71,11 +72,16 @@ private:
     Buffer       read_buf_;
     std::string  remote_addr_;
     uint16_t     remote_port_;
+    size_t       pending_write_bytes_;
+    size_t       write_high_watermark_;
+    size_t       write_low_watermark_;
+    bool         paused_for_write_;
 
     struct WriteReq {
         uv_write_t req;
         uv_buf_t   buf;
         char*      data;
+        size_t     len;
     };
     static void on_write_free(uv_write_t* req, int status);
 };

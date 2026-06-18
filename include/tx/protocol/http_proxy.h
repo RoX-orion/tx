@@ -13,6 +13,11 @@ namespace tx {
 // Parses the initial CONNECT request, extracts target, then tunnels data.
 class HttpProxyHandler {
 public:
+    enum class Mode {
+        Connect,
+        Plain,
+    };
+
     enum class State {
         Request,      // Parsing HTTP request line + headers
         Connected,    // Tunnel established, raw forwarding
@@ -34,7 +39,9 @@ public:
     void build_error_response(int status_code, Buffer& out);
 
     State state() const { return state_; }
+    Mode mode() const { return mode_; }
     const TargetAddr& target() const { return target_; }
+    const Buffer& initial_payload() const { return initial_payload_; }
 
     void set_target_callback(TargetCallback cb) { target_cb_ = std::move(cb); }
 
@@ -46,6 +53,8 @@ private:
     TargetAddr target_;
     TargetCallback target_cb_;
     size_t header_end_;       // Position after headers (start of body/tunnel data)
+    Mode mode_;
+    Buffer initial_payload_;
 };
 
 } // namespace tx

@@ -4,6 +4,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#include <cstdlib>
+
+static void check(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
 
 static void test_connect_request() {
     printf("  test_connect_request... ");
@@ -66,6 +73,36 @@ static void test_connect_response() {
     printf("OK\n");
 }
 
+static void test_plain_http_request() {
+    printf("  test_plain_http_request... ");
+    tx::HttpProxyHandler handler;
+
+    bool target_called = false;
+    handler.set_target_callback([&](const tx::TargetAddr& t) {
+        target_called = true;
+        assert(t.type == tx::AddrType::Domain);
+        assert(t.host == "example.com");
+        assert(t.port == 80);
+    });
+
+    const char* request =
+        "GET http://example.com/path?q=1 HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "\r\n";
+
+    size_t consumed = handler.feed(reinterpret_cast<const uint8_t*>(request), strlen(request));
+    check(consumed == strlen(request));
+    check(handler.state() == tx::HttpProxyHandler::State::Connected);
+    check(handler.mode() == tx::HttpProxyHandler::Mode::Plain);
+    check(target_called);
+
+    std::string rewritten(reinterpret_cast<const char*>(handler.initial_payload().data()),
+                          handler.initial_payload().readable());
+    check(rewritten.find("GET /path?q=1 HTTP/1.1\r\n") == 0);
+
+    printf("OK\n");
+}
+
 static void test_ipv6_connect_request() {
     printf("  test_ipv6_connect_request... ");
     tx::HttpProxyHandler handler;
@@ -112,6 +149,7 @@ int main() {
     test_connect_request();
     test_partial_request();
     test_connect_response();
+    test_plain_http_request();
     test_ipv6_connect_request();
     test_invalid_port();
     printf("All HTTP proxy tests passed!\n");

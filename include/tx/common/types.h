@@ -60,9 +60,10 @@ struct TargetAddr {
 
 // Tunnel command types
 enum class TunnelCmd : uint8_t {
-    Connect    = 0x01,
-    Data       = 0x02,
-    Disconnect = 0x03,
+    Connect       = 0x01,
+    Data          = 0x02,
+    Disconnect    = 0x03,
+    ConnectResult = 0x04,
 };
 
 // Route decision

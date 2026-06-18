@@ -24,8 +24,8 @@ bool ClientApp::init(const ClientConfig& config) {
     config_ = config;
 
     // Initialize crypto — deterministic key from password (must match server)
-    auto key = KeyDeriver::derive_deterministic(config.password);
-    auto aes = std::make_shared<AesGcm>(key.data(), key.size());
+    tunnel_master_key_ = KeyDeriver::derive_deterministic(config.password);
+    auto aes = std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size());
     tunnel_codec_ = TunnelCodec(aes);
 
     // Load router
@@ -74,6 +74,7 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->http = std::make_unique<HttpProxyHandler>();
     conn->route = RouteAction::Proxy;
     conn->connected = false;
+    conn->connect_result_sent = false;
     conn->target_dispatched = false;
     conn->session_id = next_session_id_++;
 
@@ -107,6 +108,11 @@ void ClientApp::on_http_accept(SessionPtr session) {
             // Parse HTTP CONNECT headers
             size_t consumed = conn->http->feed(conn->proto_buf.data(), conn->proto_buf.readable());
             conn->proto_buf.consume(consumed);
+            if (conn->http->state() == HttpProxyHandler::State::Connected &&
+                conn->http->mode() == HttpProxyHandler::Mode::Plain) {
+                conn->proto_buf.clear();
+                conn->proto_buf.append(conn->http->initial_payload());
+            }
             if (conn->http->state() == HttpProxyHandler::State::Error) {
                 Buffer resp;
                 conn->http->build_error_response(400, resp);
@@ -130,6 +136,7 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->http = nullptr;
     conn->route = RouteAction::Proxy;
     conn->connected = false;
+    conn->connect_result_sent = false;
     conn->target_dispatched = false;
     conn->session_id = next_session_id_++;
 
@@ -209,6 +216,8 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     if (action == RouteAction::Direct) {
         // GeoSite matched → direct
         conn->route = RouteAction::Direct;
+        TX_INFO("Route decision: %s:%u -> direct (geosite)",
+                conn->target.host.c_str(), conn->target.port);
         connect_direct(conn);
         return;
     }
@@ -217,6 +226,8 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     // resolve the target from its network; local DNS can fail or be polluted.
     if (conn->target.type == AddrType::Domain) {
         conn->route = RouteAction::Proxy;
+        TX_INFO("Route decision: %s:%u -> tunnel (domain)",
+                conn->target.host.c_str(), conn->target.port);
         connect_via_tunnel(conn);
         return;
     }
@@ -225,8 +236,12 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     conn->route = router_.decide_by_ip(ip);
 
     if (conn->route == RouteAction::Direct) {
+        TX_INFO("Route decision: %s:%u -> direct (geoip)",
+                conn->target.host.c_str(), conn->target.port);
         connect_direct(conn);
     } else {
+        TX_INFO("Route decision: %s:%u -> tunnel (geoip/default)",
+                conn->target.host.c_str(), conn->target.port);
         connect_via_tunnel(conn);
     }
 }
@@ -267,7 +282,8 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
                 Buffer resp;
                 conn->socks5->build_connect_response(true, resp);
                 conn->local_session->send(resp);
-            } else if (conn->http) {
+            } else if (conn->http &&
+                       conn->http->mode() == HttpProxyHandler::Mode::Connect) {
                 Buffer resp;
                 conn->http->build_connect_response(resp);
                 conn->local_session->send(resp);
@@ -326,25 +342,26 @@ bool ClientApp::ensure_tunnel() {
     tunnel_session_->connect(config_.server_host, config_.server_port,
         [this](bool success) {
             if (success) {
-                tunnel_connecting_ = false;
-                tunnel_connected_ = true;
+                tunnel_handshake_buf_.clear();
+                tunnel_client_nonce_.clear();
                 TX_INFO("Tunnel connected to %s:%u",
                         config_.server_host.c_str(), config_.server_port);
 
                 tunnel_session_->start_read([this](SessionPtr, Buffer& data) {
-                    on_tunnel_read(data);
+                    on_tunnel_handshake_read(data);
                 });
 
-                auto pending = pending_tunnel_conns_;
-                pending_tunnel_conns_.clear();
-                for (auto& conn : pending) {
-                    activate_tunnel_connection(conn);
+                Buffer hello;
+                if (!TunnelCodec::build_client_hello(tunnel_master_key_, hello,
+                                                      tunnel_client_nonce_)) {
+                    TX_ERROR("Failed to build tunnel handshake");
+                    fail_pending_tunnel_connections();
+                    if (tunnel_session_ && !tunnel_session_->is_closed()) {
+                        tunnel_session_->close();
+                    }
+                    return;
                 }
-
-                // Flush any buffered data
-                if (!tunnel_send_buf_.empty()) {
-                    tunnel_session_->send(tunnel_send_buf_);
-                }
+                tunnel_session_->send(hello);
             } else {
                 tunnel_connecting_ = false;
                 tunnel_connected_ = false;
@@ -360,6 +377,62 @@ bool ClientApp::ensure_tunnel() {
     return true;
 }
 
+void ClientApp::on_tunnel_handshake_read(Buffer& data) {
+    tunnel_handshake_buf_.append(data);
+    data.clear();
+
+    if (tunnel_handshake_buf_.readable() < TunnelCodec::kHandshakeSize) {
+        return;
+    }
+
+    std::vector<uint8_t> server_nonce;
+    if (!TunnelCodec::parse_server_hello(tunnel_master_key_, tunnel_client_nonce_,
+                                          tunnel_handshake_buf_.data(),
+                                          TunnelCodec::kHandshakeSize,
+                                          server_nonce)) {
+        TX_ERROR("Tunnel handshake failed");
+        fail_pending_tunnel_connections();
+        if (tunnel_session_ && !tunnel_session_->is_closed()) {
+            tunnel_session_->close();
+        }
+        return;
+    }
+
+    tunnel_handshake_buf_.consume(TunnelCodec::kHandshakeSize);
+    finish_tunnel_handshake(server_nonce);
+
+    if (!tunnel_handshake_buf_.empty()) {
+        on_tunnel_read(tunnel_handshake_buf_);
+    }
+}
+
+void ClientApp::finish_tunnel_handshake(const std::vector<uint8_t>& server_nonce) {
+    auto session_key = TunnelCodec::derive_session_key(tunnel_master_key_,
+                                                       tunnel_client_nonce_,
+                                                       server_nonce);
+    auto aes = std::make_shared<AesGcm>(session_key.data(), session_key.size());
+    tunnel_codec_ = TunnelCodec(aes);
+    tunnel_client_nonce_.clear();
+
+    tunnel_connecting_ = false;
+    tunnel_connected_ = true;
+    TX_INFO("Tunnel handshake complete");
+
+    tunnel_session_->start_read([this](SessionPtr, Buffer& data) {
+        on_tunnel_read(data);
+    });
+
+    auto pending = pending_tunnel_conns_;
+    pending_tunnel_conns_.clear();
+    for (auto& conn : pending) {
+        activate_tunnel_connection(conn);
+    }
+
+    if (!tunnel_send_buf_.empty()) {
+        tunnel_session_->send(tunnel_send_buf_);
+    }
+}
+
 void ClientApp::activate_tunnel_connection(ProxyConnPtr conn) {
     if (!conn || conn->connected ||
         !conn->local_session || conn->local_session->is_closed()) {
@@ -372,12 +445,22 @@ void ClientApp::activate_tunnel_connection(ProxyConnPtr conn) {
 
     tunnel_send_connect(conn);
     conn->connected = true;
+}
+
+void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
+    if (!conn || conn->connect_result_sent ||
+        !conn->local_session || conn->local_session->is_closed()) {
+        return;
+    }
+
+    conn->connect_result_sent = true;
 
     if (conn->socks5) {
         Buffer resp;
         conn->socks5->build_connect_response(true, resp);
         conn->local_session->send(resp);
-    } else if (conn->http) {
+    } else if (conn->http &&
+               conn->http->mode() == HttpProxyHandler::Mode::Connect) {
         Buffer resp;
         conn->http->build_connect_response(resp);
         conn->local_session->send(resp);
@@ -394,17 +477,16 @@ void ClientApp::activate_tunnel_connection(ProxyConnPtr conn) {
     }
 }
 
-void ClientApp::fail_pending_tunnel_connections() {
-    auto pending = pending_tunnel_conns_;
-    pending_tunnel_conns_.clear();
-    tunnel_send_buf_.clear();
+void ClientApp::fail_tunnel_connection(ProxyConnPtr conn) {
+    if (!conn) return;
 
-    for (auto& conn : pending) {
-        if (!conn || conn->connected) continue;
+    connections_.erase(conn->session_id);
 
-        connections_.erase(conn->session_id);
-        if (!conn->local_session || conn->local_session->is_closed()) continue;
+    if (!conn->local_session || conn->local_session->is_closed()) {
+        return;
+    }
 
+    if (!conn->connect_result_sent) {
         if (conn->socks5) {
             Buffer resp;
             conn->socks5->build_connect_response(false, resp);
@@ -414,6 +496,20 @@ void ClientApp::fail_pending_tunnel_connections() {
             conn->http->build_error_response(502, resp);
             conn->local_session->send(resp);
         }
+        return;
+    }
+
+    conn->local_session->close();
+}
+
+void ClientApp::fail_pending_tunnel_connections() {
+    auto pending = pending_tunnel_conns_;
+    pending_tunnel_conns_.clear();
+    tunnel_send_buf_.clear();
+
+    for (auto& conn : pending) {
+        if (!conn || conn->connected) continue;
+        fail_tunnel_connection(conn);
     }
 }
 
@@ -430,13 +526,22 @@ void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
 }
 
 void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) {
-    Buffer encoded;
-    if (tunnel_codec_.encode_data(conn->session_id, data, len, encoded)) {
+    const size_t max_payload = TunnelCodec::kMaxPlaintextSize - TunnelCodec::kDataHeaderSize;
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk_len = std::min(max_payload, len - offset);
+        Buffer encoded;
+        if (!tunnel_codec_.encode_data(conn->session_id, data + offset, chunk_len, encoded)) {
+            return;
+        }
+
         if (tunnel_connected_ && tunnel_session_) {
             tunnel_session_->send(encoded);
         } else {
             tunnel_send_buf_.append(encoded);
         }
+
+        offset += chunk_len;
     }
 }
 
@@ -472,16 +577,36 @@ void ClientApp::on_tunnel_read(Buffer& data) {
                 }
                 break;
 
+            case TunnelCmd::ConnectResult:
+                if (!payload.empty() && payload.data()[0] == 1) {
+                    complete_tunnel_connection(conn);
+                } else {
+                    TX_DEBUG("Tunnel connect failed for session %u", session_id);
+                    fail_tunnel_connection(conn);
+                }
+                break;
+
             case TunnelCmd::Disconnect:
                 TX_DEBUG("Tunnel disconnect for session %u", session_id);
-                if (conn->local_session && !conn->local_session->is_closed()) {
-                    conn->local_session->close();
-                }
-                connections_.erase(it);
+                fail_tunnel_connection(conn);
                 break;
 
             default:
                 break;
+        }
+    }
+
+    if (tunnel_codec_.has_protocol_error()) {
+        TX_ERROR("Closing tunnel because remote data is not valid TX tunnel protocol");
+        tunnel_codec_.clear_protocol_error();
+        fail_pending_tunnel_connections();
+        auto connections = std::move(connections_);
+        connections_.clear();
+        for (auto& kv : connections) {
+            fail_tunnel_connection(kv.second);
+        }
+        if (tunnel_session_ && !tunnel_session_->is_closed()) {
+            tunnel_session_->close();
         }
     }
 }

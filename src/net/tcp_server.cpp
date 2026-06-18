@@ -20,7 +20,11 @@ struct ConnectCtx {
 // ==================== TcpSession ====================
 
 TcpSession::TcpSession(uv_loop_t* loop)
-    : loop_(loop), closed_(false), reading_(false), remote_port_(0) {
+    : loop_(loop), closed_(false), reading_(false), remote_port_(0),
+      pending_write_bytes_(0),
+      write_high_watermark_(4 * 1024 * 1024),
+      write_low_watermark_(1024 * 1024),
+      paused_for_write_(false) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 }
@@ -112,13 +116,14 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     }
 }
 
-void TcpSession::send(const uint8_t* data, size_t len) {
-    if (closed_ || len == 0) return;
+bool TcpSession::send(const uint8_t* data, size_t len) {
+    if (closed_ || len == 0) return false;
 
     auto* wr = new WriteReq;
     wr->data = new char[len];
     memcpy(wr->data, data, len);
     wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
+    wr->len = len;
     wr->req.data = wr;
 
     int r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&tcp_),
@@ -127,18 +132,34 @@ void TcpSession::send(const uint8_t* data, size_t len) {
         TX_DEBUG("uv_write failed: %s", uv_strerror(r));
         delete[] wr->data;
         delete wr;
+        return false;
     }
+
+    pending_write_bytes_ += len;
+    if (pending_write_bytes_ > write_high_watermark_ && reading_) {
+        paused_for_write_ = true;
+        uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
+        reading_ = false;
+        TX_DEBUG("Write backlog high (%zu bytes), pausing reads", pending_write_bytes_);
+    }
+
+    return true;
 }
 
-void TcpSession::send(Buffer& buf) {
-    if (closed_ || buf.empty()) return;
-    send(buf.data(), buf.readable());
+bool TcpSession::send(Buffer& buf) {
+    if (closed_ || buf.empty()) return false;
+    if (!send(buf.data(), buf.readable())) {
+        return false;
+    }
     buf.clear();
+    return true;
 }
 
 void TcpSession::start_read(ReadCallback cb) {
-    if (closed_ || reading_) return;
+    if (closed_) return;
     read_cb_ = std::move(cb);
+    paused_for_write_ = false;
+    if (reading_) return;
     tcp_.data = this;
     int r = uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp_), on_alloc, on_read);
     if (r != 0) {
@@ -196,6 +217,26 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
 
 void TcpSession::on_write_free(uv_write_t* req, int status) {
     auto* wr = static_cast<WriteReq*>(req->data);
+    auto* self = static_cast<TcpSession*>(req->handle->data);
+    if (self && self->pending_write_bytes_ >= wr->len) {
+        self->pending_write_bytes_ -= wr->len;
+    } else if (self) {
+        self->pending_write_bytes_ = 0;
+    }
+
+    if (self && !self->closed_ && self->paused_for_write_ &&
+        self->pending_write_bytes_ <= self->write_low_watermark_ &&
+        self->read_cb_) {
+        self->paused_for_write_ = false;
+        int r = uv_read_start(reinterpret_cast<uv_stream_t*>(&self->tcp_),
+                              on_alloc, on_read);
+        if (r == 0) {
+            self->reading_ = true;
+        } else if (r != UV_EALREADY) {
+            TX_DEBUG("uv_read_start after write drain failed: %s", uv_strerror(r));
+        }
+    }
+
     if (status < 0 && status != UV_ECANCELED) {
         TX_DEBUG("Write error: %s", uv_strerror(status));
     }

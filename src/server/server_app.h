@@ -28,6 +28,8 @@ private:
     struct TunnelClient {
         SessionPtr       session;
         TunnelCodec      codec;
+        std::vector<uint8_t> master_key;
+        Buffer           handshake_buf;
         Buffer           recv_buf;
 
         // Outbound connections by session ID
@@ -42,6 +44,7 @@ private:
     using TunnelClientPtr = std::shared_ptr<TunnelClient>;
 
     void on_tunnel_accept(SessionPtr session);
+    void on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data);
     void on_tunnel_read(TunnelClientPtr client, Buffer& data);
     void on_tunnel_close(TunnelClientPtr client);
 
@@ -54,6 +57,7 @@ private:
     void tunnel_send_data(TunnelClientPtr client, SessionId sid,
                           const uint8_t* data, size_t len);
     void tunnel_send_disconnect(TunnelClientPtr client, SessionId sid);
+    void tunnel_send_connect_result(TunnelClientPtr client, SessionId sid, bool success);
 
     uv_loop_t*         loop_;
     ServerConfig       config_;

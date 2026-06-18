@@ -29,6 +29,10 @@ public:
     static constexpr size_t kMinFrameSize = kLenPrefixSize + AesGcm::kOverhead;
     static constexpr size_t kMaxPlaintextSize = 66000;
     static constexpr size_t kMaxEncryptedFrameSize = kMaxPlaintextSize + AesGcm::kOverhead;
+    static constexpr size_t kDataHeaderSize = 6;
+    static constexpr size_t kHandshakeNonceSize = 16;
+    static constexpr size_t kHandshakeMacSize = 32;
+    static constexpr size_t kHandshakeSize = 4 + 1 + kHandshakeNonceSize + kHandshakeMacSize;
 
     TunnelCodec() : aes_(nullptr) {}
     explicit TunnelCodec(std::shared_ptr<AesGcm> aes) : aes_(std::move(aes)) {}
@@ -48,6 +52,9 @@ public:
     // Encode DISCONNECT message
     bool encode_disconnect(SessionId session_id, Buffer& out);
 
+    // Encode CONNECT result message. Payload is a single byte: 1=success, 0=failure.
+    bool encode_connect_result(SessionId session_id, bool success, Buffer& out);
+
     // Decode one frame from buffer. Returns true if a complete message was decoded.
     // Consumes bytes from 'in'. Parsed fields stored in output params.
     bool decode(Buffer& in,
@@ -56,6 +63,26 @@ public:
                 Buffer& payload);
 
     std::shared_ptr<AesGcm> aes() const { return aes_; }
+    bool has_protocol_error() const { return protocol_error_; }
+    void clear_protocol_error() { protocol_error_ = false; }
+
+    static bool build_client_hello(const std::vector<uint8_t>& master_key,
+                                   Buffer& out,
+                                   std::vector<uint8_t>& client_nonce);
+    static bool parse_client_hello(const std::vector<uint8_t>& master_key,
+                                   const uint8_t* data, size_t len,
+                                   std::vector<uint8_t>& client_nonce);
+    static bool build_server_hello(const std::vector<uint8_t>& master_key,
+                                   const std::vector<uint8_t>& client_nonce,
+                                   Buffer& out,
+                                   std::vector<uint8_t>& server_nonce);
+    static bool parse_server_hello(const std::vector<uint8_t>& master_key,
+                                   const std::vector<uint8_t>& client_nonce,
+                                   const uint8_t* data, size_t len,
+                                   std::vector<uint8_t>& server_nonce);
+    static std::vector<uint8_t> derive_session_key(const std::vector<uint8_t>& master_key,
+                                                   const std::vector<uint8_t>& client_nonce,
+                                                   const std::vector<uint8_t>& server_nonce);
 
 private:
     // Build plaintext message body
@@ -65,6 +92,7 @@ private:
                          uint8_t* out, size_t out_len);
 
     std::shared_ptr<AesGcm> aes_;
+    bool protocol_error_ = false;
 };
 
 } // namespace tx

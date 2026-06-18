@@ -55,8 +55,11 @@ size_t Socks5Handler::parse_handshake(const uint8_t* data, size_t len) {
         }
     }
 
-    // We always reply NO AUTH for now
-    (void)found_noauth;
+    if (!found_noauth) {
+        TX_ERROR("SOCKS5 no supported authentication method");
+        state_ = Socks5State::Error;
+        return 2 + nmethods;
+    }
 
     state_ = Socks5State::Request;
     return 2 + nmethods;
@@ -130,6 +133,12 @@ size_t Socks5Handler::parse_request(const uint8_t* data, size_t len) {
 }
 
 void Socks5Handler::build_connect_response(bool success, Buffer& out) {
+    if (state_ == Socks5State::Error && !success) {
+        uint8_t auth_fail[] = {kSocks5Version, kMethodNoAccept};
+        out.append(auth_fail, sizeof(auth_fail));
+        return;
+    }
+
     // VER + REP + RSV + ATYP + BND.ADDR(4) + BND.PORT(2)
     uint8_t resp[10];
     resp[0] = kSocks5Version;

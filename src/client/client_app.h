@@ -46,6 +46,7 @@ private:
         Buffer               pending_data;        // Data buffered before tunnel connected
         Buffer               proto_buf;           // Protocol parsing buffer (survives across reads)
         bool                 connected;
+        bool                 connect_result_sent;
         bool                 target_dispatched;
     };
     using ProxyConnPtr = std::shared_ptr<ProxyConn>;
@@ -66,10 +67,14 @@ private:
     // Tunnel connection
     bool ensure_tunnel();
     void on_tunnel_read(Buffer& data);
+    void on_tunnel_handshake_read(Buffer& data);
+    void finish_tunnel_handshake(const std::vector<uint8_t>& server_nonce);
     void tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len);
     void tunnel_send_connect(ProxyConnPtr conn);
     void tunnel_send_disconnect(ProxyConnPtr conn);
     void activate_tunnel_connection(ProxyConnPtr conn);
+    void complete_tunnel_connection(ProxyConnPtr conn);
+    void fail_tunnel_connection(ProxyConnPtr conn);
     void fail_pending_tunnel_connections();
 
     // DNS resolution for routing
@@ -87,6 +92,9 @@ private:
     // Tunnel to server
     SessionPtr         tunnel_session_;
     TunnelCodec        tunnel_codec_;
+    std::vector<uint8_t> tunnel_master_key_;
+    std::vector<uint8_t> tunnel_client_nonce_;
+    Buffer             tunnel_handshake_buf_;
     bool               tunnel_connected_;
     bool               tunnel_connecting_;
 

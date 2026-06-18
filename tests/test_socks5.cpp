@@ -4,6 +4,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#include <cstdlib>
+
+static void check(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
 
 static void test_handshake() {
     printf("  test_handshake... ");
@@ -100,12 +107,31 @@ static void test_connect_response() {
     printf("OK\n");
 }
 
+static void test_no_supported_auth_method() {
+    printf("  test_no_supported_auth_method... ");
+    tx::Socks5Handler handler;
+
+    uint8_t handshake[] = {0x05, 0x01, 0x02};
+    size_t consumed = handler.feed(handshake, sizeof(handshake));
+    check(consumed == sizeof(handshake));
+    check(handler.state() == tx::Socks5State::Error);
+
+    tx::Buffer resp;
+    handler.build_connect_response(false, resp);
+    check(resp.readable() == 2);
+    check(resp.data()[0] == 0x05);
+    check(resp.data()[1] == 0xFF);
+
+    printf("OK\n");
+}
+
 int main() {
     printf("=== SOCKS5 Tests ===\n");
     test_handshake();
     test_connect_ipv4();
     test_connect_domain();
     test_connect_response();
+    test_no_supported_auth_method();
     printf("All SOCKS5 tests passed!\n");
     return 0;
 }

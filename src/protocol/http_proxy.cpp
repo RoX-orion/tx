@@ -7,7 +7,36 @@
 
 namespace tx {
 
-HttpProxyHandler::HttpProxyHandler() : state_(State::Request), header_end_(0) {}
+namespace {
+
+static bool starts_with_ci(const std::string& s, const char* prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (s.size() < prefix_len) return false;
+    for (size_t i = 0; i < prefix_len; ++i) {
+        if (std::tolower(static_cast<unsigned char>(s[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void set_addr_type(TargetAddr& target) {
+    struct in_addr v4;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET, target.host.c_str(), &v4) == 1) {
+        target.type = AddrType::IPv4;
+    } else if (inet_pton(AF_INET6, target.host.c_str(), &v6) == 1) {
+        target.type = AddrType::IPv6;
+    } else {
+        target.type = AddrType::Domain;
+    }
+}
+
+} // namespace
+
+HttpProxyHandler::HttpProxyHandler()
+    : state_(State::Request), header_end_(0), mode_(Mode::Connect) {}
 
 size_t HttpProxyHandler::feed(const uint8_t* data, size_t len) {
     if (state_ == State::Connected) {
@@ -45,25 +74,54 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
             }
             std::string request_line = headers.substr(0, first_line_end);
 
-            // Must start with CONNECT
-            if (request_line.substr(0, 8) != "CONNECT ") {
-                TX_ERROR("HTTP proxy: only CONNECT method supported, got: %s",
-                         request_line.substr(0, 20).c_str());
+            size_t method_end = request_line.find(' ');
+            size_t target_end = method_end == std::string::npos
+                                    ? std::string::npos
+                                    : request_line.find(' ', method_end + 1);
+            if (method_end == std::string::npos || target_end == std::string::npos) {
+                TX_ERROR("HTTP proxy: malformed request line: %s", request_line.c_str());
                 state_ = State::Error;
                 return true;
             }
 
-            // Extract host:port
-            size_t space_pos = request_line.find(' ', 8);
+            std::string method = request_line.substr(0, method_end);
+            std::string request_target =
+                request_line.substr(method_end + 1, target_end - method_end - 1);
+            std::string version = request_line.substr(target_end + 1);
+
             std::string host_port;
-            if (space_pos != std::string::npos) {
-                host_port = request_line.substr(8, space_pos - 8);
+            size_t consumed = i + 4;
+            if (method == "CONNECT") {
+                mode_ = Mode::Connect;
+                host_port = request_target;
+            } else if (starts_with_ci(request_target, "http://")) {
+                mode_ = Mode::Plain;
+                size_t authority_start = 7;
+                size_t path_start = request_target.find('/', authority_start);
+                host_port = request_target.substr(
+                    authority_start,
+                    path_start == std::string::npos
+                        ? std::string::npos
+                        : path_start - authority_start);
+
+                std::string path = path_start == std::string::npos
+                                       ? "/"
+                                       : request_target.substr(path_start);
+                std::string rewritten = method + " " + path + " " + version + "\r\n" +
+                                        headers.substr(first_line_end + 2) + "\r\n\r\n";
+                initial_payload_.clear();
+                initial_payload_.append(rewritten);
+                if (len > consumed) {
+                    initial_payload_.append(data + consumed, len - consumed);
+                }
             } else {
-                host_port = request_line.substr(8);
+                TX_ERROR("HTTP proxy: unsupported request target: %s",
+                         request_target.substr(0, 80).c_str());
+                state_ = State::Error;
+                return true;
             }
 
-            // Split host and port. IPv6 literals in CONNECT are bracketed:
-            // CONNECT [2001:db8::1]:443 HTTP/1.1
+            // Split host and port. IPv6 literals in CONNECT are bracketed.
             if (!host_port.empty() && host_port[0] == '[') {
                 size_t close = host_port.find(']');
                 if (close == std::string::npos) {
@@ -75,7 +133,7 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
                 if (close + 1 < host_port.size() && host_port[close + 1] == ':') {
                     target_.port = static_cast<uint16_t>(atoi(host_port.substr(close + 2).c_str()));
                 } else {
-                    target_.port = 443;
+                    target_.port = method == "CONNECT" ? 443 : 80;
                 }
             } else {
                 size_t colon_pos = host_port.rfind(':');
@@ -84,7 +142,7 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
                     target_.port = static_cast<uint16_t>(atoi(host_port.substr(colon_pos + 1).c_str()));
                 } else {
                     target_.host = host_port;
-                    target_.port = 80;
+                    target_.port = method == "CONNECT" ? 443 : 80;
                 }
             }
 
@@ -94,19 +152,13 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
                 return true;
             }
 
-            // Determine address type
-            struct in_addr v4;
-            struct in6_addr v6;
-            if (inet_pton(AF_INET, target_.host.c_str(), &v4) == 1) {
-                target_.type = AddrType::IPv4;
-            } else if (inet_pton(AF_INET6, target_.host.c_str(), &v6) == 1) {
-                target_.type = AddrType::IPv6;
-            } else {
-                target_.type = AddrType::Domain;
-            }
+            set_addr_type(target_);
+            header_end_ = mode_ == Mode::Plain ? len : consumed;
 
             state_ = State::Connected;
-            TX_INFO("HTTP CONNECT %s:%u", target_.host.c_str(), target_.port);
+            TX_INFO("HTTP %s %s:%u",
+                    mode_ == Mode::Connect ? "CONNECT" : "PLAIN",
+                    target_.host.c_str(), target_.port);
 
             if (target_cb_) {
                 target_cb_(target_);

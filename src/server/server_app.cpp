@@ -49,8 +49,9 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
     auto client = std::make_shared<TunnelClient>();
     client->session = session;
 
-    // Initialize crypto — deterministic key from password (must match client)
+    // Initialize with the deterministic master key for the authenticated handshake.
     auto key = KeyDeriver::derive_deterministic(config_.password);
+    client->master_key = key;
     auto aes = std::make_shared<AesGcm>(key.data(), key.size());
     client->codec = TunnelCodec(aes);
 
@@ -61,10 +62,63 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
     });
 
     session->start_read([this, client](SessionPtr, Buffer& data) {
-        client->recv_buf.append(data);
-        data.clear();
+        on_tunnel_handshake_read(client, data);
+    });
+}
+
+void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
+    client->handshake_buf.append(data);
+    data.clear();
+
+    if (client->handshake_buf.readable() < TunnelCodec::kHandshakeSize) {
+        return;
+    }
+
+    std::vector<uint8_t> client_nonce;
+    if (!TunnelCodec::parse_client_hello(client->master_key,
+                                          client->handshake_buf.data(),
+                                          TunnelCodec::kHandshakeSize,
+                                          client_nonce)) {
+        TX_ERROR("Tunnel handshake authentication failed");
+        if (client->session && !client->session->is_closed()) {
+            client->session->close();
+        }
+        return;
+    }
+
+    Buffer hello;
+    std::vector<uint8_t> server_nonce;
+    if (!TunnelCodec::build_server_hello(client->master_key, client_nonce,
+                                          hello, server_nonce)) {
+        TX_ERROR("Failed to build tunnel server hello");
+        if (client->session && !client->session->is_closed()) {
+            client->session->close();
+        }
+        return;
+    }
+
+    auto session_key = TunnelCodec::derive_session_key(client->master_key,
+                                                       client_nonce,
+                                                       server_nonce);
+    auto aes = std::make_shared<AesGcm>(session_key.data(), session_key.size());
+    client->codec = TunnelCodec(aes);
+
+    client->session->send(hello);
+    client->handshake_buf.consume(TunnelCodec::kHandshakeSize);
+    TX_INFO("Tunnel handshake complete for %s:%u",
+            client->session->remote_addr().c_str(), client->session->remote_port());
+
+    client->session->start_read([this, client](SessionPtr, Buffer& more) {
+        client->recv_buf.append(more);
+        more.clear();
         on_tunnel_read(client, client->recv_buf);
     });
+
+    if (!client->handshake_buf.empty()) {
+        client->recv_buf.append(client->handshake_buf);
+        client->handshake_buf.clear();
+        on_tunnel_read(client, client->recv_buf);
+    }
 }
 
 void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
@@ -84,6 +138,17 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
             case TunnelCmd::Disconnect:
                 handle_disconnect(client, session_id);
                 break;
+            case TunnelCmd::ConnectResult:
+                TX_DEBUG("Unexpected CONNECT_RESULT from client for session %u", session_id);
+                break;
+        }
+    }
+
+    if (client->codec.has_protocol_error()) {
+        TX_ERROR("Closing tunnel client because data is not valid TX tunnel protocol");
+        client->codec.clear_protocol_error();
+        if (client->session && !client->session->is_closed()) {
+            client->session->close();
         }
     }
 }
@@ -118,7 +183,7 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
             if (!success) {
                 TX_ERROR("Failed to connect to target for session %u: %s:%u",
                          sid, target.host.c_str(), target.port);
-                tunnel_send_disconnect(client, sid);
+                tunnel_send_connect_result(client, sid, false);
                 client->outbounds.erase(sid);
                 return;
             }
@@ -136,6 +201,8 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
 
             // Mark as connected and flush pending data
             it->second.connected = true;
+            tunnel_send_connect_result(client, sid, true);
+
             if (!it->second.pending_data.empty()) {
                 remote->send(it->second.pending_data);
                 it->second.pending_data.clear();
@@ -190,6 +257,15 @@ void ServerApp::tunnel_send_disconnect(TunnelClientPtr client, SessionId sid) {
     if (!client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_disconnect(sid, encoded)) {
+        client->session->send(encoded);
+    }
+}
+
+void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid,
+                                             bool success) {
+    if (!client->session || client->session->is_closed()) return;
+    Buffer encoded;
+    if (client->codec.encode_connect_result(sid, success, encoded)) {
         client->session->send(encoded);
     }
 }

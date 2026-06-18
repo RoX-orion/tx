@@ -1,0 +1,71 @@
+# IDE / editor
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# CMake build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+install_manifest.txt
+
+# Build outputs
+bin/
+lib/
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.pdb
+*.idb
+*.ilk
+*.exp
+
+# Test / coverage / profiling artifacts
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+coverage/
+
+# Logs and runtime dumps
+*.log
+*.pid
+*.dmp
+core
+core.*
+
+# Local config and secrets
+*.local
+*.env
+*.env.*
+!*.env.example
+config/*.json
+!config/*.json.example
+
+# OS files
+.DS_Store
+Thumbs.db

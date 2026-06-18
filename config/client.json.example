@@ -1,0 +1,18 @@
+{
+    "listen": {
+        "http": {"host": "127.0.0.1", "port": 8080},
+        "socks5": {"host": "127.0.0.1", "port": 1080}
+    },
+    "server": {
+        "host": "203.88.113.170",
+        "port": 443,
+        "password": "7e52be0e-6929-432b-b74e-4e1d559dbccb"
+    },
+    "geo": {
+        "geoip_path": "geoip.dat",
+        "geosite_path": "geosite.dat",
+        "direct_geoip": ["cn", "private"],
+        "direct_geosite": ["cn"]
+    },
+    "log_level": "info"
+}

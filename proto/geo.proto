@@ -1,0 +1,52 @@
+// V2Ray GeoIP / GeoSite protobuf definitions
+// Compatible with v2fly/geoip and v2fly/domain-list-community
+
+syntax = "proto2";
+
+package tx;
+
+// ============ GeoIP ============
+
+message CIDR {
+    required bytes ip     = 1;  // 4 bytes (IPv4) or 16 bytes (IPv6)
+    required uint32 prefix = 2; // CIDR prefix length
+}
+
+message GeoIP {
+    required string country_code = 1;
+    repeated CIDR cidr          = 2;
+    optional bool reverse_match  = 3 [default = false];
+}
+
+message GeoIPList {
+    repeated GeoIP entry = 1;
+}
+
+// ============ GeoSite ============
+
+message Domain {
+    enum Type {
+        Plain  = 0;  // substring match
+        Regex  = 1;  // regex match
+        Domain = 2;  // suffix match (example.com matches sub.example.com)
+        Full   = 3;  // exact match
+    }
+    required Type type           = 1;
+    required string value        = 2;
+    repeated DomainAttribute attribute = 3;
+}
+
+message DomainAttribute {
+    required string key          = 1;
+    optional bool bool_value     = 2 [default = false];
+    optional int64 int_value     = 3 [default = 0];
+}
+
+message GeoSite {
+    required string country_code = 1;
+    repeated Domain domain       = 2;
+}
+
+message GeoSiteList {
+    repeated GeoSite entry = 1;
+}

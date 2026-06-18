@@ -1,0 +1,8 @@
+{
+    "listen": {
+        "host": "0.0.0.0",
+        "port": 443
+    },
+    "password": "7e52be0e-6929-432b-b74e-4e1d559dbccb",
+    "log_level": "info"
+}

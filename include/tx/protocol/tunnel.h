@@ -30,6 +30,7 @@ public:
     static constexpr size_t kMaxPlaintextSize = 66000;
     static constexpr size_t kMaxEncryptedFrameSize = kMaxPlaintextSize + AesGcm::kOverhead;
     static constexpr size_t kDataHeaderSize = 6;
+    static constexpr size_t kMaxDataPayloadSize = kMaxPlaintextSize - kDataHeaderSize;
     static constexpr size_t kHandshakeNonceSize = 16;
     static constexpr size_t kHandshakeMacSize = 32;
     static constexpr size_t kHandshakeSize = 4 + 1 + kHandshakeNonceSize + kHandshakeMacSize;
@@ -48,6 +49,11 @@ public:
     bool encode_data(SessionId session_id,
                      const uint8_t* payload, size_t payload_len,
                      Buffer& out);
+
+    // Encode DATA as one or more frames when payload exceeds one frame.
+    bool encode_data_chunks(SessionId session_id,
+                            const uint8_t* payload, size_t payload_len,
+                            Buffer& out);
 
     // Encode DISCONNECT message
     bool encode_disconnect(SessionId session_id, Buffer& out);

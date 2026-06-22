@@ -66,7 +66,7 @@ RouteAction Router::decide(const std::string& host, const IpAddr& ip) const {
     // 3. GeoSite check (by hostname)
     if (!host.empty()) {
         for (const auto& tag : config_.direct_geosite_tags) {
-            if (geosite_.match(host, tag)) {
+            if (geosite_.match_domain(host, tag)) {
                 TX_DEBUG("GeoSite match: %s → %s (direct)", host.c_str(), tag.c_str());
                 return RouteAction::Direct;
             }
@@ -81,7 +81,7 @@ RouteAction Router::decide(const std::string& host, const IpAddr& ip) const {
 RouteAction Router::decide_by_host(const std::string& host) const {
     // Try GeoSite first (hostname-based)
     for (const auto& tag : config_.direct_geosite_tags) {
-        if (geosite_.match(host, tag)) {
+        if (geosite_.match_domain(host, tag)) {
             return RouteAction::Direct;
         }
     }

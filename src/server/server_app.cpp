@@ -247,8 +247,9 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
 void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
                                    const uint8_t* data, size_t len) {
     if (!client->session || client->session->is_closed()) return;
+
     Buffer encoded;
-    if (client->codec.encode_data(sid, data, len, encoded)) {
+    if (client->codec.encode_data_chunks(sid, data, len, encoded)) {
         client->session->send(encoded);
     }
 }
@@ -266,6 +267,7 @@ void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid
     if (!client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_connect_result(sid, success, encoded)) {
+        TX_INFO("CONNECT_RESULT session %u → %s", sid, success ? "success" : "failure");
         client->session->send(encoded);
     }
 }

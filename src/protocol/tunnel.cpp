@@ -147,7 +147,7 @@ bool TunnelCodec::encode(TunnelCmd cmd, SessionId session_id,
 bool TunnelCodec::encode_data(SessionId session_id,
                                const uint8_t* payload, size_t payload_len,
                                Buffer& out) {
-    if (payload_len > kMaxPlaintextSize - kDataHeaderSize) {
+    if (payload_len > kMaxDataPayloadSize) {
         TX_ERROR("Tunnel data payload too large: %zu bytes", payload_len);
         return false;
     }
@@ -170,6 +170,20 @@ bool TunnelCodec::encode_data(SessionId session_id,
     store_be32(len_buf, static_cast<uint32_t>(enc_len));
     out.append(len_buf, kLenPrefixSize);
     out.append(encrypted, static_cast<size_t>(enc_len));
+    return true;
+}
+
+bool TunnelCodec::encode_data_chunks(SessionId session_id,
+                                      const uint8_t* payload, size_t payload_len,
+                                      Buffer& out) {
+    size_t offset = 0;
+    while (offset < payload_len) {
+        size_t chunk_len = std::min(kMaxDataPayloadSize, payload_len - offset);
+        if (!encode_data(session_id, payload + offset, chunk_len, out)) {
+            return false;
+        }
+        offset += chunk_len;
+    }
     return true;
 }
 

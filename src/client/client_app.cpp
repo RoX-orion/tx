@@ -426,6 +426,7 @@ bool ClientApp::ensure_tunnel() {
     tunnel_session_ = std::make_shared<TcpSession>(loop_);
     tunnel_connected_ = false;
     tunnel_connecting_ = true;
+    tunnel_recv_buf_.clear();
 
     tunnel_session_->set_close_callback([this](SessionPtr session) {
         TX_WARN("Tunnel disconnected");
@@ -433,6 +434,7 @@ bool ClientApp::ensure_tunnel() {
             tunnel_connected_ = false;
             tunnel_connecting_ = false;
             tunnel_session_.reset();
+            fail_all_tunnel_connections();
         }
     });
 
@@ -499,7 +501,9 @@ void ClientApp::on_tunnel_handshake_read(Buffer& data) {
     finish_tunnel_handshake(server_nonce);
 
     if (!tunnel_handshake_buf_.empty()) {
-        on_tunnel_read(tunnel_handshake_buf_);
+        tunnel_recv_buf_.append(tunnel_handshake_buf_);
+        tunnel_handshake_buf_.clear();
+        on_tunnel_read(tunnel_recv_buf_);
     }
 }
 
@@ -516,7 +520,9 @@ void ClientApp::finish_tunnel_handshake(const std::vector<uint8_t>& server_nonce
     TX_INFO("Tunnel handshake complete");
 
     tunnel_session_->start_read([this](SessionPtr, Buffer& data) {
-        on_tunnel_read(data);
+        tunnel_recv_buf_.append(data);
+        data.clear();
+        on_tunnel_read(tunnel_recv_buf_);
     });
 
     auto pending = pending_tunnel_conns_;
@@ -551,6 +557,8 @@ void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
     }
 
     conn->connect_result_sent = true;
+    TX_INFO("[Proxy] CONNECT established for session %u: %s:%u",
+            conn->session_id, conn->target.host.c_str(), conn->target.port);
 
     if (conn->socks5) {
         Buffer resp;
@@ -610,6 +618,17 @@ void ClientApp::fail_pending_tunnel_connections() {
     }
 }
 
+void ClientApp::fail_all_tunnel_connections() {
+    fail_pending_tunnel_connections();
+
+    auto active = std::move(connections_);
+    connections_.clear();
+
+    for (auto& kv : active) {
+        fail_tunnel_connection(kv.second);
+    }
+}
+
 void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
     Buffer encoded;
     if (tunnel_codec_.encode(TunnelCmd::Connect, conn->session_id,
@@ -623,22 +642,15 @@ void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
 }
 
 void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) {
-    const size_t max_payload = TunnelCodec::kMaxPlaintextSize - TunnelCodec::kDataHeaderSize;
-    size_t offset = 0;
-    while (offset < len) {
-        size_t chunk_len = std::min(max_payload, len - offset);
-        Buffer encoded;
-        if (!tunnel_codec_.encode_data(conn->session_id, data + offset, chunk_len, encoded)) {
-            return;
-        }
+    Buffer encoded;
+    if (!tunnel_codec_.encode_data_chunks(conn->session_id, data, len, encoded)) {
+        return;
+    }
 
-        if (tunnel_connected_ && tunnel_session_) {
-            tunnel_session_->send(encoded);
-        } else {
-            tunnel_send_buf_.append(encoded);
-        }
-
-        offset += chunk_len;
+    if (tunnel_connected_ && tunnel_session_) {
+        tunnel_session_->send(encoded);
+    } else {
+        tunnel_send_buf_.append(encoded);
     }
 }
 
@@ -675,6 +687,9 @@ void ClientApp::on_tunnel_read(Buffer& data) {
                 break;
 
             case TunnelCmd::ConnectResult:
+                TX_INFO("[Proxy] CONNECT_RESULT session %u: %s",
+                        session_id,
+                        (!payload.empty() && payload.data()[0] == 1) ? "success" : "failure");
                 if (!payload.empty() && payload.data()[0] == 1) {
                     complete_tunnel_connection(conn);
                 } else {

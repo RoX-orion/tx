@@ -29,6 +29,10 @@ public:
     // Check if domain matches a specific geosite tag
     bool match(const std::string& domain, const std::string& tag) const;
 
+    // Check only exact and domain-suffix rules. This is safer for routing
+    // because Plain keyword rules can match unrelated domains.
+    bool match_domain(const std::string& domain, const std::string& tag) const;
+
     // Lookup first matching geosite tag for a domain
     std::string lookup(const std::string& domain) const;
 

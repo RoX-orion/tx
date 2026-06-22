@@ -4,6 +4,17 @@
 
 namespace tx {
 
+namespace {
+
+bool domain_suffix_has_label_boundary(const std::string& domain, size_t suffix_len) {
+    if (suffix_len >= domain.size()) {
+        return true;
+    }
+    return domain[domain.size() - suffix_len - 1] == '.';
+}
+
+} // namespace
+
 ReverseTrie::ReverseTrie() : root_(new Node), size_(0) {}
 
 ReverseTrie::~ReverseTrie() {
@@ -61,14 +72,16 @@ bool ReverseTrie::match(const std::string& domain, const std::string& country) c
         }
     }
 
+    size_t matched_len = 0;
     for (char ch : reversed) {
         auto it = current->children.find(ch);
         if (it == current->children.end()) {
             break;
         }
         current = it->second;
+        matched_len++;
 
-        if (current->is_terminal) {
+        if (current->is_terminal && domain_suffix_has_label_boundary(domain, matched_len)) {
             for (const auto& c : current->countries) {
                 if (c == country) return true;
             }
@@ -87,14 +100,17 @@ std::string ReverseTrie::lookup(const std::string& domain) const {
         result = current->countries[0];
     }
 
+    size_t matched_len = 0;
     for (char ch : reversed) {
         auto it = current->children.find(ch);
         if (it == current->children.end()) {
             break;
         }
         current = it->second;
+        matched_len++;
 
-        if (current->is_terminal && !current->countries.empty()) {
+        if (current->is_terminal && !current->countries.empty() &&
+            domain_suffix_has_label_boundary(domain, matched_len)) {
             result = current->countries[0];
         }
     }

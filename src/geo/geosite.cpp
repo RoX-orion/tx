@@ -288,6 +288,20 @@ bool GeoSiteMatcher::match(const std::string& domain, const std::string& tag) co
     return false;
 }
 
+bool GeoSiteMatcher::match_domain(const std::string& domain, const std::string& tag) const {
+    const std::string normalized_domain = to_lower_ascii(domain);
+    const std::string normalized_tag = to_lower_ascii(tag);
+
+    auto exact_it = exact_map_.find(normalized_tag);
+    if (exact_it != exact_map_.end()) {
+        for (const auto& e : exact_it->second) {
+            if (normalized_domain == e) return true;
+        }
+    }
+
+    return domain_trie_.match(normalized_domain, normalized_tag);
+}
+
 std::string GeoSiteMatcher::lookup(const std::string& domain) const {
     const std::string normalized_domain = to_lower_ascii(domain);
 

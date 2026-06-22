@@ -78,6 +78,7 @@ private:
     void complete_tunnel_connection(ProxyConnPtr conn);
     void fail_tunnel_connection(ProxyConnPtr conn);
     void fail_pending_tunnel_connections();
+    void fail_all_tunnel_connections();
 
     // DNS resolution for routing
     void resolve_and_route(ProxyConnPtr conn);
@@ -99,6 +100,7 @@ private:
     std::vector<uint8_t> tunnel_master_key_;
     std::vector<uint8_t> tunnel_client_nonce_;
     Buffer             tunnel_handshake_buf_;
+    Buffer             tunnel_recv_buf_;
     bool               tunnel_connected_;
     bool               tunnel_connecting_;
 

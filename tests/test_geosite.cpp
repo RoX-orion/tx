@@ -1,9 +1,60 @@
 #include "tx/geo/trie.h"
 #include "tx/geo/aho_corasick.h"
+#include "tx/geo/geosite.h"
 #include "tx/common/log.h"
 
 #include <cstdio>
 #include <cassert>
+#include <cstdint>
+#include <fstream>
+#include <string>
+#include <vector>
+
+static void append_varint(std::vector<uint8_t>& out, uint64_t value) {
+    while (value >= 0x80) {
+        out.push_back(static_cast<uint8_t>(value | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+static void append_string_field(std::vector<uint8_t>& out, uint32_t field,
+                                const std::string& value) {
+    append_varint(out, (field << 3) | 2);
+    append_varint(out, value.size());
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+static void append_varint_field(std::vector<uint8_t>& out, uint32_t field,
+                                uint64_t value) {
+    append_varint(out, (field << 3) | 0);
+    append_varint(out, value);
+}
+
+static void append_message_field(std::vector<uint8_t>& out, uint32_t field,
+                                 const std::vector<uint8_t>& message) {
+    append_varint(out, (field << 3) | 2);
+    append_varint(out, message.size());
+    out.insert(out.end(), message.begin(), message.end());
+}
+
+static std::vector<uint8_t> make_domain(uint32_t type, const std::string& value) {
+    std::vector<uint8_t> domain;
+    append_varint_field(domain, 1, type);
+    append_string_field(domain, 2, value);
+    return domain;
+}
+
+static std::vector<uint8_t> make_geosite_dat() {
+    std::vector<uint8_t> site;
+    append_string_field(site, 1, "CN");
+    append_message_field(site, 2, make_domain(0, "google"));
+    append_message_field(site, 2, make_domain(2, "bilibili.com"));
+
+    std::vector<uint8_t> list;
+    append_message_field(list, 1, site);
+    return list;
+}
 
 static void test_reverse_trie_suffix() {
     printf("  test_reverse_trie_suffix... ");
@@ -39,6 +90,22 @@ static void test_reverse_trie_deep() {
     assert(trie.match("x.a.b.c.example.com", "test"));
     assert(trie.match("a.b.c.example.com", "test"));
     assert(!trie.match("b.c.example.com", "test"));
+
+    printf("OK\n");
+}
+
+static void test_reverse_trie_label_boundary() {
+    printf("  test_reverse_trie_label_boundary... ");
+    tx::ReverseTrie trie;
+
+    trie.insert_domain("google.com", "global");
+
+    assert(trie.match("google.com", "global"));
+    assert(trie.match("www.google.com", "global"));
+    assert(!trie.match("www.google.com.cn", "global"));
+    assert(!trie.match("notgoogle.com", "global"));
+    assert(!trie.match("evilgoogle.com", "global"));
+    assert(trie.lookup("notgoogle.com").empty());
 
     printf("OK\n");
 }
@@ -85,13 +152,40 @@ static void test_aho_corasick_empty() {
     printf("OK\n");
 }
 
+static void test_geosite_domain_match_excludes_plain_rules() {
+    printf("  test_geosite_domain_match_excludes_plain_rules... ");
+
+    const std::string path = "/tmp/tx_test_geosite_match_domain.dat";
+    auto data = make_geosite_dat();
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(data.data()),
+                  static_cast<std::streamsize>(data.size()));
+    }
+
+    tx::GeoSiteMatcher matcher;
+    assert(matcher.load(path));
+
+    assert(matcher.match("www.google.com", "cn"));
+    assert(!matcher.match_domain("www.google.com", "cn"));
+    assert(matcher.match_domain("www.bilibili.com", "cn"));
+    assert(matcher.match_domain("WWW.BILIBILI.COM", "CN"));
+    assert(!matcher.match_domain("notbilibili.com", "cn"));
+
+    std::remove(path.c_str());
+
+    printf("OK\n");
+}
+
 int main() {
     printf("=== GeoSite Tests ===\n");
     test_reverse_trie_suffix();
     test_reverse_trie_deep();
+    test_reverse_trie_label_boundary();
     test_aho_corasick_basic();
     test_aho_corasick_overlapping();
     test_aho_corasick_empty();
+    test_geosite_domain_match_excludes_plain_rules();
     printf("All GeoSite tests passed!\n");
     return 0;
 }

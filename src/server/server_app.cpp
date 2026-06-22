@@ -6,7 +6,9 @@ namespace tx {
 
 namespace {
 
-constexpr size_t kMaxTunnelWriteBacklog = 32 * 1024 * 1024;
+constexpr size_t kTunnelPauseWriteBacklog = 8 * 1024 * 1024;
+constexpr size_t kTunnelResumeWriteBacklog = 2 * 1024 * 1024;
+constexpr size_t kMaxTunnelWriteBacklog = 64 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
 
 } // namespace
@@ -66,6 +68,9 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
 
     session->set_close_callback([this, client](SessionPtr) {
         on_tunnel_close(client);
+    });
+    session->set_write_drain_callback([this, client](SessionPtr) {
+        resume_outbound_reads(client);
     });
 
     session->start_read([this, client](SessionPtr, Buffer& data) {
@@ -218,11 +223,13 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
                 it->second.pending_data.clear();
             }
 
-            // Start reading from remote → forward back through tunnel
-            remote->start_read([this, client, sid](SessionPtr, Buffer& data) {
-                tunnel_send_data(client, sid, data.data(), data.readable());
-                data.clear();
-            });
+            if (!client->outbounds_paused) {
+                // Start reading from remote → forward back through tunnel.
+                remote->start_read([this, client, sid](SessionPtr, Buffer& data) {
+                    tunnel_send_data(client, sid, data.data(), data.readable());
+                    data.clear();
+                });
+            }
         });
 }
 
@@ -283,6 +290,8 @@ void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
         if (!client->session->send(encoded)) {
             TX_ERROR("Failed to send %zu encoded bytes to tunnel for session %u",
                      encoded.readable(), sid);
+        } else if (client->session->pending_write_bytes() > kTunnelPauseWriteBacklog) {
+            pause_outbound_reads(client);
         }
     } else {
         TX_ERROR("Failed to encode %zu bytes for tunnel session %u", len, sid);
@@ -317,6 +326,54 @@ void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid
     } else {
         TX_ERROR("Failed to encode CONNECT_RESULT for session %u", sid);
     }
+}
+
+void ServerApp::pause_outbound_reads(TunnelClientPtr client) {
+    if (!client || client->outbounds_paused) {
+        return;
+    }
+    client->outbounds_paused = true;
+
+    for (auto& kv : client->outbounds) {
+        auto& outbound = kv.second;
+        if (outbound.remote_session && !outbound.remote_session->is_closed() &&
+            outbound.remote_session->is_reading()) {
+            outbound.remote_session->stop_read();
+        }
+    }
+
+    TX_DEBUG("Paused outbound reads because tunnel backlog reached %zu bytes",
+             client->session ? client->session->pending_write_bytes() : 0);
+}
+
+void ServerApp::resume_outbound_reads(TunnelClientPtr client) {
+    if (!client || !client->session || client->session->is_closed() ||
+        !client->outbounds_paused) {
+        return;
+    }
+
+    if (client->session->pending_write_bytes() > kTunnelResumeWriteBacklog) {
+        return;
+    }
+
+    client->outbounds_paused = false;
+
+    for (auto& kv : client->outbounds) {
+        auto sid = kv.first;
+        auto& outbound = kv.second;
+        if (!outbound.connected || !outbound.remote_session ||
+            outbound.remote_session->is_closed()) {
+            continue;
+        }
+
+        outbound.remote_session->start_read([this, client, sid](SessionPtr, Buffer& data) {
+            tunnel_send_data(client, sid, data.data(), data.readable());
+            data.clear();
+        });
+    }
+
+    TX_DEBUG("Resumed outbound reads after tunnel backlog drained to %zu bytes",
+             client->session->pending_write_bytes());
 }
 
 void ServerApp::on_tunnel_close(TunnelClientPtr client) {

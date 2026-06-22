@@ -24,27 +24,32 @@ public:
     // Unload all data
     void unload();
 
-    bool has_geoip() const { return geoip_loaded_; }
-    bool has_geosite() const { return geosite_loaded_; }
+    bool has_geoip() const { return geoip_mapping_.loaded; }
+    bool has_geosite() const { return geosite_mapping_.loaded; }
 
     // Raw protobuf data access (for parsing into data structures)
-    const uint8_t* geoip_data() const { return geoip_data_; }
-    size_t geoip_size() const { return geoip_size_; }
-    const uint8_t* geosite_data() const { return geosite_data_; }
-    size_t geosite_size() const { return geosite_size_; }
+    const uint8_t* geoip_data() const { return geoip_mapping_.data; }
+    size_t geoip_size() const { return geoip_mapping_.size; }
+    const uint8_t* geosite_data() const { return geosite_mapping_.data; }
+    size_t geosite_size() const { return geosite_mapping_.size; }
 
 private:
-    // mmap a file, returns (data, size) or (nullptr, 0) on failure
-    static std::pair<uint8_t*, size_t> mmap_file(const std::string& path);
-    static void munmap_file(uint8_t* data, size_t size);
+    struct FileMapping {
+        uint8_t* data;
+        size_t size;
+        bool loaded;
+#ifdef _WIN32
+        void* file_handle;
+        void* mapping_handle;
+#endif
+    };
 
-    uint8_t* geoip_data_;
-    size_t   geoip_size_;
-    bool     geoip_loaded_;
+    // Map a file, returns an empty mapping on failure.
+    static FileMapping mmap_file(const std::string& path);
+    static void munmap_file(FileMapping& mapping);
 
-    uint8_t* geosite_data_;
-    size_t   geosite_size_;
-    bool     geosite_loaded_;
+    FileMapping geoip_mapping_;
+    FileMapping geosite_mapping_;
 };
 
 } // namespace tx

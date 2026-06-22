@@ -11,6 +11,15 @@ namespace tx {
 
 namespace {
 
+constexpr size_t kMaxClientTunnelBacklog = 64 * 1024 * 1024;
+
+bool is_ip_literal(const std::string& host) {
+    struct in_addr v4;
+    struct in6_addr v6;
+    return inet_pton(AF_INET, host.c_str(), &v4) == 1 ||
+           inet_pton(AF_INET6, host.c_str(), &v6) == 1;
+}
+
 bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
     if (!addr) return false;
 
@@ -261,6 +270,14 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     }
 
     IpAddr ip = IpAddr::from_string(conn->target.host, conn->target.port);
+    if (conn->target.type == AddrType::Domain && ip.is_lan() && !is_ip_literal(conn->target.host)) {
+        TX_WARN("[Proxy] %s:%u resolved to private/local address %s, forcing proxy",
+                conn->target.host.c_str(), conn->target.port, ip.to_string().c_str());
+        conn->route = RouteAction::Proxy;
+        connect_via_tunnel(conn);
+        return;
+    }
+
     conn->route = router_.decide_by_ip(ip);
 
     if (conn->route == RouteAction::Direct) {
@@ -318,7 +335,15 @@ void ClientApp::on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct 
         }
     }
 
-    if (have_ip && app->router_.decide_by_ip(selected) == RouteAction::Direct) {
+    bool private_domain_result = have_ip && selected.is_lan() && conn->target.type == AddrType::Domain;
+
+    if (private_domain_result) {
+        conn->route = RouteAction::Proxy;
+        TX_WARN("[Proxy] %s:%u resolved to private/local address %s, forcing proxy",
+                conn->target.host.c_str(), conn->target.port,
+                selected.to_string().c_str());
+        app->connect_via_tunnel(conn);
+    } else if (have_ip && app->router_.decide_by_ip(selected) == RouteAction::Direct) {
         conn->route = RouteAction::Direct;
         TX_INFO("[Direct] %s:%u resolved to %s (geoip)",
                 conn->target.host.c_str(), conn->target.port,
@@ -630,6 +655,13 @@ void ClientApp::fail_all_tunnel_connections() {
 }
 
 void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
+    if (!tunnel_connected_ && tunnel_send_buf_.readable() > kMaxClientTunnelBacklog) {
+        TX_ERROR("Client tunnel backlog too large before CONNECT (%zu bytes), failing session %u",
+                 tunnel_send_buf_.readable(), conn->session_id);
+        fail_tunnel_connection(conn);
+        return;
+    }
+
     Buffer encoded;
     if (tunnel_codec_.encode(TunnelCmd::Connect, conn->session_id,
                               conn->target, nullptr, 0, encoded)) {
@@ -642,6 +674,13 @@ void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
 }
 
 void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) {
+    if (!tunnel_connected_ && tunnel_send_buf_.readable() + len > kMaxClientTunnelBacklog) {
+        TX_ERROR("Client tunnel backlog too large (%zu + %zu bytes), closing session %u",
+                 tunnel_send_buf_.readable(), len, conn->session_id);
+        fail_tunnel_connection(conn);
+        return;
+    }
+
     Buffer encoded;
     if (!tunnel_codec_.encode_data_chunks(conn->session_id, data, len, encoded)) {
         return;

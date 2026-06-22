@@ -31,6 +31,7 @@ private:
         std::vector<uint8_t> master_key;
         Buffer           handshake_buf;
         Buffer           recv_buf;
+        bool             outbounds_paused = false;
 
         // Outbound connections by session ID
         struct Outbound {
@@ -58,6 +59,8 @@ private:
                           const uint8_t* data, size_t len);
     void tunnel_send_disconnect(TunnelClientPtr client, SessionId sid);
     void tunnel_send_connect_result(TunnelClientPtr client, SessionId sid, bool success);
+    void pause_outbound_reads(TunnelClientPtr client);
+    void resume_outbound_reads(TunnelClientPtr client);
 
     uv_loop_t*         loop_;
     ServerConfig       config_;

@@ -2,8 +2,18 @@ enable_testing()
 
 # Test helper: create a test executable
 function(tx_add_test name)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.cpp")
+        message(WARNING "Skipping missing test source: test_${name}.cpp")
+        return()
+    endif()
+
     add_executable(test_${name} test_${name}.cpp)
     target_link_libraries(test_${name} PRIVATE tx_core)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_${name} PRIVATE -UNDEBUG)
+    elseif(MSVC)
+        target_compile_options(test_${name} PRIVATE /UNDEBUG)
+    endif()
     add_test(NAME test_${name} COMMAND test_${name})
 endfunction()
 

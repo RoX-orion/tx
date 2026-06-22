@@ -9,6 +9,17 @@
 
 namespace tx {
 
+constexpr uint8_t TunnelCodec::kVersion;
+constexpr size_t TunnelCodec::kLenPrefixSize;
+constexpr size_t TunnelCodec::kMinFrameSize;
+constexpr size_t TunnelCodec::kMaxPlaintextSize;
+constexpr size_t TunnelCodec::kMaxEncryptedFrameSize;
+constexpr size_t TunnelCodec::kDataHeaderSize;
+constexpr size_t TunnelCodec::kMaxDataPayloadSize;
+constexpr size_t TunnelCodec::kHandshakeNonceSize;
+constexpr size_t TunnelCodec::kHandshakeMacSize;
+constexpr size_t TunnelCodec::kHandshakeSize;
+
 namespace {
 
 static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'H', 'S'};

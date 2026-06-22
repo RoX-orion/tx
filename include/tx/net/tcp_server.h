@@ -16,6 +16,7 @@ using SessionPtr     = std::shared_ptr<TcpSession>;
 using AcceptCallback = std::function<void(SessionPtr session)>;
 using ReadCallback   = std::function<void(SessionPtr session, Buffer& data)>;
 using CloseCallbackS = std::function<void(SessionPtr session)>;
+using WriteDrainCallback = std::function<void(SessionPtr session)>;
 
 // A single TCP connection session
 class TcpSession : public std::enable_shared_from_this<TcpSession> {
@@ -37,6 +38,7 @@ public:
     // Start/stop reading
     void start_read(ReadCallback cb);
     void stop_read();
+    bool is_reading() const { return reading_; }
 
     // Close
     void close();
@@ -44,6 +46,7 @@ public:
 
     // Callbacks
     void set_close_callback(CloseCallbackS cb) { close_cb_ = std::move(cb); }
+    void set_write_drain_callback(WriteDrainCallback cb) { write_drain_cb_ = std::move(cb); }
 
     // Access underlying handle
     uv_tcp_t* handle() { return &tcp_; }
@@ -68,6 +71,7 @@ private:
     bool         reading_;
     ReadCallback read_cb_;
     CloseCallbackS close_cb_;
+    WriteDrainCallback write_drain_cb_;
     SessionPtr   self_ref_;   // Keeps this object alive until uv_close finishes.
     Buffer       read_buf_;
     std::string  remote_addr_;
@@ -82,6 +86,7 @@ private:
         uv_buf_t   buf;
         char*      data;
         size_t     len;
+        SessionPtr session;
     };
     static void on_write_free(uv_write_t* req, int status);
 };

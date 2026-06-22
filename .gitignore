@@ -1,10 +1,14 @@
 # IDE / editor
 .idea/
+.vs/
 *.iml
 .vscode/
 *.swp
 *.swo
 *~
+*.user
+*.userosscache
+*.suo
 
 # CMake build directories
 build/
@@ -17,11 +21,15 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+*.ninja
+.ninja_deps
+.ninja_log
 compile_commands.json
 CTestTestfile.cmake
 DartConfiguration.tcl
 Testing/
 install_manifest.txt
+CMakeUserPresets.json
 
 # Build outputs
 bin/
@@ -42,6 +50,7 @@ lib/
 *.idb
 *.ilk
 *.exp
+*.dSYM/
 
 # Test / coverage / profiling artifacts
 *.gcda
@@ -50,6 +59,8 @@ lib/
 *.profraw
 *.profdata
 coverage/
+.coverage
+coverage.xml
 
 # Logs and runtime dumps
 *.log
@@ -65,6 +76,11 @@ core.*
 !*.env.example
 config/*.json
 !config/*.json.example
+
+# Local dependency/cache directories
+.deps/
+.cache/
+*.deb
 
 # OS files
 .DS_Store

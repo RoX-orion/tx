@@ -124,6 +124,7 @@ bool TcpSession::send(const uint8_t* data, size_t len) {
     memcpy(wr->data, data, len);
     wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
     wr->len = len;
+    wr->session = shared_from_this();
     wr->req.data = wr;
 
     int r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&tcp_),
@@ -180,6 +181,9 @@ void TcpSession::close() {
     if (closed_) return;
     closed_ = true;
     reading_ = false;
+    paused_for_write_ = false;
+    read_cb_ = nullptr;
+    write_drain_cb_ = nullptr;
     try {
         self_ref_ = shared_from_this();
     } catch (const std::bad_weak_ptr&) {
@@ -217,11 +221,14 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
 
 void TcpSession::on_write_free(uv_write_t* req, int status) {
     auto* wr = static_cast<WriteReq*>(req->data);
-    auto* self = static_cast<TcpSession*>(req->handle->data);
-    if (self && self->pending_write_bytes_ >= wr->len) {
-        self->pending_write_bytes_ -= wr->len;
-    } else if (self) {
-        self->pending_write_bytes_ = 0;
+    auto session = wr->session;
+    auto* self = session.get();
+    if (self) {
+        if (self->pending_write_bytes_ >= wr->len) {
+            self->pending_write_bytes_ -= wr->len;
+        } else {
+            self->pending_write_bytes_ = 0;
+        }
     }
 
     if (self && !self->closed_ && self->paused_for_write_ &&
@@ -237,6 +244,12 @@ void TcpSession::on_write_free(uv_write_t* req, int status) {
         }
     }
 
+    if (self && !self->closed_ &&
+        self->pending_write_bytes_ <= self->write_low_watermark_ &&
+        self->write_drain_cb_) {
+        self->write_drain_cb_(self->shared_from_this());
+    }
+
     if (status < 0 && status != UV_ECANCELED) {
         TX_DEBUG("Write error: %s", uv_strerror(status));
     }
@@ -249,9 +262,11 @@ void TcpSession::on_close(uv_handle_t* handle) {
     SessionPtr keep_alive = std::move(self->self_ref_);
     self->closed_ = true;
     self->reading_ = false;
+    self->paused_for_write_ = false;
     // Clear callbacks to prevent dangling references
     auto cb = std::move(self->close_cb_);
     self->read_cb_ = nullptr;
+    self->write_drain_cb_ = nullptr;
     if (cb) {
         cb(self->shared_from_this());
     }

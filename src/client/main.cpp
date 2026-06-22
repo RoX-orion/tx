@@ -3,6 +3,32 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <signal.h>
+#include <unistd.h>
+
+static void on_fatal_signal(int signum) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "TX Client fatal signal: %d\n", signum);
+    if (len > 0) {
+        write(STDERR_FILENO, buf, static_cast<size_t>(len));
+    }
+    _exit(128 + signum);
+}
+
+static void install_crash_handlers() {
+    signal(SIGSEGV, on_fatal_signal);
+    signal(SIGABRT, on_fatal_signal);
+#ifdef SIGBUS
+    signal(SIGBUS, on_fatal_signal);
+#endif
+    signal(SIGILL, on_fatal_signal);
+    std::set_terminate([]() {
+        TX_ERROR("TX Client terminated by unhandled exception");
+        std::abort();
+    });
+}
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
@@ -14,6 +40,8 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+    install_crash_handlers();
+
     const char* config_path = "client.json";
     const char* log_level = nullptr;
 

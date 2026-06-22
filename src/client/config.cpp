@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <algorithm>
+#include <sys/stat.h>
 
 using json = nlohmann::json;
 
@@ -12,6 +13,70 @@ namespace tx {
 static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
     return s;
+}
+
+static bool path_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+static std::string dirname_of(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, pos);
+}
+
+static std::string join_path(const std::string& base, const std::string& leaf) {
+    if (base.empty() || base == ".") {
+        return leaf;
+    }
+    char last = base.back();
+    if (last == '/' || last == '\\') {
+        return base + leaf;
+    }
+    return base + "/" + leaf;
+}
+
+static std::string parent_dir(const std::string& path) {
+    return dirname_of(path);
+}
+
+static std::string resolve_config_path(const std::string& config_path,
+                                       const std::string& value_path) {
+    if (value_path.empty()) {
+        return value_path;
+    }
+
+    if (value_path[0] == '/' || value_path[0] == '\\' ||
+        (value_path.size() > 1 && value_path[1] == ':')) {
+        return value_path;
+    }
+
+    if (path_exists(value_path)) {
+        return value_path;
+    }
+
+    std::string dir = dirname_of(config_path);
+    const std::string candidate0 = join_path(dir, value_path);
+    if (path_exists(candidate0)) {
+        return candidate0;
+    }
+
+    std::string probe_dir = dir;
+    for (int i = 0; i < 4; ++i) {
+        probe_dir = parent_dir(probe_dir);
+        const std::string candidate = join_path(probe_dir, value_path);
+        if (path_exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return candidate0;
 }
 
 bool ClientConfig::validate() const {
@@ -67,8 +132,14 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
         // Geo config
         if (j.contains("geo")) {
             auto& geo = j["geo"];
-            if (geo.contains("geoip_path")) config.router.geoip_path = geo["geoip_path"].get<std::string>();
-            if (geo.contains("geosite_path")) config.router.geosite_path = geo["geosite_path"].get<std::string>();
+            if (geo.contains("geoip_path")) {
+                config.router.geoip_path =
+                    resolve_config_path(path, geo["geoip_path"].get<std::string>());
+            }
+            if (geo.contains("geosite_path")) {
+                config.router.geosite_path =
+                    resolve_config_path(path, geo["geosite_path"].get<std::string>());
+            }
             if (geo.contains("direct_geoip")) {
                 for (auto& tag : geo["direct_geoip"]) {
                     config.router.direct_geoip_tags.push_back(to_lower(tag.get<std::string>()));

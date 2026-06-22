@@ -4,6 +4,13 @@
 
 namespace tx {
 
+namespace {
+
+constexpr size_t kMaxTunnelWriteBacklog = 32 * 1024 * 1024;
+constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
+
+} // namespace
+
 ServerApp::ServerApp()
     : loop_(uv_default_loop()),
       server_(loop_) {}
@@ -193,6 +200,7 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
 
             auto it = client->outbounds.find(sid);
             if (it == client->outbounds.end()) {
+                TX_WARN("Outbound disappeared before target connected for session %u", sid);
                 if (remote && !remote->is_closed()) {
                     remote->close();
                 }
@@ -204,6 +212,8 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
             tunnel_send_connect_result(client, sid, true);
 
             if (!it->second.pending_data.empty()) {
+                TX_INFO("Flushing %zu pending bytes to target for session %u",
+                        it->second.pending_data.readable(), sid);
                 remote->send(it->second.pending_data);
                 it->second.pending_data.clear();
             }
@@ -219,15 +229,28 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
 void ServerApp::handle_data(TunnelClientPtr client, SessionId sid, Buffer& payload) {
     auto it = client->outbounds.find(sid);
     if (it == client->outbounds.end()) {
-        TX_DEBUG("Data for unknown session %u", sid);
+        TX_WARN("Data for unknown session %u (%zu bytes)", sid, payload.readable());
         return;
     }
 
     if (it->second.connected &&
         it->second.remote_session && !it->second.remote_session->is_closed()) {
-        it->second.remote_session->send(payload);
+        size_t payload_len = payload.readable();
+        if (!it->second.remote_session->send(payload)) {
+            TX_ERROR("Failed to send %zu bytes to target for session %u",
+                     payload_len, sid);
+            handle_disconnect(client, sid);
+        }
     } else {
         // Buffer data until remote connection is established
+        if (it->second.pending_data.readable() + payload.readable() > kMaxPendingTargetData) {
+            TX_ERROR("Pending target data too large for session %u: %zu + %zu bytes",
+                     sid, it->second.pending_data.readable(), payload.readable());
+            tunnel_send_connect_result(client, sid, false);
+            handle_disconnect(client, sid);
+            payload.clear();
+            return;
+        }
         it->second.pending_data.append(payload);
     }
     payload.clear();
@@ -248,9 +271,21 @@ void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
                                    const uint8_t* data, size_t len) {
     if (!client->session || client->session->is_closed()) return;
 
+    if (client->session->pending_write_bytes() > kMaxTunnelWriteBacklog) {
+        TX_ERROR("Tunnel write backlog too large (%zu bytes), closing tunnel",
+                 client->session->pending_write_bytes());
+        client->session->close();
+        return;
+    }
+
     Buffer encoded;
     if (client->codec.encode_data_chunks(sid, data, len, encoded)) {
-        client->session->send(encoded);
+        if (!client->session->send(encoded)) {
+            TX_ERROR("Failed to send %zu encoded bytes to tunnel for session %u",
+                     encoded.readable(), sid);
+        }
+    } else {
+        TX_ERROR("Failed to encode %zu bytes for tunnel session %u", len, sid);
     }
 }
 
@@ -258,7 +293,11 @@ void ServerApp::tunnel_send_disconnect(TunnelClientPtr client, SessionId sid) {
     if (!client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_disconnect(sid, encoded)) {
-        client->session->send(encoded);
+        if (!client->session->send(encoded)) {
+            TX_ERROR("Failed to send DISCONNECT for session %u", sid);
+        }
+    } else {
+        TX_ERROR("Failed to encode DISCONNECT for session %u", sid);
     }
 }
 
@@ -267,8 +306,16 @@ void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid
     if (!client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_connect_result(sid, success, encoded)) {
-        TX_INFO("CONNECT_RESULT session %u → %s", sid, success ? "success" : "failure");
-        client->session->send(encoded);
+        if (success) {
+            TX_DEBUG("CONNECT_RESULT session %u → success", sid);
+        } else {
+            TX_WARN("CONNECT_RESULT session %u → failure", sid);
+        }
+        if (!client->session->send(encoded)) {
+            TX_ERROR("Failed to send CONNECT_RESULT for session %u", sid);
+        }
+    } else {
+        TX_ERROR("Failed to encode CONNECT_RESULT for session %u", sid);
     }
 }
 

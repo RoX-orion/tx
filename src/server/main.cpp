@@ -1,8 +1,12 @@
 #include "server_app.h"
 #include "tx/common/log.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <signal.h>
+#include <unistd.h>
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
@@ -13,7 +17,29 @@ static void print_usage(const char* prog) {
         prog);
 }
 
+static void on_fatal_signal(int signum) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "TX Server fatal signal: %d\n", signum);
+    if (len > 0) {
+        write(STDERR_FILENO, buf, static_cast<size_t>(len));
+    }
+    _exit(128 + signum);
+}
+
+static void install_crash_handlers() {
+    signal(SIGSEGV, on_fatal_signal);
+    signal(SIGABRT, on_fatal_signal);
+    signal(SIGBUS, on_fatal_signal);
+    signal(SIGILL, on_fatal_signal);
+    std::set_terminate([]() {
+        TX_ERROR("TX Server terminated by unhandled exception");
+        std::abort();
+    });
+}
+
 int main(int argc, char* argv[]) {
+    install_crash_handlers();
+
     const char* config_path = "server.json";
     const char* log_level = nullptr;
 

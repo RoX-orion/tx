@@ -1,14 +1,33 @@
 #include "tx/router/router.h"
 #include "tx/common/log.h"
 #include <algorithm>
+#include <cctype>
 
 namespace tx {
+
+namespace {
+
+std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+void normalize_tags(std::vector<std::string>& tags) {
+    for (auto& tag : tags) {
+        tag = to_lower_ascii(tag);
+    }
+}
+
+} // namespace
 
 Router::Router() : loaded_(false) {}
 Router::~Router() = default;
 
 bool Router::load(const RouterConfig& config) {
     config_ = config;
+    normalize_tags(config_.direct_geoip_tags);
+    normalize_tags(config_.direct_geosite_tags);
 
     // Load GeoIP data
     if (!config.geoip_path.empty()) {

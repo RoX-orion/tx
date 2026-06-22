@@ -1,6 +1,8 @@
 #include "tx/geo/geoip.h"
 #include "tx/common/log.h"
 #include "tx/common/endian.h"
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace tx {
@@ -10,6 +12,12 @@ namespace tx {
 // We parse the wire format directly without a protobuf library.
 
 namespace {
+
+static std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
 
 struct PbSlice {
     const uint8_t* data;
@@ -182,16 +190,18 @@ bool GeoIpMatcher::parse_geoip(const uint8_t* data, size_t len) {
         [this, &count](const std::string& country,
                         const std::vector<std::pair<const uint8_t*, size_t>>& cidrs,
                         const std::vector<uint32_t>& prefixes) {
+            const std::string normalized_country = to_lower_ascii(country);
+
             for (size_t i = 0; i < cidrs.size(); i++) {
                 const uint8_t* ip = cidrs[i].first;
                 size_t ip_len = cidrs[i].second;
                 uint32_t prefix = prefixes[i];
 
                 if (ip_len == 4) {
-                    tree_v4_.insert(ip, static_cast<uint8_t>(prefix), country, false);
+                    tree_v4_.insert(ip, static_cast<uint8_t>(prefix), normalized_country, false);
                     count++;
                 } else if (ip_len == 16) {
-                    tree_v6_.insert(ip, static_cast<uint8_t>(prefix), country, true);
+                    tree_v6_.insert(ip, static_cast<uint8_t>(prefix), normalized_country, true);
                     count++;
                 }
             }
@@ -203,15 +213,17 @@ bool GeoIpMatcher::parse_geoip(const uint8_t* data, size_t len) {
 }
 
 bool GeoIpMatcher::match(const IpAddr& addr, const std::string& country) const {
+    const std::string normalized_country = to_lower_ascii(country);
+
     if (addr.family == IpAddr::IPv4) {
         // Check if it's an IPv4-mapped IPv6 address
-        return tree_v4_.match(addr.data.v4, false, country);
+        return tree_v4_.match(addr.data.v4, false, normalized_country);
     } else {
         // Check IPv4-mapped first
         if (addr.is_ipv4_mapped_ipv6()) {
-            return tree_v4_.match(addr.data.v6 + 12, false, country);
+            return tree_v4_.match(addr.data.v6 + 12, false, normalized_country);
         }
-        return tree_v6_.match(addr.data.v6, true, country);
+        return tree_v6_.match(addr.data.v6, true, normalized_country);
     }
 }
 

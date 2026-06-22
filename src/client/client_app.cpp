@@ -2,10 +2,44 @@
 #include "tx/common/log.h"
 #include "tx/crypto/key_derive.h"
 
+#include <arpa/inet.h>
 #include <cstring>
+#include <netdb.h>
 #include <random>
 
 namespace tx {
+
+namespace {
+
+bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
+    if (!addr) return false;
+
+    if (addr->sa_family == AF_INET) {
+        const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
+        out = IpAddr::from_ipv4(
+            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[0],
+            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[1],
+            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[2],
+            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[3],
+            port);
+        return true;
+    }
+
+    if (addr->sa_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
+        out = IpAddr::from_ipv6(reinterpret_cast<const uint8_t*>(&a6->sin6_addr), port);
+        return true;
+    }
+
+    return false;
+}
+
+} // namespace
+
+struct ClientApp::RouteDnsCtx {
+    ClientApp* app;
+    ProxyConnPtr conn;
+};
 
 ClientApp::ClientApp()
     : loop_(uv_default_loop()),
@@ -214,21 +248,15 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     RouteAction action = router_.decide_by_host(conn->target.host);
 
     if (action == RouteAction::Direct) {
-        // GeoSite matched → direct
         conn->route = RouteAction::Direct;
-        TX_INFO("Route decision: %s:%u -> direct (geosite)",
+        TX_INFO("[Direct] %s:%u (geosite)",
                 conn->target.host.c_str(), conn->target.port);
         connect_direct(conn);
         return;
     }
 
-    // Avoid local DNS for domain names. For proxied domains the server should
-    // resolve the target from its network; local DNS can fail or be polluted.
     if (conn->target.type == AddrType::Domain) {
-        conn->route = RouteAction::Proxy;
-        TX_INFO("Route decision: %s:%u -> tunnel (domain)",
-                conn->target.host.c_str(), conn->target.port);
-        connect_via_tunnel(conn);
+        resolve_domain_and_route(conn);
         return;
     }
 
@@ -236,18 +264,86 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     conn->route = router_.decide_by_ip(ip);
 
     if (conn->route == RouteAction::Direct) {
-        TX_INFO("Route decision: %s:%u -> direct (geoip)",
+        TX_INFO("[Direct] %s:%u (geoip)",
                 conn->target.host.c_str(), conn->target.port);
         connect_direct(conn);
     } else {
-        TX_INFO("Route decision: %s:%u -> tunnel (geoip/default)",
+        TX_INFO("[Proxy] %s:%u (geoip/default)",
                 conn->target.host.c_str(), conn->target.port);
         connect_via_tunnel(conn);
     }
 }
 
+void ClientApp::resolve_domain_and_route(ProxyConnPtr conn) {
+    auto* req = new uv_getaddrinfo_t;
+    auto* ctx = new RouteDnsCtx{this, conn};
+    req->data = ctx;
+
+    int r = uv_getaddrinfo(loop_, req, ClientApp::on_route_dns_resolved,
+                           conn->target.host.c_str(), nullptr, nullptr);
+    if (r != 0) {
+        TX_WARN("[Proxy] %s:%u DNS route lookup failed: %s",
+                conn->target.host.c_str(), conn->target.port, uv_strerror(r));
+        conn->route = RouteAction::Proxy;
+        connect_via_tunnel(conn);
+        delete ctx;
+        delete req;
+    }
+}
+
+void ClientApp::on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
+    auto* ctx = static_cast<RouteDnsCtx*>(req->data);
+    auto conn = ctx->conn;
+    ClientApp* app = ctx->app;
+
+    if (!conn || !conn->local_session || conn->local_session->is_closed()) {
+        if (res) uv_freeaddrinfo(res);
+        delete ctx;
+        delete req;
+        return;
+    }
+
+    IpAddr selected;
+    bool have_ip = false;
+
+    if (status == 0 && res) {
+        for (auto* ai = res; ai; ai = ai->ai_next) {
+            if (ai->ai_family == AF_INET) {
+                have_ip = sockaddr_to_ipaddr(ai->ai_addr, conn->target.port, selected);
+                break;
+            }
+            if (!have_ip && ai->ai_family == AF_INET6) {
+                have_ip = sockaddr_to_ipaddr(ai->ai_addr, conn->target.port, selected);
+            }
+        }
+    }
+
+    if (have_ip && app->router_.decide_by_ip(selected) == RouteAction::Direct) {
+        conn->route = RouteAction::Direct;
+        TX_INFO("[Direct] %s:%u resolved to %s (geoip)",
+                conn->target.host.c_str(), conn->target.port,
+                selected.to_string().c_str());
+        app->connect_direct(conn);
+    } else {
+        conn->route = RouteAction::Proxy;
+        if (status < 0 || !res) {
+            TX_WARN("[Proxy] %s:%u DNS route lookup failed: %s",
+                    conn->target.host.c_str(), conn->target.port,
+                    status < 0 ? uv_strerror(status) : "no results");
+        } else {
+            TX_INFO("[Proxy] %s:%u (geoip/default)",
+                    conn->target.host.c_str(), conn->target.port);
+        }
+        app->connect_via_tunnel(conn);
+    }
+
+    if (res) uv_freeaddrinfo(res);
+    delete ctx;
+    delete req;
+}
+
 void ClientApp::connect_direct(ProxyConnPtr conn) {
-    TX_INFO("Direct connect: %s:%u", conn->target.host.c_str(), conn->target.port);
+    TX_INFO("[Direct] Connecting to %s:%u", conn->target.host.c_str(), conn->target.port);
 
     auto direct = std::make_shared<TcpSession>(loop_);
     conn->direct_session = direct;
@@ -305,7 +401,8 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
 }
 
 void ClientApp::connect_via_tunnel(ProxyConnPtr conn) {
-    TX_INFO("Proxy via tunnel: %s:%u", conn->target.host.c_str(), conn->target.port);
+    TX_INFO("[Proxy] Connecting via tunnel to %s:%u",
+            conn->target.host.c_str(), conn->target.port);
 
     connections_[conn->session_id] = conn;
 

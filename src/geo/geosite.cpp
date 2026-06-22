@@ -2,11 +2,18 @@
 #include "tx/common/log.h"
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 
 namespace tx {
 
 // ===== Protobuf parser for geosite.dat =====
 namespace {
+
+static std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
 
 static bool read_varint(const uint8_t* data, size_t len, size_t& pos, uint64_t& val) {
     val = 0;
@@ -210,27 +217,28 @@ bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {
 
     bool ok = parse_geosite_list(data, len,
         [this, &domain_count](PbGeoSite& site) {
-            const std::string& country = site.country_code;
+            const std::string country = to_lower_ascii(site.country_code);
 
             for (auto& dom : site.domains) {
                 domain_count++;
+                const std::string value = to_lower_ascii(dom.value);
 
                 switch (dom.type) {
                     case 0: // Plain — substring match
-                        ac_automaton_.add_pattern(dom.value, country);
+                        ac_automaton_.add_pattern(value, country);
                         break;
                     case 2: // Domain — suffix match
-                        domain_trie_.insert_domain(dom.value, country);
+                        domain_trie_.insert_domain(value, country);
                         break;
                     case 3: // Full — exact match
-                        exact_map_[country].push_back(dom.value);
+                        exact_map_[country].push_back(value);
                         break;
                     case 1: // Regex
                         try {
-                            regex_patterns_.push_back({std::regex(dom.value), country});
+                            regex_patterns_.push_back({std::regex(value), country});
                         } catch (const std::regex_error& e) {
                             TX_WARN("Invalid regex in geosite '%s': %s (%s)",
-                                    country.c_str(), dom.value.c_str(), e.what());
+                                    country.c_str(), value.c_str(), e.what());
                         }
                         break;
                 }
@@ -240,36 +248,39 @@ bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {
     // Build Aho-Corasick automaton
     ac_automaton_.build();
 
-    TX_INFO("GeoSite loaded: %zu domains, trie nodes, AC patterns: %zu, exact entries: %zu, regex: %zu",
+    TX_INFO("GeoSite loaded: %zu domains, trie nodes: %zu, AC patterns: %zu, exact entries: %zu, regex: %zu",
             domain_count, domain_trie_.size(), ac_automaton_.pattern_count(),
             exact_map_.size(), regex_patterns_.size());
     return ok;
 }
 
 bool GeoSiteMatcher::match(const std::string& domain, const std::string& tag) const {
+    const std::string normalized_domain = to_lower_ascii(domain);
+    const std::string normalized_tag = to_lower_ascii(tag);
+
     // 1. Check exact match
-    auto exact_it = exact_map_.find(tag);
+    auto exact_it = exact_map_.find(normalized_tag);
     if (exact_it != exact_map_.end()) {
         for (const auto& e : exact_it->second) {
-            if (domain == e) return true;
+            if (normalized_domain == e) return true;
         }
     }
 
     // 2. Check suffix match (ReverseTrie)
-    if (domain_trie_.match(domain, tag)) {
+    if (domain_trie_.match(normalized_domain, normalized_tag)) {
         return true;
     }
 
     // 3. Check substring match (Aho-Corasick)
-    if (ac_automaton_.search(domain, tag)) {
+    if (ac_automaton_.search(normalized_domain, normalized_tag)) {
         return true;
     }
 
     // 4. Check regex match
     for (const auto& re : regex_patterns_) {
-        if (re.country == tag) {
+        if (re.country == normalized_tag) {
             try {
-                if (std::regex_search(domain, re.pattern)) return true;
+                if (std::regex_search(normalized_domain, re.pattern)) return true;
             } catch (...) {}
         }
     }
@@ -278,22 +289,24 @@ bool GeoSiteMatcher::match(const std::string& domain, const std::string& tag) co
 }
 
 std::string GeoSiteMatcher::lookup(const std::string& domain) const {
+    const std::string normalized_domain = to_lower_ascii(domain);
+
     // Check each country in order of most common
     for (const auto& kv : exact_map_) {
         for (const auto& e : kv.second) {
-            if (domain == e) return kv.first;
+            if (normalized_domain == e) return kv.first;
         }
     }
 
-    auto trie_result = domain_trie_.lookup(domain);
+    auto trie_result = domain_trie_.lookup(normalized_domain);
     if (!trie_result.empty()) return trie_result;
 
-    auto ac_results = ac_automaton_.search_all(domain);
+    auto ac_results = ac_automaton_.search_all(normalized_domain);
     if (!ac_results.empty()) return ac_results[0];
 
     for (const auto& re : regex_patterns_) {
         try {
-            if (std::regex_search(domain, re.pattern)) return re.country;
+            if (std::regex_search(normalized_domain, re.pattern)) return re.country;
         } catch (...) {}
     }
 

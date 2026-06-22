@@ -32,6 +32,8 @@ public:
     void stop();
 
 private:
+    struct RouteDnsCtx;
+
     // ---- Proxy connection handling ----
 
     struct ProxyConn {
@@ -79,6 +81,8 @@ private:
 
     // DNS resolution for routing
     void resolve_and_route(ProxyConnPtr conn);
+    void resolve_domain_and_route(ProxyConnPtr conn);
+    static void on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
 
     // ---- Members ----
     uv_loop_t*         loop_;

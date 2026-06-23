@@ -60,10 +60,7 @@ include(TxUtils)
 include(FetchDeps)
 
 # Find OpenSSL
-if(TX_LINK_STATIC_DEPS)
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-endif()
-find_package(OpenSSL REQUIRED)
+tx_find_openssl()
 tx_find_static_openssl_deps()
 
 # Include directories
@@ -112,7 +109,7 @@ target_include_directories(tx_core PUBLIC
 if(UNIX AND NOT ANDROID)
     target_link_libraries(tx_core PUBLIC pthread dl)
 elseif(ANDROID)
-    target_link_libraries(tx_core PUBLIC log)
+    target_link_libraries(tx_core PUBLIC log c++_static)
 elseif(WIN32 OR MINGW)
     target_link_libraries(tx_core PUBLIC ws2_32 shlwapi userenv advapi32 iphlpapi psapi shell32 crypt32 bcrypt)
 endif()

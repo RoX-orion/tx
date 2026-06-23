@@ -81,7 +81,8 @@ static void test_handshake_authentication_failure() {
 
     std::vector<uint8_t> tampered(client_hello.data(),
                                   client_hello.data() + client_hello.readable());
-    tampered.back() ^= 0x01;
+    TX_ASSERT(!tampered.empty());
+    tampered[tampered.size() - 1] ^= 0x01;
     TX_ASSERT(!tx::TunnelCodec::parse_client_hello(master_key, tampered.data(),
                                                    tampered.size(),
                                                    parsed_client_nonce));

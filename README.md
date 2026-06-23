@@ -43,14 +43,16 @@
 
 - CMake 3.25.1 或更新版本
 - 支持 C++14 的编译器
-- OpenSSL 开发库或预编译静态库
-- libuv 开发库或预编译静态库
-- nlohmann_json
+- OpenSSL 开发库和静态库
+- Linux 静态 C++ 运行库（启用 `TX_STATIC_CXX_RUNTIME=ON` 时）
+- libuv 开发库，或允许 CMake 下载到项目 `.deps/`
+- nlohmann_json，或允许 CMake 下载到项目 `.deps/`
 
 默认构建策略：
 
 - `tx_core` 本身始终构建为静态库。
 - `TX_LINK_STATIC_DEPS=ON` 时，优先静态链接第三方依赖，默认开启。
+- `TX_FETCH_DEPS=ON` 时，缺失的 libuv 和 nlohmann_json 会下载到项目 `.deps/` 目录。
 - Linux / Windows 可继续构建 `tx_client` 和 `tx_server` 可执行文件。
 - Android 默认关闭命令行程序，转而构建 `libtx.so` 共享库，并将第三方依赖静态打入该库。
 
@@ -58,10 +60,16 @@ Debian / Ubuntu 示例：
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential cmake libssl-dev libuv1-dev nlohmann-json3-dev
+sudo apt install -y build-essential cmake libssl-dev
 ```
 
-如果依赖安装在非标准路径，可以通过 CMake 变量指定，例如：
+Fedora 示例：
+
+```sh
+sudo dnf install -y gcc gcc-c++ cmake make openssl-devel openssl-static libstdc++-static zlib-static zstd-static
+```
+
+如果 OpenSSL 或其它依赖安装在非标准路径，可以通过 CMake 变量指定，例如：
 
 ```sh
 cmake -B build \
@@ -74,10 +82,10 @@ cmake -B build \
 
 说明：
 
-- `libuv` 需要显式指向静态库文件，例如 `libuv.a`、`uv_a.lib`。
-- `nlohmann_json` 是 header-only，提供头文件目录即可。
 - `OpenSSL` 通过 `find_package(OpenSSL)` 查找；静态模式下会优先选择静态库。
-- Linux 上如果使用发行版提供的静态 OpenSSL，常见的 `zlib`、`zstd` 传递依赖会自动补齐。
+- Linux 上静态 OpenSSL 常见传递依赖是 `zlib`、`zstd`，构建会自动尝试补齐对应静态库。
+- `libuv` 可以显式指向静态库文件，例如 `libuv.a`、`uv_a.lib`；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
+- `nlohmann_json` 是 header-only；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
 
 ## 构建
 
@@ -101,6 +109,7 @@ build/bin/tx_server
 - `-DTX_BUILD_TESTS=ON|OFF`：是否构建测试，非 Android 平台默认开启。
 - `-DTX_BUILD_SHARED=ON|OFF`：是否构建共享库，主要用于 Android 场景，默认关闭。
 - `-DTX_LINK_STATIC_DEPS=ON|OFF`：是否优先静态链接第三方依赖，默认开启。
+- `-DTX_FETCH_DEPS=ON|OFF`：是否把缺失的 libuv / nlohmann_json 下载到项目 `.deps/`，默认开启。
 - `-DTX_STATIC_CXX_RUNTIME=ON|OFF`：在 GCC / Clang 下尽量静态链接 `libgcc` / `libstdc++`，默认开启。
 - `-DTX_STATIC_MSVC_RUNTIME=ON|OFF`：在 MSVC 下使用静态运行时 `/MT` 或 `/MTd`，默认开启。
 - `-DCMAKE_BUILD_TYPE=Debug|Release`：选择调试或发布构建。
@@ -110,16 +119,20 @@ build/bin/tx_server
 ```sh
 cmake -B build-linux \
   -DCMAKE_BUILD_TYPE=Release \
+  -DTX_FETCH_DEPS=ON \
   -DTX_LINK_STATIC_DEPS=ON \
   -DTX_STATIC_CXX_RUNTIME=ON \
-  -DLIBUV_INCLUDE_DIR=/path/to/libuv/include \
-  -DLIBUV_LIBRARY=/path/to/libuv/lib/libuv.a \
-  -DNLOHMANN_JSON_INCLUDE_DIR=/path/to/nlohmann-json/include \
   -DOPENSSL_ROOT_DIR=/path/to/openssl
 cmake --build build-linux -j$(nproc)
 ```
 
 如果系统同时安装了动态版和静态版 OpenSSL，`TX_LINK_STATIC_DEPS=ON` 会优先查找静态库。
+也可以使用 preset：
+
+```sh
+cmake --preset linux-release
+cmake --build --preset linux-release
+```
 
 ### Windows 构建
 
@@ -130,19 +143,17 @@ cmake -B build-win `
   -G "Visual Studio 17 2022" `
   -A x64 `
   -DCMAKE_BUILD_TYPE=Release `
+  -DTX_FETCH_DEPS=ON `
   -DTX_LINK_STATIC_DEPS=ON `
   -DTX_STATIC_MSVC_RUNTIME=ON `
-  -DLIBUV_INCLUDE_DIR=C:/deps/libuv/include `
-  -DLIBUV_LIBRARY=C:/deps/libuv/lib/uv_a.lib `
-  -DNLOHMANN_JSON_INCLUDE_DIR=C:/deps/nlohmann-json/include `
   -DOPENSSL_ROOT_DIR=C:/deps/openssl
 cmake --build build-win --config Release
 ```
 
 建议：
 
-- `libuv` 使用静态库，如 `uv_a.lib`。
 - OpenSSL 准备静态库版本，并通过 `OPENSSL_ROOT_DIR` 指向安装根目录。
+- `libuv` 和 `nlohmann_json` 可以由 `TX_FETCH_DEPS=ON` 下载到 `.deps/`，也可以手工指定本地路径。
 - 如果你用的是 MinGW，也可以保留 `TX_STATIC_CXX_RUNTIME=ON`，让 `libgcc/libstdc++` 尽量静态链接。
 
 ### Android 共享库构建
@@ -163,10 +174,9 @@ cmake -B build-android \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
+  -DANDROID_STL=c++_static \
+  -DTX_FETCH_DEPS=ON \
   -DTX_LINK_STATIC_DEPS=ON \
-  -DLIBUV_INCLUDE_DIR=/path/to/android/libuv/include \
-  -DLIBUV_LIBRARY=/path/to/android/libuv/libuv.a \
-  -DNLOHMANN_JSON_INCLUDE_DIR=/path/to/nlohmann-json/include \
   -DOPENSSL_ROOT_DIR=/path/to/android/openssl
 cmake --build build-android -j$(nproc)
 ```
@@ -177,7 +187,7 @@ cmake --build build-android -j$(nproc)
 build-android/lib/libtx.so
 ```
 
-Android 模式下，第三方依赖会优先静态链接进 `libtx.so`，减少目标设备上的运行时依赖。
+Android 模式下，第三方依赖会优先静态链接进 `libtx.so`，并使用 NDK 的 `c++_static`。
 
 ## 测试
 

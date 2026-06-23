@@ -206,7 +206,7 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
     if (self->closed_) return;
 
     if (nread > 0) {
-        Buffer tmp;
+        Buffer tmp(static_cast<size_t>(nread));
         tmp.append(reinterpret_cast<uint8_t*>(buf->base), static_cast<size_t>(nread));
         if (self->read_cb_) {
             self->read_cb_(self->shared_from_this(), tmp);

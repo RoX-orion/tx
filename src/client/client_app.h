@@ -33,6 +33,7 @@ public:
 
 private:
     struct RouteDnsCtx;
+    struct TunnelTimerCtx;
 
     // ---- Proxy connection handling ----
 
@@ -47,9 +48,16 @@ private:
         SessionId            session_id;
         Buffer               pending_data;        // Data buffered before tunnel connected
         Buffer               proto_buf;           // Protocol parsing buffer (survives across reads)
+        TunnelCodec          tunnel_codec;        // Per-proxy tunnel codec
+        std::vector<uint8_t> tunnel_client_nonce;
+        Buffer               tunnel_handshake_buf;
+        Buffer               tunnel_recv_buf;
+        uv_timer_t*          tunnel_timer;
         bool                 connected;
         bool                 connect_result_sent;
         bool                 target_dispatched;
+        bool                 tunnel_connected;
+        bool                 tunnel_connecting;
     };
     using ProxyConnPtr = std::shared_ptr<ProxyConn>;
 
@@ -67,18 +75,22 @@ private:
     void connect_via_tunnel(ProxyConnPtr conn);
 
     // Tunnel connection
-    bool ensure_tunnel();
-    void on_tunnel_read(Buffer& data);
-    void on_tunnel_handshake_read(Buffer& data);
-    void finish_tunnel_handshake(const std::vector<uint8_t>& server_nonce);
+    bool start_tunnel(ProxyConnPtr conn);
+    void on_tunnel_read(ProxyConnPtr conn, Buffer& data);
+    void on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data);
+    void finish_tunnel_handshake(ProxyConnPtr conn,
+                                 const std::vector<uint8_t>& server_nonce);
     void tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len);
     void tunnel_send_connect(ProxyConnPtr conn);
     void tunnel_send_disconnect(ProxyConnPtr conn);
     void activate_tunnel_connection(ProxyConnPtr conn);
     void complete_tunnel_connection(ProxyConnPtr conn);
     void fail_tunnel_connection(ProxyConnPtr conn);
-    void fail_pending_tunnel_connections();
-    void fail_all_tunnel_connections();
+    void close_tunnel_session(ProxyConnPtr conn);
+    void start_tunnel_timer(ProxyConnPtr conn, uint64_t timeout_ms, const char* phase);
+    void stop_tunnel_timer(ProxyConnPtr conn);
+    static void on_tunnel_timer(uv_timer_t* timer);
+    static void on_tunnel_timer_closed(uv_handle_t* handle);
 
     // DNS resolution for routing
     void resolve_and_route(ProxyConnPtr conn);
@@ -94,23 +106,12 @@ private:
     TcpServer          http_server_;
     TcpServer          socks5_server_;
 
-    // Tunnel to server
-    SessionPtr         tunnel_session_;
-    TunnelCodec        tunnel_codec_;
+    // Tunnel crypto
     std::vector<uint8_t> tunnel_master_key_;
-    std::vector<uint8_t> tunnel_client_nonce_;
-    Buffer             tunnel_handshake_buf_;
-    Buffer             tunnel_recv_buf_;
-    bool               tunnel_connected_;
-    bool               tunnel_connecting_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;
     SessionId          next_session_id_;
-
-    // Pending tunnel messages (before tunnel connects)
-    Buffer             tunnel_send_buf_;
-    std::vector<ProxyConnPtr> pending_tunnel_conns_;
 };
 
 } // namespace tx

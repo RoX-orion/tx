@@ -11,7 +11,8 @@ namespace tx {
 
 namespace {
 
-constexpr size_t kMaxClientTunnelBacklog = 64 * 1024 * 1024;
+constexpr uint64_t kTunnelHandshakeTimeoutMs = 8000;
+constexpr uint64_t kTunnelConnectResultTimeoutMs = 15000;
 
 bool is_ip_literal(const std::string& host) {
     struct in_addr v4;
@@ -50,13 +51,16 @@ struct ClientApp::RouteDnsCtx {
     ProxyConnPtr conn;
 };
 
+struct ClientApp::TunnelTimerCtx {
+    ClientApp* app;
+    ProxyConnPtr conn;
+    std::string phase;
+};
+
 ClientApp::ClientApp()
     : loop_(uv_default_loop()),
       http_server_(loop_),
       socks5_server_(loop_),
-      tunnel_codec_(nullptr),
-      tunnel_connected_(false),
-      tunnel_connecting_(false),
       next_session_id_(1) {}
 
 ClientApp::~ClientApp() {
@@ -68,8 +72,6 @@ bool ClientApp::init(const ClientConfig& config) {
 
     // Initialize crypto — deterministic key from password (must match server)
     tunnel_master_key_ = KeyDeriver::derive_deterministic(config.password);
-    auto aes = std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size());
-    tunnel_codec_ = TunnelCodec(aes);
 
     // Load router
     if (!router_.load(config.router)) {
@@ -106,7 +108,19 @@ int ClientApp::run() {
 void ClientApp::stop() {
     http_server_.stop();
     socks5_server_.stop();
-    if (tunnel_session_) tunnel_session_->close();
+    for (auto& kv : connections_) {
+        auto& conn = kv.second;
+        close_tunnel_session(conn);
+        if (conn->direct_session && !conn->direct_session->is_closed()) {
+            conn->direct_session->set_close_callback(nullptr);
+            conn->direct_session->close();
+        }
+        if (conn->local_session && !conn->local_session->is_closed()) {
+            conn->local_session->set_close_callback(nullptr);
+            conn->local_session->close();
+        }
+    }
+    connections_.clear();
     uv_stop(loop_);
 }
 
@@ -119,7 +133,12 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->connected = false;
     conn->connect_result_sent = false;
     conn->target_dispatched = false;
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = false;
+    conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
+    conn->tunnel_codec = TunnelCodec(
+        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
 
     conn->http->set_target_callback([this, conn](const TargetAddr& target) {
         conn->target = target;
@@ -181,7 +200,12 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->connected = false;
     conn->connect_result_sent = false;
     conn->target_dispatched = false;
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = false;
+    conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
+    conn->tunnel_codec = TunnelCodec(
+        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
 
     conn->socks5->set_target_callback([this, conn](const TargetAddr& target) {
         conn->target = target;
@@ -431,134 +455,142 @@ void ClientApp::connect_via_tunnel(ProxyConnPtr conn) {
 
     connections_[conn->session_id] = conn;
 
-    if (tunnel_connected_) {
-        activate_tunnel_connection(conn);
-        return;
-    }
-
-    pending_tunnel_conns_.push_back(conn);
-
-    if (!ensure_tunnel()) {
+    if (!start_tunnel(conn)) {
         TX_ERROR("Failed to establish tunnel");
-        fail_pending_tunnel_connections();
+        fail_tunnel_connection(conn);
     }
 }
 
-bool ClientApp::ensure_tunnel() {
-    if (tunnel_session_ && tunnel_connected_) return true;
-    if (tunnel_session_ && tunnel_connecting_) return true;
+bool ClientApp::start_tunnel(ProxyConnPtr conn) {
+    if (!conn || !conn->local_session || conn->local_session->is_closed()) {
+        return false;
+    }
+    if (conn->tunnel_session && (conn->tunnel_connected || conn->tunnel_connecting)) {
+        return true;
+    }
 
-    tunnel_session_ = std::make_shared<TcpSession>(loop_);
-    tunnel_connected_ = false;
-    tunnel_connecting_ = true;
-    tunnel_recv_buf_.clear();
+    auto tunnel = std::make_shared<TcpSession>(loop_);
+    conn->tunnel_session = tunnel;
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = true;
+    conn->tunnel_handshake_buf.clear();
+    conn->tunnel_recv_buf.clear();
+    conn->tunnel_client_nonce.clear();
+    conn->tunnel_codec = TunnelCodec(
+        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
+    start_tunnel_timer(conn, kTunnelHandshakeTimeoutMs, "handshake");
 
-    tunnel_session_->set_close_callback([this](SessionPtr session) {
-        TX_WARN("Tunnel disconnected");
-        if (tunnel_session_ == session) {
-            tunnel_connected_ = false;
-            tunnel_connecting_ = false;
-            tunnel_session_.reset();
-            fail_all_tunnel_connections();
+    tunnel->set_close_callback([this, conn, tunnel](SessionPtr) {
+        TX_WARN("Tunnel disconnected for session %u", conn->session_id);
+        if (conn->tunnel_session == tunnel) {
+            conn->tunnel_connected = false;
+            conn->tunnel_connecting = false;
+            conn->tunnel_session.reset();
+            fail_tunnel_connection(conn);
         }
     });
 
-    tunnel_session_->connect(config_.server_host, config_.server_port,
-        [this](bool success) {
-            if (success) {
-                tunnel_handshake_buf_.clear();
-                tunnel_client_nonce_.clear();
-                TX_INFO("Tunnel connected to %s:%u",
-                        config_.server_host.c_str(), config_.server_port);
+    tunnel->connect(config_.server_host, config_.server_port,
+        [this, conn, tunnel](bool success) {
+            if (!conn || conn->tunnel_session != tunnel ||
+                !conn->local_session || conn->local_session->is_closed()) {
+                if (tunnel && !tunnel->is_closed()) {
+                    tunnel->close();
+                }
+                return;
+            }
 
-                tunnel_session_->start_read([this](SessionPtr, Buffer& data) {
-                    on_tunnel_handshake_read(data);
+            if (success) {
+                conn->tunnel_handshake_buf.clear();
+                conn->tunnel_client_nonce.clear();
+                TX_INFO("Tunnel connected to %s:%u for session %u",
+                        config_.server_host.c_str(), config_.server_port,
+                        conn->session_id);
+
+                tunnel->start_read([this, conn](SessionPtr, Buffer& data) {
+                    on_tunnel_handshake_read(conn, data);
                 });
 
                 Buffer hello;
                 if (!TunnelCodec::build_client_hello(tunnel_master_key_, hello,
-                                                      tunnel_client_nonce_)) {
-                    TX_ERROR("Failed to build tunnel handshake");
-                    fail_pending_tunnel_connections();
-                    if (tunnel_session_ && !tunnel_session_->is_closed()) {
-                        tunnel_session_->close();
-                    }
+                                                      conn->tunnel_client_nonce)) {
+                    TX_ERROR("Failed to build tunnel handshake for session %u",
+                             conn->session_id);
+                    fail_tunnel_connection(conn);
                     return;
                 }
-                tunnel_session_->send(hello);
+                tunnel->send(hello);
             } else {
-                tunnel_connecting_ = false;
-                tunnel_connected_ = false;
-                TX_ERROR("Tunnel connect failed to %s:%u",
-                         config_.server_host.c_str(), config_.server_port);
-                fail_pending_tunnel_connections();
-                if (tunnel_session_ && !tunnel_session_->is_closed()) {
-                    tunnel_session_->close();
-                }
+                conn->tunnel_connecting = false;
+                conn->tunnel_connected = false;
+                TX_ERROR("Tunnel connect failed to %s:%u for session %u",
+                         config_.server_host.c_str(), config_.server_port,
+                         conn->session_id);
+                fail_tunnel_connection(conn);
             }
         });
 
     return true;
 }
 
-void ClientApp::on_tunnel_handshake_read(Buffer& data) {
-    tunnel_handshake_buf_.append(data);
+void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
+    if (!conn) {
+        data.clear();
+        return;
+    }
+
+    conn->tunnel_handshake_buf.append(data);
     data.clear();
 
-    if (tunnel_handshake_buf_.readable() < TunnelCodec::kHandshakeSize) {
+    if (conn->tunnel_handshake_buf.readable() < TunnelCodec::kHandshakeSize) {
         return;
     }
 
     std::vector<uint8_t> server_nonce;
-    if (!TunnelCodec::parse_server_hello(tunnel_master_key_, tunnel_client_nonce_,
-                                          tunnel_handshake_buf_.data(),
+    if (!TunnelCodec::parse_server_hello(tunnel_master_key_, conn->tunnel_client_nonce,
+                                          conn->tunnel_handshake_buf.data(),
                                           TunnelCodec::kHandshakeSize,
                                           server_nonce)) {
-        TX_ERROR("Tunnel handshake failed");
-        fail_pending_tunnel_connections();
-        if (tunnel_session_ && !tunnel_session_->is_closed()) {
-            tunnel_session_->close();
-        }
+        TX_ERROR("Tunnel handshake failed for session %u", conn->session_id);
+        fail_tunnel_connection(conn);
         return;
     }
 
-    tunnel_handshake_buf_.consume(TunnelCodec::kHandshakeSize);
-    finish_tunnel_handshake(server_nonce);
+    conn->tunnel_handshake_buf.consume(TunnelCodec::kHandshakeSize);
+    finish_tunnel_handshake(conn, server_nonce);
 
-    if (!tunnel_handshake_buf_.empty()) {
-        tunnel_recv_buf_.append(tunnel_handshake_buf_);
-        tunnel_handshake_buf_.clear();
-        on_tunnel_read(tunnel_recv_buf_);
+    if (!conn->tunnel_handshake_buf.empty()) {
+        conn->tunnel_recv_buf.append(conn->tunnel_handshake_buf);
+        conn->tunnel_handshake_buf.clear();
+        on_tunnel_read(conn, conn->tunnel_recv_buf);
     }
 }
 
-void ClientApp::finish_tunnel_handshake(const std::vector<uint8_t>& server_nonce) {
+void ClientApp::finish_tunnel_handshake(ProxyConnPtr conn,
+                                        const std::vector<uint8_t>& server_nonce) {
+    if (!conn || !conn->tunnel_session || conn->tunnel_session->is_closed()) {
+        return;
+    }
+
     auto session_key = TunnelCodec::derive_session_key(tunnel_master_key_,
-                                                       tunnel_client_nonce_,
+                                                       conn->tunnel_client_nonce,
                                                        server_nonce);
     auto aes = std::make_shared<AesGcm>(session_key.data(), session_key.size());
-    tunnel_codec_ = TunnelCodec(aes);
-    tunnel_client_nonce_.clear();
+    conn->tunnel_codec = TunnelCodec(aes);
+    conn->tunnel_client_nonce.clear();
+    stop_tunnel_timer(conn);
 
-    tunnel_connecting_ = false;
-    tunnel_connected_ = true;
-    TX_INFO("Tunnel handshake complete");
+    conn->tunnel_connecting = false;
+    conn->tunnel_connected = true;
+    TX_INFO("Tunnel handshake complete for session %u", conn->session_id);
 
-    tunnel_session_->start_read([this](SessionPtr, Buffer& data) {
-        tunnel_recv_buf_.append(data);
+    conn->tunnel_session->start_read([this, conn](SessionPtr, Buffer& data) {
+        conn->tunnel_recv_buf.append(data);
         data.clear();
-        on_tunnel_read(tunnel_recv_buf_);
+        on_tunnel_read(conn, conn->tunnel_recv_buf);
     });
 
-    auto pending = pending_tunnel_conns_;
-    pending_tunnel_conns_.clear();
-    for (auto& conn : pending) {
-        activate_tunnel_connection(conn);
-    }
-
-    if (!tunnel_send_buf_.empty()) {
-        tunnel_session_->send(tunnel_send_buf_);
-    }
+    activate_tunnel_connection(conn);
 }
 
 void ClientApp::activate_tunnel_connection(ProxyConnPtr conn) {
@@ -573,6 +605,7 @@ void ClientApp::activate_tunnel_connection(ProxyConnPtr conn) {
 
     tunnel_send_connect(conn);
     conn->connected = true;
+    start_tunnel_timer(conn, kTunnelConnectResultTimeoutMs, "connect-result");
 }
 
 void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
@@ -582,6 +615,7 @@ void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
     }
 
     conn->connect_result_sent = true;
+    stop_tunnel_timer(conn);
     TX_INFO("[Proxy] CONNECT established for session %u: %s:%u",
             conn->session_id, conn->target.host.c_str(), conn->target.port);
 
@@ -611,6 +645,8 @@ void ClientApp::fail_tunnel_connection(ProxyConnPtr conn) {
     if (!conn) return;
 
     connections_.erase(conn->session_id);
+    conn->connected = false;
+    close_tunnel_session(conn);
 
     if (!conn->local_session || conn->local_session->is_closed()) {
         return;
@@ -632,90 +668,144 @@ void ClientApp::fail_tunnel_connection(ProxyConnPtr conn) {
     conn->local_session->close();
 }
 
-void ClientApp::fail_pending_tunnel_connections() {
-    auto pending = pending_tunnel_conns_;
-    pending_tunnel_conns_.clear();
-    tunnel_send_buf_.clear();
+void ClientApp::close_tunnel_session(ProxyConnPtr conn) {
+    if (!conn) return;
 
-    for (auto& conn : pending) {
-        if (!conn || conn->connected) continue;
-        fail_tunnel_connection(conn);
+    auto tunnel = conn->tunnel_session;
+    conn->tunnel_session.reset();
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = false;
+    conn->tunnel_client_nonce.clear();
+    conn->tunnel_handshake_buf.clear();
+    conn->tunnel_recv_buf.clear();
+    stop_tunnel_timer(conn);
+
+    if (tunnel && !tunnel->is_closed()) {
+        tunnel->set_close_callback(nullptr);
+        tunnel->close();
     }
 }
 
-void ClientApp::fail_all_tunnel_connections() {
-    fail_pending_tunnel_connections();
+void ClientApp::start_tunnel_timer(ProxyConnPtr conn, uint64_t timeout_ms, const char* phase) {
+    if (!conn) return;
 
-    auto active = std::move(connections_);
-    connections_.clear();
+    stop_tunnel_timer(conn);
 
-    for (auto& kv : active) {
-        fail_tunnel_connection(kv.second);
+    auto* timer = new uv_timer_t;
+    auto* ctx = new TunnelTimerCtx{this, conn, phase ? phase : "unknown"};
+    timer->data = ctx;
+
+    if (uv_timer_init(loop_, timer) != 0) {
+        delete ctx;
+        delete timer;
+        return;
     }
+
+    conn->tunnel_timer = timer;
+    int r = uv_timer_start(timer, ClientApp::on_tunnel_timer, timeout_ms, 0);
+    if (r != 0) {
+        conn->tunnel_timer = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_tunnel_timer_closed);
+    }
+}
+
+void ClientApp::stop_tunnel_timer(ProxyConnPtr conn) {
+    if (!conn || !conn->tunnel_timer) return;
+
+    auto* timer = conn->tunnel_timer;
+    conn->tunnel_timer = nullptr;
+
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_timer_stop(timer);
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_tunnel_timer_closed);
+    }
+}
+
+void ClientApp::on_tunnel_timer(uv_timer_t* timer) {
+    auto* ctx = static_cast<TunnelTimerCtx*>(timer->data);
+    if (!ctx || !ctx->app) return;
+
+    auto conn = ctx->conn;
+    std::string phase = ctx->phase;
+    if (!conn || conn->tunnel_timer != timer) {
+        return;
+    }
+
+    conn->tunnel_timer = nullptr;
+    TX_ERROR("Tunnel %s timeout for session %u: %s:%u",
+             phase.c_str(), conn->session_id,
+             conn->target.host.c_str(), conn->target.port);
+    ctx->app->fail_tunnel_connection(conn);
+
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_tunnel_timer_closed);
+    }
+}
+
+void ClientApp::on_tunnel_timer_closed(uv_handle_t* handle) {
+    auto* ctx = static_cast<TunnelTimerCtx*>(handle->data);
+    delete ctx;
+    delete reinterpret_cast<uv_timer_t*>(handle);
 }
 
 void ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
-    if (!tunnel_connected_ && tunnel_send_buf_.readable() > kMaxClientTunnelBacklog) {
-        TX_ERROR("Client tunnel backlog too large before CONNECT (%zu bytes), failing session %u",
-                 tunnel_send_buf_.readable(), conn->session_id);
+    if (!conn || !conn->tunnel_connected ||
+        !conn->tunnel_session || conn->tunnel_session->is_closed()) {
         fail_tunnel_connection(conn);
         return;
     }
 
     Buffer encoded;
-    if (tunnel_codec_.encode(TunnelCmd::Connect, conn->session_id,
-                              conn->target, nullptr, 0, encoded)) {
-        if (tunnel_connected_ && tunnel_session_) {
-            tunnel_session_->send(encoded);
-        } else {
-            tunnel_send_buf_.append(encoded);
-        }
+    if (conn->tunnel_codec.encode(TunnelCmd::Connect, conn->session_id,
+                                  conn->target, nullptr, 0, encoded)) {
+        conn->tunnel_session->send(encoded);
     }
 }
 
 void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) {
-    if (!tunnel_connected_ && tunnel_send_buf_.readable() + len > kMaxClientTunnelBacklog) {
-        TX_ERROR("Client tunnel backlog too large (%zu + %zu bytes), closing session %u",
-                 tunnel_send_buf_.readable(), len, conn->session_id);
+    if (!conn || !conn->tunnel_connected ||
+        !conn->tunnel_session || conn->tunnel_session->is_closed()) {
         fail_tunnel_connection(conn);
         return;
     }
 
     Buffer encoded;
-    if (!tunnel_codec_.encode_data_chunks(conn->session_id, data, len, encoded)) {
+    if (!conn->tunnel_codec.encode_data_chunks(conn->session_id, data, len, encoded)) {
         return;
     }
 
-    if (tunnel_connected_ && tunnel_session_) {
-        tunnel_session_->send(encoded);
-    } else {
-        tunnel_send_buf_.append(encoded);
-    }
+    conn->tunnel_session->send(encoded);
 }
 
 void ClientApp::tunnel_send_disconnect(ProxyConnPtr conn) {
+    if (!conn || !conn->tunnel_connected ||
+        !conn->tunnel_session || conn->tunnel_session->is_closed()) {
+        return;
+    }
+
     Buffer encoded;
-    if (tunnel_codec_.encode_disconnect(conn->session_id, encoded)) {
-        if (tunnel_connected_ && tunnel_session_) {
-            tunnel_session_->send(encoded);
-        }
+    if (conn->tunnel_codec.encode_disconnect(conn->session_id, encoded)) {
+        conn->tunnel_session->send(encoded);
     }
 }
 
-void ClientApp::on_tunnel_read(Buffer& data) {
+void ClientApp::on_tunnel_read(ProxyConnPtr conn, Buffer& data) {
+    if (!conn) {
+        data.clear();
+        return;
+    }
+
     TunnelCmd cmd;
     SessionId session_id;
     TargetAddr target;
     Buffer payload;
 
-    while (tunnel_codec_.decode(data, cmd, session_id, target, payload)) {
-        auto it = connections_.find(session_id);
-        if (it == connections_.end()) {
-            TX_DEBUG("Tunnel data for unknown session %u", session_id);
+    while (conn->tunnel_codec.decode(data, cmd, session_id, target, payload)) {
+        if (session_id != conn->session_id) {
+            TX_WARN("Tunnel data for unexpected session %u on tunnel for session %u",
+                    session_id, conn->session_id);
             continue;
         }
-
-        auto& conn = it->second;
 
         switch (cmd) {
             case TunnelCmd::Data:
@@ -747,31 +837,27 @@ void ClientApp::on_tunnel_read(Buffer& data) {
         }
     }
 
-    if (tunnel_codec_.has_protocol_error()) {
+    if (conn->tunnel_codec.has_protocol_error()) {
         TX_ERROR("Closing tunnel because remote data is not valid TX tunnel protocol");
-        tunnel_codec_.clear_protocol_error();
-        fail_pending_tunnel_connections();
-        auto connections = std::move(connections_);
-        connections_.clear();
-        for (auto& kv : connections) {
-            fail_tunnel_connection(kv.second);
-        }
-        if (tunnel_session_ && !tunnel_session_->is_closed()) {
-            tunnel_session_->close();
-        }
+        conn->tunnel_codec.clear_protocol_error();
+        fail_tunnel_connection(conn);
     }
 }
 
 void ClientApp::on_proxy_close(ProxyConnPtr conn) {
+    if (!conn) return;
+
     TX_DEBUG("Proxy connection closed, session %u", conn->session_id);
 
     if (conn->direct_session && !conn->direct_session->is_closed()) {
+        conn->direct_session->set_close_callback(nullptr);
         conn->direct_session->close();
     }
 
     if (conn->route == RouteAction::Proxy) {
         tunnel_send_disconnect(conn);
         connections_.erase(conn->session_id);
+        close_tunnel_session(conn);
     }
 }
 

@@ -1,6 +1,5 @@
 #include "client_app.h"
 #include "tx/common/log.h"
-#include "tx/crypto/key_derive.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -70,8 +69,7 @@ ClientApp::~ClientApp() {
 bool ClientApp::init(const ClientConfig& config) {
     config_ = config;
 
-    // Initialize crypto — deterministic key from password (must match server)
-    tunnel_master_key_ = KeyDeriver::derive_deterministic(config.password);
+    tunnel_psk_ = config.psk;
 
     // Load router
     if (!router_.load(config.router)) {
@@ -137,8 +135,6 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
-    conn->tunnel_codec = TunnelCodec(
-        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
 
     conn->http->set_target_callback([this, conn](const TargetAddr& target) {
         conn->target = target;
@@ -204,8 +200,6 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
-    conn->tunnel_codec = TunnelCodec(
-        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
 
     conn->socks5->set_target_callback([this, conn](const TargetAddr& target) {
         conn->target = target;
@@ -475,9 +469,7 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
     conn->tunnel_connecting = true;
     conn->tunnel_handshake_buf.clear();
     conn->tunnel_recv_buf.clear();
-    conn->tunnel_client_nonce.clear();
-    conn->tunnel_codec = TunnelCodec(
-        std::make_shared<AesGcm>(tunnel_master_key_.data(), tunnel_master_key_.size()));
+    TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
     start_tunnel_timer(conn, kTunnelHandshakeTimeoutMs, "handshake");
 
     tunnel->set_close_callback([this, conn, tunnel](SessionPtr) {
@@ -502,7 +494,7 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
 
             if (success) {
                 conn->tunnel_handshake_buf.clear();
-                conn->tunnel_client_nonce.clear();
+                TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
                 TX_INFO("Tunnel connected to %s:%u for session %u",
                         config_.server_host.c_str(), config_.server_port,
                         conn->session_id);
@@ -512,8 +504,8 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                 });
 
                 Buffer hello;
-                if (!TunnelCodec::build_client_hello(tunnel_master_key_, hello,
-                                                      conn->tunnel_client_nonce)) {
+                if (!TunnelCodec::build_client_hello(tunnel_psk_, config_.cipher, hello,
+                                                      conn->tunnel_handshake_state)) {
                     TX_ERROR("Failed to build tunnel handshake for session %u",
                              conn->session_id);
                     fail_tunnel_connection(conn);
@@ -546,18 +538,17 @@ void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
         return;
     }
 
-    std::vector<uint8_t> server_nonce;
-    if (!TunnelCodec::parse_server_hello(tunnel_master_key_, conn->tunnel_client_nonce,
+    TunnelTrafficKeys keys;
+    if (!TunnelCodec::parse_server_hello(tunnel_psk_, conn->tunnel_handshake_state,
                                           conn->tunnel_handshake_buf.data(),
                                           TunnelCodec::kHandshakeSize,
-                                          server_nonce)) {
-        TX_ERROR("Tunnel handshake failed for session %u", conn->session_id);
+                                          keys)) {
         fail_tunnel_connection(conn);
         return;
     }
 
     conn->tunnel_handshake_buf.consume(TunnelCodec::kHandshakeSize);
-    finish_tunnel_handshake(conn, server_nonce);
+    finish_tunnel_handshake(conn, keys);
 
     if (!conn->tunnel_handshake_buf.empty()) {
         conn->tunnel_recv_buf.append(conn->tunnel_handshake_buf);
@@ -567,17 +558,13 @@ void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
 }
 
 void ClientApp::finish_tunnel_handshake(ProxyConnPtr conn,
-                                        const std::vector<uint8_t>& server_nonce) {
+                                        const TunnelTrafficKeys& keys) {
     if (!conn || !conn->tunnel_session || conn->tunnel_session->is_closed()) {
         return;
     }
 
-    auto session_key = TunnelCodec::derive_session_key(tunnel_master_key_,
-                                                       conn->tunnel_client_nonce,
-                                                       server_nonce);
-    auto aes = std::make_shared<AesGcm>(session_key.data(), session_key.size());
-    conn->tunnel_codec = TunnelCodec(aes);
-    conn->tunnel_client_nonce.clear();
+    conn->tunnel_codec = TunnelCodec(keys, true);
+    TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
     stop_tunnel_timer(conn);
 
     conn->tunnel_connecting = false;
@@ -675,7 +662,7 @@ void ClientApp::close_tunnel_session(ProxyConnPtr conn) {
     conn->tunnel_session.reset();
     conn->tunnel_connected = false;
     conn->tunnel_connecting = false;
-    conn->tunnel_client_nonce.clear();
+    TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
     conn->tunnel_handshake_buf.clear();
     conn->tunnel_recv_buf.clear();
     stop_tunnel_timer(conn);

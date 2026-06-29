@@ -1,6 +1,5 @@
 #include "server_app.h"
 #include "tx/common/log.h"
-#include "tx/crypto/key_derive.h"
 
 namespace tx {
 
@@ -58,12 +57,6 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
     auto client = std::make_shared<TunnelClient>();
     client->session = session;
 
-    // Initialize with the deterministic master key for the authenticated handshake.
-    auto key = KeyDeriver::derive_deterministic(config_.password);
-    client->master_key = key;
-    auto aes = std::make_shared<AesGcm>(key.data(), key.size());
-    client->codec = TunnelCodec(aes);
-
     clients_[session->handle()] = client;
 
     session->set_close_callback([this, client](SessionPtr) {
@@ -86,12 +79,11 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
         return;
     }
 
-    std::vector<uint8_t> client_nonce;
-    if (!TunnelCodec::parse_client_hello(client->master_key,
+    TunnelPeerHello client_hello;
+    if (!TunnelCodec::parse_client_hello(config_.psk,
                                           client->handshake_buf.data(),
                                           TunnelCodec::kHandshakeSize,
-                                          client_nonce)) {
-        TX_ERROR("Tunnel handshake authentication failed");
+                                          client_hello)) {
         if (client->session && !client->session->is_closed()) {
             client->session->close();
         }
@@ -99,21 +91,17 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
     }
 
     Buffer hello;
-    std::vector<uint8_t> server_nonce;
-    if (!TunnelCodec::build_server_hello(client->master_key, client_nonce,
-                                          hello, server_nonce)) {
-        TX_ERROR("Failed to build tunnel server hello");
+    TunnelHandshakeState server_state;
+    TunnelTrafficKeys keys;
+    if (!TunnelCodec::build_server_hello(config_.psk, client_hello,
+                                          hello, server_state, keys)) {
         if (client->session && !client->session->is_closed()) {
             client->session->close();
         }
         return;
     }
 
-    auto session_key = TunnelCodec::derive_session_key(client->master_key,
-                                                       client_nonce,
-                                                       server_nonce);
-    auto aes = std::make_shared<AesGcm>(session_key.data(), session_key.size());
-    client->codec = TunnelCodec(aes);
+    client->codec = TunnelCodec(keys, false);
 
     client->session->send(hello);
     client->handshake_buf.consume(TunnelCodec::kHandshakeSize);

@@ -1,11 +1,13 @@
 #include "server_app.h"
 #include "tx/common/log.h"
+#include "tx/crypto/secret.h"
 
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <signal.h>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -21,6 +23,7 @@ static void print_usage(const char* prog) {
         "Usage: %s [options]\n"
         "  -c, --config <path>   Config file path (default: server.json)\n"
         "  -l, --log <level>     Log level: debug, info, warn, error (default: info)\n"
+        "      --gen-secret      Generate a 32-byte base64 PSK and exit\n"
         "  -h, --help            Show this help\n",
         prog);
 }
@@ -58,6 +61,13 @@ int main(int argc, char* argv[]) {
             config_path = argv[++i];
         } else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) && i + 1 < argc) {
             log_level = argv[++i];
+        } else if (strcmp(argv[i], "--gen-secret") == 0) {
+            std::vector<uint8_t> secret;
+            if (!tx::Secret::generate_psk(secret)) {
+                return 1;
+            }
+            printf("%s\n", tx::Secret::encode_base64_secret(secret.data(), secret.size()).c_str());
+            return 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;

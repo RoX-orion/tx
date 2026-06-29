@@ -1,8 +1,9 @@
 {
     "listen": {
-        "host": "0.0.0.0",
+        "host": "0.0.0.0", //support IPV6 -> ::
         "port": 443
     },
-    "password": "7e52be0e-6929-432b-b74e-4e1d559dbccb",
+    "secret": "uuid-v4:your-uuid-v4",
+    "cipher": "aes-256-gcm",
     "log_level": "info"
 }

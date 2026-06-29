@@ -1,5 +1,5 @@
 #include "tx/protocol/tunnel.h"
-#include "tx/crypto/key_derive.h"
+#include "tx/crypto/aead.h"
 
 #include <algorithm>
 #include <cassert>
@@ -10,9 +10,30 @@
 
 #define TX_ASSERT(expr) do { assert(expr); (void)sizeof(expr); } while (0)
 
-static tx::TunnelCodec make_codec(const std::vector<uint8_t>& key) {
-    auto aes = std::make_shared<tx::AesGcm>(key.data(), key.size());
-    return tx::TunnelCodec(aes);
+static std::vector<uint8_t> test_psk(uint8_t seed = 0x42) {
+    std::vector<uint8_t> psk(32);
+    for (size_t i = 0; i < psk.size(); ++i) {
+        psk[i] = static_cast<uint8_t>(seed + i);
+    }
+    return psk;
+}
+
+static tx::TunnelTrafficKeys fixed_keys(tx::AeadCipherKind cipher = tx::AeadCipherKind::Aes256Gcm) {
+    tx::TunnelTrafficKeys keys;
+    keys.cipher = cipher;
+    keys.client_to_server_key.assign(tx::AeadCipher::kKeyLen, 0x11);
+    keys.server_to_client_key.assign(tx::AeadCipher::kKeyLen, 0x22);
+    keys.client_to_server_nonce_prefix = {0xa1, 0xa2, 0xa3, 0xa4};
+    keys.server_to_client_nonce_prefix = {0xb1, 0xb2, 0xb3, 0xb4};
+    return keys;
+}
+
+static tx::TunnelCodec make_client_codec() {
+    return tx::TunnelCodec(fixed_keys(), true);
+}
+
+static tx::TunnelCodec make_server_codec() {
+    return tx::TunnelCodec(fixed_keys(), false);
 }
 
 static void assert_no_message(tx::TunnelCodec& codec, tx::Buffer& in) {
@@ -25,76 +46,75 @@ static void assert_no_message(tx::TunnelCodec& codec, tx::Buffer& in) {
 
 static void test_handshake_round_trip() {
     printf("  test_handshake_round_trip... ");
-    auto master_key = tx::KeyDeriver::derive_deterministic("shared-password");
+    auto psk = test_psk();
 
     tx::Buffer client_hello;
-    std::vector<uint8_t> client_nonce;
-    TX_ASSERT(tx::TunnelCodec::build_client_hello(master_key, client_hello, client_nonce));
+    tx::TunnelHandshakeState client_state;
+    TX_ASSERT(tx::TunnelCodec::build_client_hello(psk, tx::AeadCipherKind::Aes256Gcm,
+                                                  client_hello, client_state));
     TX_ASSERT(client_hello.readable() == tx::TunnelCodec::kHandshakeSize);
-    TX_ASSERT(client_nonce.size() == tx::TunnelCodec::kHandshakeNonceSize);
+    TX_ASSERT(client_state.nonce.size() == tx::TunnelCodec::kHandshakeNonceSize);
+    TX_ASSERT(client_state.public_key.size() == tx::TunnelCodec::kHandshakePublicKeySize);
 
-    std::vector<uint8_t> parsed_client_nonce;
-    TX_ASSERT(tx::TunnelCodec::parse_client_hello(master_key, client_hello.data(),
+    tx::TunnelPeerHello parsed_client_hello;
+    TX_ASSERT(tx::TunnelCodec::parse_client_hello(psk, client_hello.data(),
                                                   client_hello.readable(),
-                                                  parsed_client_nonce));
-    TX_ASSERT(parsed_client_nonce == client_nonce);
+                                                  parsed_client_hello));
+    TX_ASSERT(parsed_client_hello.nonce == client_state.nonce);
+    TX_ASSERT(parsed_client_hello.public_key == client_state.public_key);
 
     tx::Buffer server_hello;
-    std::vector<uint8_t> server_nonce;
-    TX_ASSERT(tx::TunnelCodec::build_server_hello(master_key, client_nonce,
-                                                  server_hello, server_nonce));
+    tx::TunnelHandshakeState server_state;
+    tx::TunnelTrafficKeys server_keys;
+    TX_ASSERT(tx::TunnelCodec::build_server_hello(psk, parsed_client_hello,
+                                                  server_hello, server_state, server_keys));
     TX_ASSERT(server_hello.readable() == tx::TunnelCodec::kHandshakeSize);
-    TX_ASSERT(server_nonce.size() == tx::TunnelCodec::kHandshakeNonceSize);
 
-    std::vector<uint8_t> parsed_server_nonce;
-    TX_ASSERT(tx::TunnelCodec::parse_server_hello(master_key, client_nonce,
+    tx::TunnelTrafficKeys client_keys;
+    TX_ASSERT(tx::TunnelCodec::parse_server_hello(psk, client_state,
                                                   server_hello.data(),
                                                   server_hello.readable(),
-                                                  parsed_server_nonce));
-    TX_ASSERT(parsed_server_nonce == server_nonce);
+                                                  client_keys));
 
-    auto client_session_key = tx::TunnelCodec::derive_session_key(master_key,
-                                                                  client_nonce,
-                                                                  server_nonce);
-    auto server_session_key = tx::TunnelCodec::derive_session_key(master_key,
-                                                                  parsed_client_nonce,
-                                                                  parsed_server_nonce);
-    TX_ASSERT(client_session_key == server_session_key);
-    TX_ASSERT(client_session_key.size() == tx::AesGcm::kKeyLen);
+    TX_ASSERT(client_keys.cipher == server_keys.cipher);
+    TX_ASSERT(client_keys.client_to_server_key == server_keys.client_to_server_key);
+    TX_ASSERT(client_keys.server_to_client_key == server_keys.server_to_client_key);
+    TX_ASSERT(client_keys.client_to_server_nonce_prefix == server_keys.client_to_server_nonce_prefix);
+    TX_ASSERT(client_keys.server_to_client_nonce_prefix == server_keys.server_to_client_nonce_prefix);
 
     printf("OK\n");
 }
 
 static void test_handshake_authentication_failure() {
     printf("  test_handshake_authentication_failure... ");
-    auto master_key = tx::KeyDeriver::derive_deterministic("shared-password");
-    auto wrong_key = tx::KeyDeriver::derive_deterministic("wrong-password");
+    auto psk = test_psk();
+    auto wrong_psk = test_psk(0x99);
 
     tx::Buffer client_hello;
-    std::vector<uint8_t> client_nonce;
-    TX_ASSERT(tx::TunnelCodec::build_client_hello(master_key, client_hello, client_nonce));
+    tx::TunnelHandshakeState client_state;
+    TX_ASSERT(tx::TunnelCodec::build_client_hello(psk, tx::AeadCipherKind::Aes256Gcm,
+                                                  client_hello, client_state));
 
-    std::vector<uint8_t> parsed_client_nonce;
-    TX_ASSERT(!tx::TunnelCodec::parse_client_hello(wrong_key, client_hello.data(),
+    tx::TunnelPeerHello parsed_client_hello;
+    TX_ASSERT(!tx::TunnelCodec::parse_client_hello(wrong_psk, client_hello.data(),
                                                    client_hello.readable(),
-                                                   parsed_client_nonce));
+                                                   parsed_client_hello));
 
     std::vector<uint8_t> tampered(client_hello.data(),
                                   client_hello.data() + client_hello.readable());
     TX_ASSERT(!tampered.empty());
     tampered[tampered.size() - 1] ^= 0x01;
-    TX_ASSERT(!tx::TunnelCodec::parse_client_hello(master_key, tampered.data(),
+    TX_ASSERT(!tx::TunnelCodec::parse_client_hello(psk, tampered.data(),
                                                    tampered.size(),
-                                                   parsed_client_nonce));
+                                                   parsed_client_hello));
 
     printf("OK\n");
 }
 
 static void test_connect_round_trip_domain() {
     printf("  test_connect_round_trip_domain... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     tx::TargetAddr target;
     target.type = tx::AddrType::Domain;
@@ -127,9 +147,8 @@ static void test_connect_round_trip_domain() {
 
 static void test_connect_round_trip_ip_addresses() {
     printf("  test_connect_round_trip_ip_addresses... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     tx::TargetAddr ipv4;
     ipv4.type = tx::AddrType::IPv4;
@@ -169,9 +188,8 @@ static void test_connect_round_trip_ip_addresses() {
 
 static void test_data_disconnect_and_connect_result() {
     printf("  test_data_disconnect_and_connect_result... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     const char data[] = "hello through tunnel";
     tx::Buffer encoded;
@@ -208,9 +226,8 @@ static void test_data_disconnect_and_connect_result() {
 
 static void test_partial_frame_waits_for_more_data() {
     printf("  test_partial_frame_waits_for_more_data... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     const char data[] = "split frame";
     tx::Buffer full;
@@ -241,9 +258,8 @@ static void test_partial_frame_waits_for_more_data() {
 
 static void test_data_chunking() {
     printf("  test_data_chunking... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     std::vector<uint8_t> data(tx::TunnelCodec::kMaxDataPayloadSize + 123);
     for (size_t i = 0; i < data.size(); ++i) {
@@ -272,8 +288,7 @@ static void test_data_chunking() {
 
 static void test_protocol_error_for_invalid_frame_length() {
     printf("  test_protocol_error_for_invalid_frame_length... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto decoder = make_codec(key);
+    auto decoder = make_server_codec();
 
     uint8_t invalid_len[] = {0x00, 0x00, 0x00, 0x01};
     tx::Buffer encoded;
@@ -288,9 +303,8 @@ static void test_protocol_error_for_invalid_frame_length() {
 
 static void test_tampered_frame_is_discarded() {
     printf("  test_tampered_frame_is_discarded... ");
-    auto key = tx::KeyDeriver::derive_deterministic("tunnel-key");
-    auto encoder = make_codec(key);
-    auto decoder = make_codec(key);
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
 
     const char data[] = "authenticated data";
     tx::Buffer encoded;
@@ -299,13 +313,37 @@ static void test_tampered_frame_is_discarded() {
 
     std::vector<uint8_t> tampered(encoded.data(),
                                   encoded.data() + encoded.readable());
-    tampered[tx::TunnelCodec::kLenPrefixSize + tx::AesGcm::kNonceLen] ^= 0x80;
+    tampered[tx::TunnelCodec::kLenPrefixSize] ^= 0x80;
 
     tx::Buffer tampered_buffer;
     tampered_buffer.append(tampered.data(), tampered.size());
     assert_no_message(decoder, tampered_buffer);
-    TX_ASSERT(!decoder.has_protocol_error());
+    TX_ASSERT(decoder.has_protocol_error());
     TX_ASSERT(tampered_buffer.empty());
+
+    printf("OK\n");
+}
+
+static void test_chacha20_poly1305_tunnel_round_trip() {
+    printf("  test_chacha20_poly1305_tunnel_round_trip... ");
+    auto keys = fixed_keys(tx::AeadCipherKind::ChaCha20Poly1305);
+    auto encoder = tx::TunnelCodec(keys, true);
+    auto decoder = tx::TunnelCodec(keys, false);
+
+    const char data[] = "chacha tunnel data";
+    tx::Buffer encoded;
+    TX_ASSERT(encoder.encode_data(91, reinterpret_cast<const uint8_t*>(data),
+                                  strlen(data), encoded));
+
+    tx::TunnelCmd cmd;
+    tx::SessionId session_id = 0;
+    tx::TargetAddr target;
+    tx::Buffer payload;
+    TX_ASSERT(decoder.decode(encoded, cmd, session_id, target, payload));
+    TX_ASSERT(cmd == tx::TunnelCmd::Data);
+    TX_ASSERT(session_id == 91);
+    TX_ASSERT(payload.readable() == strlen(data));
+    TX_ASSERT(memcmp(payload.data(), data, strlen(data)) == 0);
 
     printf("OK\n");
 }
@@ -321,6 +359,7 @@ int main() {
     test_data_chunking();
     test_protocol_error_for_invalid_frame_length();
     test_tampered_frame_is_discarded();
+    test_chacha20_poly1305_tunnel_round_trip();
     printf("All tunnel tests passed!\n");
     return 0;
 }

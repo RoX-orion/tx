@@ -1,5 +1,6 @@
 #include "config.h"
 #include "tx/common/log.h"
+#include "tx/crypto/secret.h"
 
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -88,8 +89,8 @@ bool ClientConfig::validate() const {
         TX_ERROR("Server port not configured");
         return false;
     }
-    if (password.empty()) {
-        TX_ERROR("Password not configured");
+    if (psk.size() != Secret::kPskLen) {
+        TX_ERROR("High-entropy secret not configured; use server.secret with base64:, hex:, or uuid-v4:");
         return false;
     }
     return true;
@@ -126,7 +127,22 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             auto& server = j["server"];
             if (server.contains("host")) config.server_host = server["host"].get<std::string>();
             if (server.contains("port")) config.server_port = server["port"].get<uint16_t>();
-            if (server.contains("password")) config.password = server["password"].get<std::string>();
+            if (server.contains("cipher")) {
+                std::string cipher_name = server["cipher"].get<std::string>();
+                if (!parse_aead_cipher(cipher_name, config.cipher)) {
+                    TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
+                    return false;
+                }
+            }
+            if (server.contains("secret")) {
+                config.secret = server["secret"].get<std::string>();
+                if (!Secret::parse_psk(config.secret, config.psk)) {
+                    return false;
+                }
+            } else if (server.contains("password")) {
+                TX_ERROR("server.password is no longer accepted; use server.secret with a high-entropy PSK");
+                return false;
+            }
         }
 
         // Geo config

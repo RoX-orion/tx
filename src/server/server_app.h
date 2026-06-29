@@ -6,7 +6,6 @@
 #include <unordered_map>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
-#include "tx/crypto/aes_gcm.h"
 #include "tx/protocol/tunnel.h"
 #include "config.h"
 
@@ -28,7 +27,6 @@ private:
     struct TunnelClient {
         SessionPtr       session;
         TunnelCodec      codec;
-        std::vector<uint8_t> master_key;
         Buffer           handshake_buf;
         Buffer           recv_buf;
         bool             outbounds_paused = false;

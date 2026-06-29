@@ -2,6 +2,8 @@
 
 #include <string>
 #include <cstdint>
+#include <vector>
+#include "tx/crypto/aead.h"
 
 namespace tx {
 
@@ -11,7 +13,9 @@ struct ServerConfig {
     uint16_t    listen_port = 443;
 
     // Authentication
-    std::string password;
+    std::string secret;
+    std::vector<uint8_t> psk;
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
 
     // Logging
     std::string log_level = "info";

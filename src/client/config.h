@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <vector>
+#include "tx/crypto/aead.h"
 #include "tx/router/router.h"
 
 namespace tx {
@@ -17,7 +19,9 @@ struct ClientConfig {
     // Server connection
     std::string server_host;
     uint16_t    server_port = 443;
-    std::string password;
+    std::string secret;
+    std::vector<uint8_t> psk;
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
 
     // Geo routing
     RouterConfig router;

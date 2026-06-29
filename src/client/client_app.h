@@ -7,7 +7,6 @@
 #include <vector>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
-#include "tx/crypto/aes_gcm.h"
 #include "tx/protocol/tunnel.h"
 #include "tx/protocol/socks5.h"
 #include "tx/protocol/http_proxy.h"
@@ -49,7 +48,7 @@ private:
         Buffer               pending_data;        // Data buffered before tunnel connected
         Buffer               proto_buf;           // Protocol parsing buffer (survives across reads)
         TunnelCodec          tunnel_codec;        // Per-proxy tunnel codec
-        std::vector<uint8_t> tunnel_client_nonce;
+        TunnelHandshakeState tunnel_handshake_state;
         Buffer               tunnel_handshake_buf;
         Buffer               tunnel_recv_buf;
         uv_timer_t*          tunnel_timer;
@@ -79,7 +78,7 @@ private:
     void on_tunnel_read(ProxyConnPtr conn, Buffer& data);
     void on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data);
     void finish_tunnel_handshake(ProxyConnPtr conn,
-                                 const std::vector<uint8_t>& server_nonce);
+                                 const TunnelTrafficKeys& keys);
     void tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len);
     void tunnel_send_connect(ProxyConnPtr conn);
     void tunnel_send_disconnect(ProxyConnPtr conn);
@@ -107,7 +106,7 @@ private:
     TcpServer          socks5_server_;
 
     // Tunnel crypto
-    std::vector<uint8_t> tunnel_master_key_;
+    std::vector<uint8_t> tunnel_psk_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

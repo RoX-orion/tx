@@ -1,6 +1,6 @@
 # tx
 
-`tx` 是一个基于 C++14 的代理 / 隧道程序，提供本地 HTTP 代理、SOCKS5 代理和远端加密隧道服务。项目使用 CMake 构建，核心网络事件由 libuv 驱动，传输层使用基于密码派生的 AES-GCM 加密，并支持通过 GeoIP / GeoSite 数据进行直连与代理路由判断。
+`tx` 是一个基于 C++14 的代理 / 隧道程序，提供本地 HTTP 代理、SOCKS5 代理和远端加密隧道服务。项目使用 CMake 构建，核心网络事件由 libuv 驱动，传输层使用高熵 PSK 认证、X25519/ECDHE 前向安全握手和 AEAD 加密，并支持通过 GeoIP / GeoSite 数据进行直连与代理路由判断。
 
 项目会生成两个主要可执行文件：
 
@@ -12,7 +12,8 @@
 - 本地 HTTP 代理入口。
 - 本地 SOCKS5 代理入口。
 - 客户端与服务端之间的自定义隧道协议。
-- AES-GCM 加密与密钥派生。
+- AES-GCM / ChaCha20-Poly1305 AEAD 加密。
+- 高熵 PSK 认证和 X25519/ECDHE 会话密钥派生。
 - 基于 GeoIP / GeoSite 的路由规则。
 - Linux / Windows / Android 相关平台条件支持。
 - 简单的 assert 风格单元测试。
@@ -29,7 +30,7 @@
 │   ├── client/             # tx_client 入口、配置和应用逻辑
 │   ├── server/             # tx_server 入口、配置和应用逻辑
 │   ├── common/             # 日志、基础类型等公共代码
-│   ├── crypto/             # AES-GCM 和密钥派生
+│   ├── crypto/             # AEAD、secret 解析和密钥派生
 │   ├── geo/                # GeoIP / GeoSite 数据结构和解析
 │   ├── net/                # TCP server、buffer 等网络基础设施
 │   ├── protocol/           # SOCKS5、HTTP 代理、隧道协议
@@ -208,12 +209,20 @@ ctest --test-dir build --output-on-failure
 - `config/server.json.example`
 - `config/client.json.example`
 
-建议复制后再修改，避免直接把真实密码、服务器地址等信息写入示例文件：
+建议复制后再修改，避免直接把真实 secret、服务器地址等信息写入示例文件：
 
 ```sh
 cp config/server.json.example server.json
 cp config/client.json.example client.json
 ```
+
+生成推荐的 32 字节 base64 PSK：
+
+```sh
+./build/bin/tx_server --gen-secret
+```
+
+把输出的 `base64:...` 同时填入服务端 `secret` 和客户端 `server.secret`。
 
 ### 服务端配置
 
@@ -225,7 +234,8 @@ cp config/client.json.example client.json
         "host": "0.0.0.0",
         "port": 443
     },
-    "password": "change-me",
+    "secret": "base64:REPLACE_WITH_GEN_SECRET_OUTPUT",
+    "cipher": "aes-256-gcm",
     "log_level": "info"
 }
 ```
@@ -234,7 +244,8 @@ cp config/client.json.example client.json
 
 - `listen.host`：服务端监听地址。
 - `listen.port`：服务端监听端口。
-- `password`：客户端与服务端共享的密码，必须和客户端配置一致。
+- `secret`：客户端与服务端共享的高熵 PSK，支持 `base64:`、`hex:`、`uuid-v4:` 前缀；推荐使用 `--gen-secret` 生成 `base64:`。
+- `cipher`：隧道 AEAD 算法，可选 `aes-256-gcm` 或 `chacha20-poly1305`。
 - `log_level`：日志级别，可选 `debug`、`info`、`warn`、`error`。
 
 ### 客户端配置
@@ -250,7 +261,8 @@ cp config/client.json.example client.json
     "server": {
         "host": "your-server.example.com",
         "port": 443,
-        "password": "change-me"
+        "secret": "base64:REPLACE_WITH_GEN_SECRET_OUTPUT",
+        "cipher": "aes-256-gcm"
     },
     "geo": {
         "geoip_path": "geoip.dat",
@@ -268,7 +280,8 @@ cp config/client.json.example client.json
 - `listen.socks5`：本地 SOCKS5 代理监听地址和端口。
 - `server.host`：远端 `tx_server` 地址。
 - `server.port`：远端 `tx_server` 端口。
-- `server.password`：与服务端一致的共享密码。
+- `server.secret`：与服务端一致的高熵 PSK。
+- `server.cipher`：与服务端一致的 AEAD 算法，可选 `aes-256-gcm` 或 `chacha20-poly1305`。
 - `geo.geoip_path`：GeoIP 数据文件路径。
 - `geo.geosite_path`：GeoSite 数据文件路径。
 - `geo.direct_geoip`：命中后直连的 GeoIP 标签。

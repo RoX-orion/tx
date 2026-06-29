@@ -1,10 +1,14 @@
 #include "tx/crypto/aes_gcm.h"
+#include "tx/crypto/aead.h"
 #include "tx/crypto/key_derive.h"
+#include "tx/crypto/secret.h"
 #include "tx/common/log.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cassert>
+#include <string>
+#include <vector>
 
 static void test_key_derive() {
     printf("  test_key_derive... ");
@@ -104,6 +108,52 @@ static void test_empty_plaintext() {
     printf("OK\n");
 }
 
+static void test_secret_parse() {
+    printf("  test_secret_parse... ");
+
+    std::vector<uint8_t> generated;
+    assert(tx::Secret::generate_psk(generated));
+    assert(generated.size() == tx::Secret::kPskLen);
+
+    std::string encoded = tx::Secret::encode_base64_secret(generated.data(), generated.size());
+    std::vector<uint8_t> parsed;
+    assert(tx::Secret::parse_psk(encoded, parsed));
+    assert(parsed == generated);
+
+    assert(tx::Secret::parse_psk("uuid-v4:7e52be0e-6929-432b-b74e-4e1d559dbccb", parsed));
+    assert(parsed.size() == tx::Secret::kPskLen);
+    assert(!tx::Secret::parse_psk("uuid-v4:7e52be0e-6929-132b-b74e-4e1d559dbccb", parsed));
+    assert(!tx::Secret::parse_psk("password123", parsed));
+
+    printf("OK\n");
+}
+
+static void test_aead_chacha20_poly1305() {
+    printf("  test_aead_chacha20_poly1305... ");
+
+    std::vector<uint8_t> key(tx::AeadCipher::kKeyLen, 0x33);
+    tx::AeadCipher cipher(tx::AeadCipherKind::ChaCha20Poly1305, key.data(), key.size());
+
+    uint8_t nonce[tx::AeadCipher::kNonceLen] = {0};
+    const uint8_t aad[] = {'a', 'a', 'd'};
+    const char* plaintext = "hello chacha";
+    uint8_t encrypted[128];
+    int enc_len = cipher.encrypt(nonce, aad, sizeof(aad),
+                                 reinterpret_cast<const uint8_t*>(plaintext), strlen(plaintext),
+                                 encrypted, sizeof(encrypted));
+    assert(enc_len == static_cast<int>(strlen(plaintext) + tx::AeadCipher::kTagLen));
+
+    uint8_t decrypted[128];
+    int dec_len = cipher.decrypt(nonce, aad, sizeof(aad),
+                                 encrypted, strlen(plaintext),
+                                 encrypted + strlen(plaintext),
+                                 decrypted, sizeof(decrypted));
+    assert(dec_len == static_cast<int>(strlen(plaintext)));
+    assert(memcmp(decrypted, plaintext, strlen(plaintext)) == 0);
+
+    printf("OK\n");
+}
+
 int main() {
     printf("=== Crypto Tests ===\n");
     test_key_derive();
@@ -111,6 +161,8 @@ int main() {
     test_encrypt_decrypt();
     test_tamper_detection();
     test_empty_plaintext();
+    test_secret_parse();
+    test_aead_chacha20_poly1305();
     printf("All crypto tests passed!\n");
     return 0;
 }

@@ -8,9 +8,35 @@
 #include <memory>
 #include "tx/common/types.h"
 #include "tx/net/buffer.h"
-#include "tx/crypto/aes_gcm.h"
+#include "tx/crypto/aead.h"
 
 namespace tx {
+
+enum class TunnelDirection : uint8_t {
+    ClientToServer = 1,
+    ServerToClient = 2
+};
+
+struct TunnelHandshakeState {
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+    std::vector<uint8_t> nonce;
+    std::vector<uint8_t> private_key;
+    std::vector<uint8_t> public_key;
+};
+
+struct TunnelPeerHello {
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+    std::vector<uint8_t> nonce;
+    std::vector<uint8_t> public_key;
+};
+
+struct TunnelTrafficKeys {
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+    std::vector<uint8_t> client_to_server_key;
+    std::vector<uint8_t> server_to_client_key;
+    std::vector<uint8_t> client_to_server_nonce_prefix;
+    std::vector<uint8_t> server_to_client_nonce_prefix;
+};
 
 // Tunnel protocol: encrypted channel between client and server
 //
@@ -18,28 +44,32 @@ namespace tx {
 //   [Version:1][Command:1][SessionID:4][AddrType:1][TargetAddr:var][Payload:var]
 //
 // After encryption, each message is:
-//   [TotalLen:4][Nonce:12][Ciphertext:var][Tag:16]
+//   [TotalLen:4][Ciphertext:var][Tag:16]
 //
-// The outer length prefix allows framing over TCP stream.
+// Nonces are derived from a per-direction nonce prefix and an increasing
+// 64-bit sequence number. Sequence/direction/version/length are authenticated
+// as AEAD associated data.
 
 class TunnelCodec {
 public:
     static constexpr uint8_t kVersion = 0x01;
     static constexpr size_t kLenPrefixSize = 4;    // big-endian length prefix
-    static constexpr size_t kMinFrameSize = kLenPrefixSize + AesGcm::kOverhead;
+    static constexpr size_t kMinFrameSize = kLenPrefixSize + AeadCipher::kOverhead;
     static constexpr size_t kMaxPlaintextSize = 66000;
-    static constexpr size_t kMaxEncryptedFrameSize = kMaxPlaintextSize + AesGcm::kOverhead;
+    static constexpr size_t kMaxEncryptedFrameSize = kMaxPlaintextSize + AeadCipher::kOverhead;
     static constexpr size_t kDataHeaderSize = 6;
     static constexpr size_t kMaxDataPayloadSize = kMaxPlaintextSize - kDataHeaderSize;
     static constexpr size_t kHandshakeNonceSize = 16;
+    static constexpr size_t kHandshakePublicKeySize = 32;
     static constexpr size_t kHandshakeMacSize = 32;
-    static constexpr size_t kHandshakeSize = 4 + 1 + kHandshakeNonceSize + kHandshakeMacSize;
+    static constexpr size_t kHandshakeSize =
+        4 + 1 + 1 + kHandshakeNonceSize + kHandshakePublicKeySize + kHandshakeMacSize;
 
-    TunnelCodec() : aes_(nullptr) {}
-    explicit TunnelCodec(std::shared_ptr<AesGcm> aes) : aes_(std::move(aes)) {}
+    TunnelCodec() = default;
+    TunnelCodec(const TunnelTrafficKeys& keys, bool client_side);
 
     // Encode a tunnel message (plaintext) into encrypted frame
-    // Returns encrypted frame: [len:4][nonce:12][ciphertext+tag]
+    // Returns encrypted frame: [len:4][ciphertext+tag]
     bool encode(TunnelCmd cmd, SessionId session_id,
                 const TargetAddr& target,
                 const uint8_t* payload, size_t payload_len,
@@ -68,27 +98,26 @@ public:
                 TargetAddr& target,
                 Buffer& payload);
 
-    std::shared_ptr<AesGcm> aes() const { return aes_; }
     bool has_protocol_error() const { return protocol_error_; }
     void clear_protocol_error() { protocol_error_ = false; }
 
-    static bool build_client_hello(const std::vector<uint8_t>& master_key,
+    static bool build_client_hello(const std::vector<uint8_t>& psk,
+                                   AeadCipherKind cipher,
                                    Buffer& out,
-                                   std::vector<uint8_t>& client_nonce);
-    static bool parse_client_hello(const std::vector<uint8_t>& master_key,
+                                   TunnelHandshakeState& state);
+    static bool parse_client_hello(const std::vector<uint8_t>& psk,
                                    const uint8_t* data, size_t len,
-                                   std::vector<uint8_t>& client_nonce);
-    static bool build_server_hello(const std::vector<uint8_t>& master_key,
-                                   const std::vector<uint8_t>& client_nonce,
+                                   TunnelPeerHello& client_hello);
+    static bool build_server_hello(const std::vector<uint8_t>& psk,
+                                   const TunnelPeerHello& client_hello,
                                    Buffer& out,
-                                   std::vector<uint8_t>& server_nonce);
-    static bool parse_server_hello(const std::vector<uint8_t>& master_key,
-                                   const std::vector<uint8_t>& client_nonce,
+                                   TunnelHandshakeState& server_state,
+                                   TunnelTrafficKeys& keys);
+    static bool parse_server_hello(const std::vector<uint8_t>& psk,
+                                   const TunnelHandshakeState& client_state,
                                    const uint8_t* data, size_t len,
-                                   std::vector<uint8_t>& server_nonce);
-    static std::vector<uint8_t> derive_session_key(const std::vector<uint8_t>& master_key,
-                                                   const std::vector<uint8_t>& client_nonce,
-                                                   const std::vector<uint8_t>& server_nonce);
+                                   TunnelTrafficKeys& keys);
+    static void cleanse_handshake_state(TunnelHandshakeState& state);
 
 private:
     // Build plaintext message body
@@ -97,7 +126,20 @@ private:
                          const uint8_t* payload, size_t payload_len,
                          uint8_t* out, size_t out_len);
 
-    std::shared_ptr<AesGcm> aes_;
+    bool build_nonce(bool send, uint64_t seq, uint8_t out[AeadCipher::kNonceLen]) const;
+    static constexpr size_t kAadSize = 20;
+    void build_aad(TunnelDirection direction, uint64_t seq, uint32_t frame_len,
+                   uint8_t out[kAadSize]) const;
+
+    std::shared_ptr<AeadCipher> send_cipher_;
+    std::shared_ptr<AeadCipher> recv_cipher_;
+    std::vector<uint8_t> send_nonce_prefix_;
+    std::vector<uint8_t> recv_nonce_prefix_;
+    TunnelDirection send_direction_ = TunnelDirection::ClientToServer;
+    TunnelDirection recv_direction_ = TunnelDirection::ServerToClient;
+    AeadCipherKind cipher_kind_ = AeadCipherKind::Aes256Gcm;
+    uint64_t send_seq_ = 0;
+    uint64_t recv_seq_ = 0;
     bool protocol_error_ = false;
 };
 

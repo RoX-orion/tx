@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
 #include "tx/protocol/tunnel.h"
@@ -14,6 +15,13 @@
 #include "config.h"
 
 namespace tx {
+
+struct ClientTrafficStats {
+    uint64_t direct_upload_bytes;
+    uint64_t direct_download_bytes;
+    uint64_t proxy_upload_bytes;
+    uint64_t proxy_download_bytes;
+};
 
 // Client application: runs HTTP/SOCKS5 proxies and tunnels traffic to server.
 class ClientApp {
@@ -29,6 +37,8 @@ public:
 
     // Stop the event loop
     void stop();
+
+    ClientTrafficStats traffic_stats() const;
 
 private:
     struct RouteDnsCtx;
@@ -96,6 +106,8 @@ private:
     void resolve_domain_and_route(ProxyConnPtr conn);
     static void on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
 
+    void record_traffic(RouteAction route, bool upload, size_t bytes);
+
     // ---- Members ----
     uv_loop_t*         loop_;
     ClientConfig       config_;
@@ -111,6 +123,11 @@ private:
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;
     SessionId          next_session_id_;
+
+    std::atomic<uint64_t> direct_upload_bytes_;
+    std::atomic<uint64_t> direct_download_bytes_;
+    std::atomic<uint64_t> proxy_upload_bytes_;
+    std::atomic<uint64_t> proxy_download_bytes_;
 };
 
 } // namespace tx

@@ -61,6 +61,18 @@ void tx_client_stop(tx_handle_t handle) {
     delete h;
 }
 
+int tx_client_get_traffic_stats(tx_handle_t handle, tx_traffic_stats_t* stats) {
+    if (!handle || !stats) return -1;
+    auto* h = static_cast<TxClientHandle*>(handle);
+    if (!h->app) return -1;
+    tx::ClientTrafficStats current = h->app->traffic_stats();
+    stats->direct_upload_bytes = current.direct_upload_bytes;
+    stats->direct_download_bytes = current.direct_download_bytes;
+    stats->proxy_upload_bytes = current.proxy_upload_bytes;
+    stats->proxy_download_bytes = current.proxy_download_bytes;
+    return 0;
+}
+
 tx_handle_t tx_server_start(const tx_server_config_t* config) {
     if (!config || !config->config_path) return nullptr;
 

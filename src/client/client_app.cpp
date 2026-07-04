@@ -122,6 +122,32 @@ void ClientApp::stop() {
     uv_stop(loop_);
 }
 
+ClientTrafficStats ClientApp::traffic_stats() const {
+    ClientTrafficStats stats;
+    stats.direct_upload_bytes = direct_upload_bytes_.load(std::memory_order_relaxed);
+    stats.direct_download_bytes = direct_download_bytes_.load(std::memory_order_relaxed);
+    stats.proxy_upload_bytes = proxy_upload_bytes_.load(std::memory_order_relaxed);
+    stats.proxy_download_bytes = proxy_download_bytes_.load(std::memory_order_relaxed);
+    return stats;
+}
+
+void ClientApp::record_traffic(RouteAction route, bool upload, size_t bytes) {
+    if (bytes == 0) return;
+    if (route == RouteAction::Direct) {
+        if (upload) {
+            direct_upload_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        } else {
+            direct_download_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    } else {
+        if (upload) {
+            proxy_upload_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        } else {
+            proxy_download_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+}
+
 void ClientApp::on_http_accept(SessionPtr session) {
     auto conn = std::make_shared<ProxyConn>();
     conn->local_session = session;
@@ -153,7 +179,10 @@ void ClientApp::on_http_accept(SessionPtr session) {
             // Fully connected — forward all buffered data
             if (!conn->proto_buf.empty()) {
                 if (conn->route == RouteAction::Direct && conn->direct_session) {
+                    size_t bytes = conn->proto_buf.readable();
                     conn->direct_session->send(conn->proto_buf);
+                    record_traffic(RouteAction::Direct, true, bytes);
+                    conn->proto_buf.clear();
                 } else {
                     tunnel_send(conn, conn->proto_buf.data(), conn->proto_buf.readable());
                     conn->proto_buf.clear();
@@ -218,7 +247,10 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
             // Fully connected — forward all buffered data
             if (!conn->proto_buf.empty()) {
                 if (conn->route == RouteAction::Direct && conn->direct_session) {
+                    size_t bytes = conn->proto_buf.readable();
                     conn->direct_session->send(conn->proto_buf);
+                    record_traffic(RouteAction::Direct, true, bytes);
+                    conn->proto_buf.clear();
                 } else {
                     tunnel_send(conn, conn->proto_buf.data(), conn->proto_buf.readable());
                     conn->proto_buf.clear();
@@ -430,13 +462,16 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
 
             // Flush any data buffered while waiting for connection
             if (!conn->proto_buf.empty()) {
+                size_t bytes = conn->proto_buf.readable();
                 direct->send(conn->proto_buf);
+                record_traffic(RouteAction::Direct, true, bytes);
                 conn->proto_buf.clear();
             }
 
             // Start reading from direct connection
             direct->start_read([this, conn](SessionPtr, Buffer& data) {
                 if (conn->local_session && !conn->local_session->is_closed()) {
+                    record_traffic(RouteAction::Direct, false, data.readable());
                     conn->local_session->send(data);
                 }
             });
@@ -762,6 +797,7 @@ void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) 
     }
 
     conn->tunnel_session->send(encoded);
+    record_traffic(RouteAction::Proxy, true, len);
 }
 
 void ClientApp::tunnel_send_disconnect(ProxyConnPtr conn) {
@@ -798,6 +834,7 @@ void ClientApp::on_tunnel_read(ProxyConnPtr conn, Buffer& data) {
             case TunnelCmd::Data:
                 if (!payload.empty() && conn->local_session &&
                     !conn->local_session->is_closed()) {
+                    record_traffic(RouteAction::Proxy, false, payload.readable());
                     conn->local_session->send(payload);
                 }
                 break;

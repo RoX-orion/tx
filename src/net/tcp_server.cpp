@@ -36,7 +36,6 @@ TcpSession::~TcpSession() {
 }
 
 void TcpSession::init(uv_tcp_t* server_handle) {
-    uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 
     uv_stream_t* server_stream = reinterpret_cast<uv_stream_t*>(server_handle);

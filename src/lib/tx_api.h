@@ -32,11 +32,21 @@ typedef struct {
     const char* log_level;      // "debug", "info", "warn", "error"
 } tx_server_config_t;
 
+typedef struct {
+    unsigned long long direct_upload_bytes;
+    unsigned long long direct_download_bytes;
+    unsigned long long proxy_upload_bytes;
+    unsigned long long proxy_download_bytes;
+} tx_traffic_stats_t;
+
 // Start the client. Returns handle or NULL on failure.
 TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
 
 // Stop the client.
 TX_API void tx_client_stop(tx_handle_t handle);
+
+// Get cumulative client traffic counters. Returns 0 on success, -1 on failure.
+TX_API int tx_client_get_traffic_stats(tx_handle_t handle, tx_traffic_stats_t* stats);
 
 // Start the server. Returns handle or NULL on failure.
 TX_API tx_handle_t tx_server_start(const tx_server_config_t* config);

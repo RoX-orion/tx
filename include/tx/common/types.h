@@ -71,6 +71,7 @@ enum class TunnelCmd : uint8_t {
 enum class RouteAction {
     Direct,
     Proxy,
+    Block,
 };
 
 // Session ID type

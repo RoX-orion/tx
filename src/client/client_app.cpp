@@ -155,8 +155,6 @@ ClientApp::~ClientApp() {
 bool ClientApp::init(const ClientConfig& config) {
     config_ = config;
 
-    tunnel_psk_ = config.psk;
-
     // Load router
     if (!router_.load(config.router)) {
         TX_WARN("Router load failed, all traffic will be proxied");
@@ -186,7 +184,7 @@ bool ClientApp::init(const ClientConfig& config) {
     TX_INFO("TX Client started");
     TX_INFO("  HTTP   proxy: %s:%u", config.http_host.c_str(), config.http_port);
     TX_INFO("  SOCKS5 proxy: %s:%u", config.socks5_host.c_str(), config.socks5_port);
-    TX_INFO("  Server:       %s:%u", config.server_host.c_str(), config.server_port);
+    TX_INFO("  Outbounds:    %zu", config.outbounds.size());
     return true;
 }
 
@@ -232,13 +230,67 @@ void ClientApp::record_traffic(RouteAction route, bool upload, size_t bytes) {
         } else {
             direct_download_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         }
-    } else {
+    } else if (route == RouteAction::Proxy) {
         if (upload) {
             proxy_upload_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         } else {
             proxy_download_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         }
     }
+}
+
+const OutboundConfig* ClientApp::find_outbound(const std::string& tag) const {
+    auto it = config_.outbound_index.find(tag);
+    if (it == config_.outbound_index.end()) {
+        return nullptr;
+    }
+    if (it->second >= config_.outbounds.size()) {
+        return nullptr;
+    }
+    return &config_.outbounds[it->second];
+}
+
+bool ClientApp::apply_route_decision(ProxyConnPtr conn, const RouteDecision& decision) {
+    if (!conn) return false;
+
+    const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
+    if (!outbound) {
+        TX_ERROR("Route selected unknown outboundTag: %s", decision.outbound_tag.c_str());
+        block_connection(conn);
+        return false;
+    }
+
+    conn->outbound = outbound;
+    if (outbound->type == OutboundType::Direct) {
+        conn->route = RouteAction::Direct;
+        return true;
+    }
+    if (outbound->type == OutboundType::Block) {
+        conn->route = RouteAction::Block;
+        block_connection(conn);
+        return false;
+    }
+
+    conn->route = RouteAction::Proxy;
+    return true;
+}
+
+void ClientApp::block_connection(ProxyConnPtr conn) {
+    if (!conn || !conn->local_session || conn->local_session->is_closed()) {
+        return;
+    }
+
+    TX_INFO("[Block] %s:%u", conn->target.host.c_str(), conn->target.port);
+    if (conn->socks5) {
+        Buffer resp;
+        conn->socks5->build_connect_response(false, resp);
+        conn->local_session->send(resp);
+    } else if (conn->http) {
+        Buffer resp;
+        conn->http->build_error_response(403, resp);
+        conn->local_session->send(resp);
+    }
+    conn->local_session->close();
 }
 
 bool ClientApp::start_udp_listener() {
@@ -298,6 +350,12 @@ bool ClientApp::ensure_udp_tunnel() {
     if (udp_tunnel_.connected) return true;
     if (udp_tunnel_.connecting) return true;
 
+    const OutboundConfig* outbound = udp_tunnel_.outbound;
+    if (!outbound || outbound->type != OutboundType::Tx) {
+        TX_ERROR("UDP proxy tunnel has no TX outbound selected");
+        return false;
+    }
+
     auto tunnel = std::make_shared<TcpSession>(loop_);
     udp_tunnel_.tunnel_session = tunnel;
     udp_tunnel_.connected = false;
@@ -313,7 +371,7 @@ bool ClientApp::ensure_udp_tunnel() {
         }
     });
 
-    tunnel->connect(config_.server_host, config_.server_port,
+    tunnel->connect(outbound->server_host, outbound->server_port,
         [this, tunnel](bool success) {
             if (udp_tunnel_.tunnel_session != tunnel) {
                 if (tunnel && !tunnel->is_closed()) tunnel->close();
@@ -321,7 +379,8 @@ bool ClientApp::ensure_udp_tunnel() {
             }
             if (!success) {
                 TX_ERROR("UDP tunnel connect failed to %s:%u",
-                         config_.server_host.c_str(), config_.server_port);
+                         udp_tunnel_.outbound ? udp_tunnel_.outbound->server_host.c_str() : "",
+                         udp_tunnel_.outbound ? udp_tunnel_.outbound->server_port : 0);
                 close_udp_tunnel();
                 return;
             }
@@ -331,7 +390,9 @@ bool ClientApp::ensure_udp_tunnel() {
             });
 
             Buffer hello;
-            if (!TunnelCodec::build_client_hello(tunnel_psk_, config_.cipher, hello,
+            if (!udp_tunnel_.outbound ||
+                !TunnelCodec::build_client_hello(udp_tunnel_.outbound->psk,
+                                                  udp_tunnel_.outbound->cipher, hello,
                                                   udp_tunnel_.handshake_state)) {
                 TX_ERROR("Failed to build UDP tunnel handshake");
                 close_udp_tunnel();
@@ -380,7 +441,9 @@ void ClientApp::on_udp_tunnel_handshake_read(Buffer& data) {
     if (udp_tunnel_.handshake_buf.readable() < TunnelCodec::kHandshakeSize) return;
 
     TunnelTrafficKeys keys;
-    if (!TunnelCodec::parse_server_hello(tunnel_psk_, udp_tunnel_.handshake_state,
+    if (!udp_tunnel_.outbound ||
+        !TunnelCodec::parse_server_hello(udp_tunnel_.outbound->psk,
+                                          udp_tunnel_.handshake_state,
                                           udp_tunnel_.handshake_buf.data(),
                                           TunnelCodec::kHandshakeSize,
                                           keys)) {
@@ -505,6 +568,36 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         app->udp_session_keys_[flow.session_id] = flow_key;
     }
 
+    RouteDecision decision;
+    if (target.type == AddrType::Domain) {
+        decision = app->router_.decide_by_host(target.host);
+        if (!decision.matched) {
+            decision = app->router_.fallback_decision();
+        }
+    } else {
+        IpAddr ip = IpAddr::from_string(target.host, target.port);
+        decision = app->router_.decide_by_ip(ip);
+    }
+
+    const OutboundConfig* outbound = app->find_outbound(decision.outbound_tag);
+    if (!outbound) {
+        TX_ERROR("UDP route selected unknown outboundTag: %s", decision.outbound_tag.c_str());
+        return;
+    }
+    if (outbound->type == OutboundType::Block) {
+        TX_DEBUG("[Block][UDP] %s:%u", target.host.c_str(), target.port);
+        return;
+    }
+    if (outbound->type == OutboundType::Direct) {
+        TX_WARN("[Direct][UDP] %s:%u selected but direct UDP relay is not implemented",
+                target.host.c_str(), target.port);
+        return;
+    }
+
+    if (app->udp_tunnel_.outbound && app->udp_tunnel_.outbound != outbound) {
+        app->close_udp_tunnel();
+    }
+    app->udp_tunnel_.outbound = outbound;
     app->send_udp_packet(it->second.session_id, target, payload, payload_len);
 }
 
@@ -521,6 +614,7 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->socks5 = nullptr;
     conn->http = std::make_unique<HttpProxyHandler>();
     conn->route = RouteAction::Proxy;
+    conn->outbound = nullptr;
     conn->connected = false;
     conn->connect_result_sent = false;
     conn->target_dispatched = false;
@@ -589,6 +683,7 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->socks5 = std::make_unique<Socks5Handler>();
     conn->http = nullptr;
     conn->route = RouteAction::Proxy;
+    conn->outbound = nullptr;
     conn->connected = false;
     conn->connect_result_sent = false;
     conn->target_dispatched = false;
@@ -680,13 +775,21 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
         return;
     }
 
-    RouteAction action = router_.decide_by_host(conn->target.host);
+    RouteDecision host_decision = router_.decide_by_host(conn->target.host);
+    bool host_rule_matched = host_decision.matched;
 
-    if (action == RouteAction::Direct) {
-        conn->route = RouteAction::Direct;
-        TX_INFO("[Direct] %s:%u (geosite)",
-                conn->target.host.c_str(), conn->target.port);
-        connect_direct(conn);
+    if (host_rule_matched && apply_route_decision(conn, host_decision)) {
+        if (conn->route == RouteAction::Direct) {
+            TX_INFO("[Direct] %s:%u (domain rule -> %s)",
+                    conn->target.host.c_str(), conn->target.port,
+                    conn->outbound ? conn->outbound->tag.c_str() : "");
+            connect_direct(conn);
+        } else if (conn->route == RouteAction::Proxy) {
+            TX_INFO("[Proxy] %s:%u (domain rule -> %s)",
+                    conn->target.host.c_str(), conn->target.port,
+                    conn->outbound ? conn->outbound->tag.c_str() : "");
+            connect_via_tunnel(conn);
+        }
         return;
     }
 
@@ -699,20 +802,31 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
     if (conn->target.type == AddrType::Domain && ip.is_lan() && !is_ip_literal(conn->target.host)) {
         TX_WARN("[Proxy] %s:%u resolved to private/local address %s, forcing proxy",
                 conn->target.host.c_str(), conn->target.port, ip.to_string().c_str());
-        conn->route = RouteAction::Proxy;
-        connect_via_tunnel(conn);
+        RouteDecision decision = router_.decide_by_ip(ip);
+        if (apply_route_decision(conn, decision)) {
+            if (conn->route == RouteAction::Direct) {
+                connect_direct(conn);
+            } else if (conn->route == RouteAction::Proxy) {
+                connect_via_tunnel(conn);
+            }
+        }
         return;
     }
 
-    conn->route = router_.decide_by_ip(ip);
+    RouteDecision ip_decision = router_.decide_by_ip(ip);
+    if (!apply_route_decision(conn, ip_decision)) {
+        return;
+    }
 
     if (conn->route == RouteAction::Direct) {
-        TX_INFO("[Direct] %s:%u (geoip)",
-                conn->target.host.c_str(), conn->target.port);
+        TX_INFO("[Direct] %s:%u (ip rule -> %s)",
+                conn->target.host.c_str(), conn->target.port,
+                conn->outbound ? conn->outbound->tag.c_str() : "");
         connect_direct(conn);
     } else {
-        TX_INFO("[Proxy] %s:%u (geoip/default)",
-                conn->target.host.c_str(), conn->target.port);
+        TX_INFO("[Proxy] %s:%u (ip/default rule -> %s)",
+                conn->target.host.c_str(), conn->target.port,
+                conn->outbound ? conn->outbound->tag.c_str() : "");
         connect_via_tunnel(conn);
     }
 }
@@ -764,26 +878,36 @@ void ClientApp::on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct 
     bool private_domain_result = have_ip && selected.is_lan() && conn->target.type == AddrType::Domain;
 
     if (private_domain_result) {
-        conn->route = RouteAction::Proxy;
-        TX_WARN("[Proxy] %s:%u resolved to private/local address %s, forcing proxy",
+        TX_WARN("%s:%u resolved to private/local address %s; applying route rules",
                 conn->target.host.c_str(), conn->target.port,
                 selected.to_string().c_str());
-        app->connect_via_tunnel(conn);
-    } else if (have_ip && app->router_.decide_by_ip(selected) == RouteAction::Direct) {
-        conn->route = RouteAction::Direct;
-        TX_INFO("[Direct] %s:%u resolved to %s (geoip)",
+    }
+
+    RouteDecision decision;
+    if (have_ip) {
+        decision = app->router_.decide(conn->target.host, selected);
+    } else {
+        decision = app->router_.fallback_decision();
+    }
+
+    if (!app->apply_route_decision(conn, decision)) {
+        // block_connection already handled failure response when needed.
+    } else if (conn->route == RouteAction::Direct) {
+        TX_INFO("[Direct] %s:%u resolved to %s (rule -> %s)",
                 conn->target.host.c_str(), conn->target.port,
-                selected.to_string().c_str());
+                have_ip ? selected.to_string().c_str() : "none",
+                conn->outbound ? conn->outbound->tag.c_str() : "");
         app->connect_direct(conn);
     } else {
-        conn->route = RouteAction::Proxy;
         if (status < 0 || !res) {
             TX_WARN("[Proxy] %s:%u DNS route lookup failed: %s",
                     conn->target.host.c_str(), conn->target.port,
                     status < 0 ? uv_strerror(status) : "no results");
         } else {
-            TX_INFO("[Proxy] %s:%u (geoip/default)",
-                    conn->target.host.c_str(), conn->target.port);
+            TX_INFO("[Proxy] %s:%u resolved to %s (rule -> %s)",
+                    conn->target.host.c_str(), conn->target.port,
+                    selected.to_string().c_str(),
+                    conn->outbound ? conn->outbound->tag.c_str() : "");
         }
         app->connect_via_tunnel(conn);
     }
@@ -855,6 +979,11 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
 }
 
 void ClientApp::connect_via_tunnel(ProxyConnPtr conn) {
+    if (!conn || !conn->outbound || conn->outbound->type != OutboundType::Tx) {
+        block_connection(conn);
+        return;
+    }
+
     TX_INFO("[Proxy] Connecting via tunnel to %s:%u",
             conn->target.host.c_str(), conn->target.port);
 
@@ -893,7 +1022,7 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
         }
     });
 
-    tunnel->connect(config_.server_host, config_.server_port,
+    tunnel->connect(conn->outbound->server_host, conn->outbound->server_port,
         [this, conn, tunnel](bool success) {
             if (!conn || conn->tunnel_session != tunnel ||
                 !conn->local_session || conn->local_session->is_closed()) {
@@ -907,7 +1036,8 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                 conn->tunnel_handshake_buf.clear();
                 TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
                 TX_INFO("Tunnel connected to %s:%u for session %u",
-                        config_.server_host.c_str(), config_.server_port,
+                        conn->outbound ? conn->outbound->server_host.c_str() : "",
+                        conn->outbound ? conn->outbound->server_port : 0,
                         conn->session_id);
 
                 tunnel->start_read([this, conn](SessionPtr, Buffer& data) {
@@ -915,7 +1045,9 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                 });
 
                 Buffer hello;
-                if (!TunnelCodec::build_client_hello(tunnel_psk_, config_.cipher, hello,
+                if (!conn->outbound ||
+                    !TunnelCodec::build_client_hello(conn->outbound->psk,
+                                                      conn->outbound->cipher, hello,
                                                       conn->tunnel_handshake_state)) {
                     TX_ERROR("Failed to build tunnel handshake for session %u",
                              conn->session_id);
@@ -927,7 +1059,8 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                 conn->tunnel_connecting = false;
                 conn->tunnel_connected = false;
                 TX_ERROR("Tunnel connect failed to %s:%u for session %u",
-                         config_.server_host.c_str(), config_.server_port,
+                         conn->outbound ? conn->outbound->server_host.c_str() : "",
+                         conn->outbound ? conn->outbound->server_port : 0,
                          conn->session_id);
                 fail_tunnel_connection(conn);
             }
@@ -950,7 +1083,9 @@ void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
     }
 
     TunnelTrafficKeys keys;
-    if (!TunnelCodec::parse_server_hello(tunnel_psk_, conn->tunnel_handshake_state,
+    if (!conn->outbound ||
+        !TunnelCodec::parse_server_hello(conn->outbound->psk,
+                                          conn->tunnel_handshake_state,
                                           conn->tunnel_handshake_buf.data(),
                                           TunnelCodec::kHandshakeSize,
                                           keys)) {

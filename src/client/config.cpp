@@ -81,18 +81,49 @@ static std::string resolve_config_path(const std::string& config_path,
 }
 
 bool ClientConfig::validate() const {
-    if (server_host.empty()) {
-        TX_ERROR("Server host not configured");
+    if (outbounds.empty()) {
+        TX_ERROR("No outbounds configured");
         return false;
     }
-    if (server_port == 0) {
-        TX_ERROR("Server port not configured");
+
+    if (router.rules.empty()) {
+        TX_ERROR("No routing rules configured");
         return false;
     }
-    if (psk.size() != Secret::kPskLen) {
-        TX_ERROR("High-entropy secret not configured; use server.secret with base64:, hex:, or uuid-v4:");
-        return false;
+
+    for (const auto& outbound : outbounds) {
+        if (outbound.tag.empty()) {
+            TX_ERROR("Outbound tag is empty");
+            return false;
+        }
+        if (outbound.type == OutboundType::Tx) {
+            if (outbound.server_host.empty()) {
+                TX_ERROR("TX outbound %s has no server host", outbound.tag.c_str());
+                return false;
+            }
+            if (outbound.server_port == 0) {
+                TX_ERROR("TX outbound %s has invalid server port", outbound.tag.c_str());
+                return false;
+            }
+            if (outbound.psk.size() != Secret::kPskLen) {
+                TX_ERROR("TX outbound %s has no valid high-entropy secret", outbound.tag.c_str());
+                return false;
+            }
+        }
     }
+
+    for (const auto& rule : router.rules) {
+        if (rule.outbound_tag.empty()) {
+            TX_ERROR("Routing rule has empty outboundTag");
+            return false;
+        }
+        if (outbound_index.find(rule.outbound_tag) == outbound_index.end()) {
+            TX_ERROR("Routing rule references unknown outboundTag: %s",
+                     rule.outbound_tag.c_str());
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -122,50 +153,90 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             }
         }
 
-        // Server config
-        if (j.contains("server")) {
-            auto& server = j["server"];
-            if (server.contains("host")) config.server_host = server["host"].get<std::string>();
-            if (server.contains("port")) config.server_port = server["port"].get<uint16_t>();
-            if (server.contains("cipher")) {
-                std::string cipher_name = server["cipher"].get<std::string>();
-                if (!parse_aead_cipher(cipher_name, config.cipher)) {
-                    TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
+        // Outbound config
+        if (j.contains("outbounds")) {
+            for (auto& item : j["outbounds"]) {
+                OutboundConfig outbound;
+                if (item.contains("tag")) outbound.tag = item["tag"].get<std::string>();
+                std::string type = item.value("type", "tx");
+                type = to_lower(type);
+                if (type == "direct" || type == "freedom") {
+                    outbound.type = OutboundType::Direct;
+                } else if (type == "block" || type == "blackhole") {
+                    outbound.type = OutboundType::Block;
+                } else if (type == "tx" || type == "proxy") {
+                    outbound.type = OutboundType::Tx;
+                } else {
+                    TX_ERROR("Unsupported outbound type: %s", type.c_str());
                     return false;
                 }
-            }
-            if (server.contains("secret")) {
-                config.secret = server["secret"].get<std::string>();
-                if (!Secret::parse_psk(config.secret, config.psk)) {
+
+                if (outbound.type == OutboundType::Tx) {
+                    auto& server = item.contains("server") ? item["server"] : item;
+                    if (server.contains("host")) outbound.server_host = server["host"].get<std::string>();
+                    if (server.contains("port")) outbound.server_port = server["port"].get<uint16_t>();
+                    if (server.contains("cipher")) {
+                        std::string cipher_name = server["cipher"].get<std::string>();
+                        if (!parse_aead_cipher(cipher_name, outbound.cipher)) {
+                            TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
+                            return false;
+                        }
+                    }
+                    if (server.contains("secret")) {
+                        outbound.secret = server["secret"].get<std::string>();
+                        if (!Secret::parse_psk(outbound.secret, outbound.psk)) {
+                            return false;
+                        }
+                    } else if (server.contains("password")) {
+                        TX_ERROR("server.password is no longer accepted; use server.secret with a high-entropy PSK");
+                        return false;
+                    }
+                }
+
+                if (config.outbound_index.find(outbound.tag) != config.outbound_index.end()) {
+                    TX_ERROR("Duplicate outbound tag: %s", outbound.tag.c_str());
                     return false;
                 }
-            } else if (server.contains("password")) {
-                TX_ERROR("server.password is no longer accepted; use server.secret with a high-entropy PSK");
-                return false;
+                config.outbound_index[outbound.tag] = config.outbounds.size();
+                config.outbounds.push_back(std::move(outbound));
             }
         }
 
-        // Geo config
-        if (j.contains("geo")) {
-            auto& geo = j["geo"];
-            if (geo.contains("geoip_path")) {
+        // Routing config
+        if (j.contains("routing")) {
+            auto& routing = j["routing"];
+            if (routing.contains("geoip_path")) {
                 config.router.geoip_path =
-                    resolve_config_path(path, geo["geoip_path"].get<std::string>());
+                    resolve_config_path(path, routing["geoip_path"].get<std::string>());
             }
-            if (geo.contains("geosite_path")) {
+            if (routing.contains("geosite_path")) {
                 config.router.geosite_path =
-                    resolve_config_path(path, geo["geosite_path"].get<std::string>());
+                    resolve_config_path(path, routing["geosite_path"].get<std::string>());
             }
-            if (geo.contains("direct_geoip")) {
-                for (auto& tag : geo["direct_geoip"]) {
-                    config.router.direct_geoip_tags.push_back(to_lower(tag.get<std::string>()));
+            if (routing.contains("rules")) {
+                for (auto& item : routing["rules"]) {
+                    RouteRule rule;
+                    if (item.contains("domain")) {
+                        for (auto& domain : item["domain"]) {
+                            rule.domains.push_back(to_lower(domain.get<std::string>()));
+                        }
+                    }
+                    if (item.contains("ip")) {
+                        for (auto& ip : item["ip"]) {
+                            rule.ips.push_back(to_lower(ip.get<std::string>()));
+                        }
+                    }
+                    if (item.contains("outboundTag")) {
+                        rule.outbound_tag = item["outboundTag"].get<std::string>();
+                    }
+                    config.router.rules.push_back(std::move(rule));
                 }
             }
-            if (geo.contains("direct_geosite")) {
-                for (auto& tag : geo["direct_geosite"]) {
-                    config.router.direct_geosite_tags.push_back(to_lower(tag.get<std::string>()));
-                }
-            }
+        }
+
+        if (j.contains("geo") || j.contains("server")) {
+            TX_ERROR("Old server/geo routing config is no longer supported; use outbounds and routing.rules");
+            return false;
         }
 
         // Log level

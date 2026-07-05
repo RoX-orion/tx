@@ -2,10 +2,27 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include "tx/crypto/aead.h"
 #include "tx/router/router.h"
 
 namespace tx {
+
+enum class OutboundType {
+    Direct,
+    Tx,
+    Block,
+};
+
+struct OutboundConfig {
+    std::string tag;
+    OutboundType type = OutboundType::Tx;
+    std::string server_host;
+    uint16_t    server_port = 443;
+    std::string secret;
+    std::vector<uint8_t> psk;
+    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+};
 
 struct ClientConfig {
     // HTTP proxy listen
@@ -16,12 +33,9 @@ struct ClientConfig {
     std::string socks5_host = "127.0.0.1";
     uint16_t    socks5_port = 1080;
 
-    // Server connection
-    std::string server_host;
-    uint16_t    server_port = 443;
-    std::string secret;
-    std::vector<uint8_t> psk;
-    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+    // Outbound connections
+    std::vector<OutboundConfig> outbounds;
+    std::unordered_map<std::string, size_t> outbound_index;
 
     // Geo routing
     RouterConfig router;

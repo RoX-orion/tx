@@ -9,21 +9,25 @@
 
 namespace tx {
 
+struct RouteRule {
+    std::vector<std::string> domains; // e.g., ["geosite:cn", "example.com"]
+    std::vector<std::string> ips;     // e.g., ["geoip:cn", "geoip:private"]
+    std::string outbound_tag;
+};
+
+struct RouteDecision {
+    std::string outbound_tag;
+    bool matched = false;
+};
+
 // Routing configuration
 struct RouterConfig {
     std::string geoip_path;
     std::string geosite_path;
-    std::vector<std::string> direct_geoip_tags;    // e.g., ["cn", "private"]
-    std::vector<std::string> direct_geosite_tags;  // e.g., ["cn"]
+    std::vector<RouteRule> rules;
 };
 
-// Router: decides whether to connect directly or through proxy.
-//
-// Decision logic (in order):
-//   1. Loopback / LAN addresses → Direct
-//   2. GeoIP match for any direct tag → Direct
-//   3. GeoSite match for any direct tag → Direct
-//   4. Default → Proxy
+// Router: evaluates configured rules from top to bottom.
 class Router {
 public:
     Router();
@@ -33,17 +37,23 @@ public:
     bool load(const RouterConfig& config);
 
     // Make routing decision
-    RouteAction decide(const std::string& host, const IpAddr& resolved_ip) const;
+    RouteDecision decide(const std::string& host, const IpAddr& resolved_ip) const;
 
     // Overload: when we only have hostname (no IP yet)
-    RouteAction decide_by_host(const std::string& host) const;
+    RouteDecision decide_by_host(const std::string& host) const;
 
     // Overload: when we only have IP (no hostname)
-    RouteAction decide_by_ip(const IpAddr& ip) const;
+    RouteDecision decide_by_ip(const IpAddr& ip) const;
+
+    // Last rule is the fallback when no matcher applies.
+    RouteDecision fallback_decision() const;
 
     bool loaded() const { return loaded_; }
 
 private:
+    bool match_domain_rule(const std::string& host, const RouteRule& rule) const;
+    bool match_ip_rule(const IpAddr& ip, const RouteRule& rule) const;
+
     GeoIpMatcher   geoip_;
     GeoSiteMatcher geosite_;
     RouterConfig   config_;

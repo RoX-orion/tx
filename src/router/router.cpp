@@ -13,10 +13,16 @@ std::string to_lower_ascii(std::string s) {
     return s;
 }
 
-void normalize_tags(std::vector<std::string>& tags) {
-    for (auto& tag : tags) {
-        tag = to_lower_ascii(tag);
-    }
+bool has_prefix(const std::string& s, const char* prefix) {
+    const std::string p(prefix);
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+
+bool domain_matches_literal(const std::string& host, const std::string& pattern) {
+    if (host == pattern) return true;
+    if (host.size() <= pattern.size()) return false;
+    const size_t suffix_pos = host.size() - pattern.size();
+    return host[suffix_pos - 1] == '.' && host.compare(suffix_pos, pattern.size(), pattern) == 0;
 }
 
 } // namespace
@@ -26,8 +32,14 @@ Router::~Router() = default;
 
 bool Router::load(const RouterConfig& config) {
     config_ = config;
-    normalize_tags(config_.direct_geoip_tags);
-    normalize_tags(config_.direct_geosite_tags);
+    for (auto& rule : config_.rules) {
+        for (auto& domain : rule.domains) {
+            domain = to_lower_ascii(domain);
+        }
+        for (auto& ip : rule.ips) {
+            ip = to_lower_ascii(ip);
+        }
+    }
 
     // Load GeoIP data
     if (!config.geoip_path.empty()) {
@@ -44,65 +56,92 @@ bool Router::load(const RouterConfig& config) {
     }
 
     loaded_ = true;
-    TX_INFO("Router loaded: %zu direct GeoIP tags, %zu direct GeoSite tags",
-            config.direct_geoip_tags.size(), config.direct_geosite_tags.size());
+    TX_INFO("Router loaded: %zu rules", config_.rules.size());
     return true;
 }
 
-RouteAction Router::decide(const std::string& host, const IpAddr& ip) const {
-    // 1. Loopback / LAN → Direct
-    if (ip.is_loopback() || ip.is_lan()) {
-        return RouteAction::Direct;
-    }
-
-    // 2. GeoIP check
-    for (const auto& tag : config_.direct_geoip_tags) {
-        if (geoip_.match(ip, tag)) {
-            TX_DEBUG("GeoIP match: %s → %s (direct)", ip.to_string().c_str(), tag.c_str());
-            return RouteAction::Direct;
+RouteDecision Router::decide(const std::string& host, const IpAddr& ip) const {
+    const std::string lower_host = to_lower_ascii(host);
+    for (const auto& rule : config_.rules) {
+        if (!lower_host.empty() && match_domain_rule(lower_host, rule)) {
+            TX_DEBUG("Route domain match: %s -> %s",
+                     lower_host.c_str(), rule.outbound_tag.c_str());
+            return RouteDecision{rule.outbound_tag, true};
+        }
+        if (match_ip_rule(ip, rule)) {
+            TX_DEBUG("Route IP match: %s -> %s",
+                     ip.to_string().c_str(), rule.outbound_tag.c_str());
+            return RouteDecision{rule.outbound_tag, true};
         }
     }
 
-    // 3. GeoSite check (by hostname)
-    if (!host.empty()) {
-        for (const auto& tag : config_.direct_geosite_tags) {
+    TX_DEBUG("No match for %s (%s) -> fallback",
+             host.c_str(), ip.to_string().c_str());
+    return fallback_decision();
+}
+
+RouteDecision Router::decide_by_host(const std::string& host) const {
+    const std::string lower_host = to_lower_ascii(host);
+    for (const auto& rule : config_.rules) {
+        if (match_domain_rule(lower_host, rule)) {
+            return RouteDecision{rule.outbound_tag, true};
+        }
+    }
+
+    return RouteDecision{"", false};
+}
+
+RouteDecision Router::decide_by_ip(const IpAddr& ip) const {
+    for (const auto& rule : config_.rules) {
+        if (match_ip_rule(ip, rule)) {
+            return RouteDecision{rule.outbound_tag, true};
+        }
+    }
+
+    return fallback_decision();
+}
+
+RouteDecision Router::fallback_decision() const {
+    if (!config_.rules.empty()) {
+        return RouteDecision{config_.rules.back().outbound_tag, false};
+    }
+    return RouteDecision{"", false};
+}
+
+bool Router::match_domain_rule(const std::string& host, const RouteRule& rule) const {
+    if (host.empty() || rule.domains.empty()) return false;
+
+    for (const auto& item : rule.domains) {
+        if (has_prefix(item, "geosite:")) {
+            const std::string tag = item.substr(8);
             if (geosite_.match_domain(host, tag)) {
-                TX_DEBUG("GeoSite match: %s → %s (direct)", host.c_str(), tag.c_str());
-                return RouteAction::Direct;
+                return true;
+            }
+        } else if (domain_matches_literal(host, item)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool Router::match_ip_rule(const IpAddr& ip, const RouteRule& rule) const {
+    if (rule.ips.empty()) return false;
+
+    for (const auto& item : rule.ips) {
+        if (item == "private" || item == "geoip:private") {
+            if (ip.is_loopback() || ip.is_lan()) {
+                return true;
+            }
+        } else if (has_prefix(item, "geoip:")) {
+            const std::string tag = item.substr(6);
+            if (geoip_.match(ip, tag)) {
+                return true;
             }
         }
     }
 
-    // 4. Default → Proxy
-    TX_DEBUG("No match for %s (%s) → proxy", host.c_str(), ip.to_string().c_str());
-    return RouteAction::Proxy;
-}
-
-RouteAction Router::decide_by_host(const std::string& host) const {
-    // Try GeoSite first (hostname-based)
-    for (const auto& tag : config_.direct_geosite_tags) {
-        if (geosite_.match_domain(host, tag)) {
-            return RouteAction::Direct;
-        }
-    }
-
-    // Can't check GeoIP without an IP, default to proxy
-    // (caller should resolve DNS first, then call decide())
-    return RouteAction::Proxy;
-}
-
-RouteAction Router::decide_by_ip(const IpAddr& ip) const {
-    if (ip.is_loopback() || ip.is_lan()) {
-        return RouteAction::Direct;
-    }
-
-    for (const auto& tag : config_.direct_geoip_tags) {
-        if (geoip_.match(ip, tag)) {
-            return RouteAction::Direct;
-        }
-    }
-
-    return RouteAction::Proxy;
+    return false;
 }
 
 } // namespace tx

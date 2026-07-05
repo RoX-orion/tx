@@ -56,6 +56,7 @@ private:
         std::unique_ptr<HttpProxyHandler> http;
         TargetAddr           target;
         RouteAction          route;
+        const OutboundConfig* outbound;
         SessionId            session_id;
         Buffer               pending_data;        // Data buffered before tunnel connected
         Buffer               proto_buf;           // Protocol parsing buffer (survives across reads)
@@ -86,6 +87,7 @@ private:
 
     struct UdpTunnel {
         SessionPtr tunnel_session;
+        const OutboundConfig* outbound = nullptr;
         TunnelCodec codec;
         TunnelHandshakeState handshake_state;
         Buffer handshake_buf;
@@ -107,6 +109,9 @@ private:
     // Route decision
     void connect_direct(ProxyConnPtr conn);
     void connect_via_tunnel(ProxyConnPtr conn);
+    const OutboundConfig* find_outbound(const std::string& tag) const;
+    bool apply_route_decision(ProxyConnPtr conn, const RouteDecision& decision);
+    void block_connection(ProxyConnPtr conn);
 
     // Tunnel connection
     bool start_tunnel(ProxyConnPtr conn);
@@ -161,9 +166,6 @@ private:
     UdpTunnel          udp_tunnel_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;
-
-    // Tunnel crypto
-    std::vector<uint8_t> tunnel_psk_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

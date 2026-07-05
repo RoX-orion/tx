@@ -3,17 +3,54 @@
         "http": {"host": "127.0.0.1", "port": 8080},
         "socks5": {"host": "127.0.0.1", "port": 1080}
     },
-    "server": {
-        "host": "your-host",
-        "port": 443,
-        "secret": "uuid-v4:your-uuid-v4",
-        "cipher": "aes-256-gcm"
-    },
-    "geo": {
+    "outbounds": [
+        {
+            "tag": "direct-out",
+            "type": "direct"
+        },
+        {
+            "tag": "block",
+            "type": "block"
+        },
+        {
+            "tag": "proxy-out-tx",
+            "type": "tx",
+            "server": {
+                "host": "your-host",
+                "port": 443,
+                "secret": "uuid-v4:your-uuid-v4",
+                "cipher": "aes-256-gcm"
+            }
+        }
+    ],
+    "routing": {
         "geoip_path": "geoip.dat",
         "geosite_path": "geosite.dat",
-        "direct_geoip": ["cn", "private"],
-        "direct_geosite": ["cn"]
+        "rules": [
+            {
+                "ip": ["geoip:private"],
+                "outboundTag": "direct-out"
+            },
+            {
+                "domain": ["geosite:category-ads-all"],
+                "outboundTag": "block"
+            },
+            {
+                "domain": ["geosite:cn"],
+                "outboundTag": "direct-out"
+            },
+            {
+                "ip": ["geoip:cn"],
+                "outboundTag": "direct-out"
+            },
+            {
+                "domain": ["geosite:geolocation-!cn"],
+                "outboundTag": "proxy-out-tx"
+            },
+            {
+                "outboundTag": "proxy-out-tx"
+            }
+        ]
     },
     "log_level": "info"
 }

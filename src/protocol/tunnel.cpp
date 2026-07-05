@@ -230,7 +230,7 @@ size_t TunnelCodec::build_message(TunnelCmd cmd, SessionId session_id,
     store_be32(out + pos, session_id);
     pos += 4;
 
-    if (target && cmd == TunnelCmd::Connect) {
+    if (target && (cmd == TunnelCmd::Connect || cmd == TunnelCmd::UdpPacket)) {
         if (pos + 1 > out_len) return 0;
         out[pos++] = static_cast<uint8_t>(target->type);
 
@@ -373,6 +373,17 @@ bool TunnelCodec::encode_data_chunks(SessionId session_id,
     return true;
 }
 
+bool TunnelCodec::encode_udp_packet(SessionId session_id,
+                                    const TargetAddr& target,
+                                    const uint8_t* payload, size_t payload_len,
+                                    Buffer& out) {
+    if (payload_len > kMaxDataPayloadSize) {
+        TX_ERROR("Tunnel UDP payload too large: %zu bytes", payload_len);
+        return false;
+    }
+    return encode(TunnelCmd::UdpPacket, session_id, target, payload, payload_len, out);
+}
+
 bool TunnelCodec::encode_disconnect(SessionId session_id, Buffer& out) {
     TargetAddr dummy;
     return encode(TunnelCmd::Disconnect, session_id, dummy, nullptr, 0, out);
@@ -460,14 +471,15 @@ bool TunnelCodec::decode(Buffer& in,
     if (cmd != TunnelCmd::Connect &&
         cmd != TunnelCmd::Data &&
         cmd != TunnelCmd::Disconnect &&
-        cmd != TunnelCmd::ConnectResult) {
+        cmd != TunnelCmd::ConnectResult &&
+        cmd != TunnelCmd::UdpPacket) {
         TX_ERROR("Unknown tunnel command: %u", static_cast<unsigned>(cmd));
         protocol_error_ = true;
         in.clear();
         return false;
     }
 
-    if (cmd == TunnelCmd::Connect) {
+    if (cmd == TunnelCmd::Connect || cmd == TunnelCmd::UdpPacket) {
         if (pos >= static_cast<size_t>(pt_len)) {
             protocol_error_ = true;
             in.clear();

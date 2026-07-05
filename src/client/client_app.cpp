@@ -1,10 +1,12 @@
 #include "client_app.h"
 #include "tx/common/log.h"
+#include "tx/common/endian.h"
 
 #include <arpa/inet.h>
 #include <cstring>
 #include <netdb.h>
 #include <random>
+#include <cstdlib>
 
 namespace tx {
 
@@ -43,6 +45,89 @@ bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
     return false;
 }
 
+std::string sockaddr_key(const sockaddr* addr) {
+    char host[INET6_ADDRSTRLEN] = {0};
+    uint16_t port = 0;
+    if (addr->sa_family == AF_INET) {
+        const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
+        inet_ntop(AF_INET, &a4->sin_addr, host, sizeof(host));
+        port = ntohs(a4->sin_port);
+    } else if (addr->sa_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
+        inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+        port = ntohs(a6->sin6_port);
+    }
+    return std::string(host) + ":" + std::to_string(port);
+}
+
+bool parse_socks5_udp_packet(const uint8_t* data, size_t len,
+                             TargetAddr& target,
+                             const uint8_t*& payload,
+                             size_t& payload_len) {
+    if (len < 4 || data[0] != 0 || data[1] != 0 || data[2] != 0) {
+        return false;
+    }
+
+    size_t pos = 3;
+    uint8_t atyp = data[pos++];
+    if (atyp == static_cast<uint8_t>(AddrType::IPv4)) {
+        if (pos + 4 + 2 > len) return false;
+        char ipbuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, data + pos, ipbuf, sizeof(ipbuf));
+        target.type = AddrType::IPv4;
+        target.host = ipbuf;
+        pos += 4;
+    } else if (atyp == static_cast<uint8_t>(AddrType::Domain)) {
+        if (pos >= len) return false;
+        uint8_t host_len = data[pos++];
+        if (pos + host_len + 2 > len) return false;
+        target.type = AddrType::Domain;
+        target.host.assign(reinterpret_cast<const char*>(data + pos), host_len);
+        pos += host_len;
+    } else if (atyp == static_cast<uint8_t>(AddrType::IPv6)) {
+        if (pos + 16 + 2 > len) return false;
+        char ipbuf[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, data + pos, ipbuf, sizeof(ipbuf));
+        target.type = AddrType::IPv6;
+        target.host = ipbuf;
+        pos += 16;
+    } else {
+        return false;
+    }
+
+    target.port = load_be16(data + pos);
+    pos += 2;
+    payload = data + pos;
+    payload_len = len - pos;
+    return payload_len > 0;
+}
+
+bool build_socks5_udp_packet(const TargetAddr& target,
+                             const uint8_t* payload, size_t payload_len,
+                             Buffer& out) {
+    uint8_t hdr[4] = {0, 0, 0, static_cast<uint8_t>(target.type)};
+    out.append(hdr, sizeof(hdr));
+
+    if (target.type == AddrType::IPv4) {
+        IpAddr ip = IpAddr::from_string(target.host);
+        out.append(ip.data.v4, 4);
+    } else if (target.type == AddrType::IPv6) {
+        IpAddr ip = IpAddr::from_string(target.host);
+        out.append(ip.data.v6, 16);
+    } else {
+        if (target.host.size() > 255) return false;
+        uint8_t host_len = static_cast<uint8_t>(target.host.size());
+        out.append(&host_len, 1);
+        out.append(target.host.data(), target.host.size());
+    }
+
+    uint8_t port_buf[2];
+    store_be16(port_buf, target.port);
+    out.append(port_buf, sizeof(port_buf));
+    out.append(payload, payload_len);
+    return true;
+}
+
 } // namespace
 
 struct ClientApp::RouteDnsCtx {
@@ -60,6 +145,7 @@ ClientApp::ClientApp()
     : loop_(uv_default_loop()),
       http_server_(loop_),
       socks5_server_(loop_),
+      socks5_udp_started_(false),
       next_session_id_(1) {}
 
 ClientApp::~ClientApp() {
@@ -91,6 +177,11 @@ bool ClientApp::init(const ClientConfig& config) {
                  config.socks5_host.c_str(), config.socks5_port);
         return false;
     }
+    if (!start_udp_listener()) {
+        TX_ERROR("Failed to start SOCKS5 UDP associate listener on %s:%u",
+                 config.socks5_host.c_str(), config.socks5_port);
+        return false;
+    }
 
     TX_INFO("TX Client started");
     TX_INFO("  HTTP   proxy: %s:%u", config.http_host.c_str(), config.http_port);
@@ -104,6 +195,8 @@ int ClientApp::run() {
 }
 
 void ClientApp::stop() {
+    stop_udp_listener();
+    close_udp_tunnel();
     http_server_.stop();
     socks5_server_.stop();
     for (auto& kv : connections_) {
@@ -146,6 +239,280 @@ void ClientApp::record_traffic(RouteAction route, bool upload, size_t bytes) {
             proxy_download_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         }
     }
+}
+
+bool ClientApp::start_udp_listener() {
+    if (socks5_udp_started_) return true;
+
+    int r = uv_udp_init(loop_, &socks5_udp_);
+    if (r != 0) {
+        TX_ERROR("uv_udp_init failed: %s", uv_strerror(r));
+        return false;
+    }
+    socks5_udp_.data = this;
+
+    sockaddr_in addr4;
+    sockaddr_in6 addr6;
+    const sockaddr* bind_addr = nullptr;
+    if (uv_ip4_addr(config_.socks5_host.c_str(), config_.socks5_port, &addr4) == 0) {
+        bind_addr = reinterpret_cast<const sockaddr*>(&addr4);
+    } else if (uv_ip6_addr(config_.socks5_host.c_str(), config_.socks5_port, &addr6) == 0) {
+        bind_addr = reinterpret_cast<const sockaddr*>(&addr6);
+    } else {
+        TX_ERROR("Invalid SOCKS5 UDP bind address: %s", config_.socks5_host.c_str());
+        uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+        return false;
+    }
+
+    r = uv_udp_bind(&socks5_udp_, bind_addr, 0);
+    if (r != 0) {
+        TX_ERROR("uv_udp_bind failed: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+        return false;
+    }
+
+    r = uv_udp_recv_start(&socks5_udp_, ClientApp::on_udp_alloc, ClientApp::on_udp_read);
+    if (r != 0) {
+        TX_ERROR("uv_udp_recv_start failed: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+        return false;
+    }
+
+    socks5_udp_started_ = true;
+    TX_INFO("  SOCKS5 UDP:   %s:%u", config_.socks5_host.c_str(), config_.socks5_port);
+    return true;
+}
+
+void ClientApp::stop_udp_listener() {
+    if (!socks5_udp_started_) return;
+    socks5_udp_started_ = false;
+    uv_udp_recv_stop(&socks5_udp_);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socks5_udp_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+    }
+    udp_flows_.clear();
+    udp_session_keys_.clear();
+}
+
+bool ClientApp::ensure_udp_tunnel() {
+    if (udp_tunnel_.connected) return true;
+    if (udp_tunnel_.connecting) return true;
+
+    auto tunnel = std::make_shared<TcpSession>(loop_);
+    udp_tunnel_.tunnel_session = tunnel;
+    udp_tunnel_.connected = false;
+    udp_tunnel_.connecting = true;
+    udp_tunnel_.handshake_buf.clear();
+    udp_tunnel_.recv_buf.clear();
+    TunnelCodec::cleanse_handshake_state(udp_tunnel_.handshake_state);
+
+    tunnel->set_close_callback([this, tunnel](SessionPtr) {
+        if (udp_tunnel_.tunnel_session == tunnel) {
+            TX_WARN("UDP tunnel disconnected");
+            close_udp_tunnel();
+        }
+    });
+
+    tunnel->connect(config_.server_host, config_.server_port,
+        [this, tunnel](bool success) {
+            if (udp_tunnel_.tunnel_session != tunnel) {
+                if (tunnel && !tunnel->is_closed()) tunnel->close();
+                return;
+            }
+            if (!success) {
+                TX_ERROR("UDP tunnel connect failed to %s:%u",
+                         config_.server_host.c_str(), config_.server_port);
+                close_udp_tunnel();
+                return;
+            }
+
+            tunnel->start_read([this](SessionPtr, Buffer& data) {
+                on_udp_tunnel_handshake_read(data);
+            });
+
+            Buffer hello;
+            if (!TunnelCodec::build_client_hello(tunnel_psk_, config_.cipher, hello,
+                                                  udp_tunnel_.handshake_state)) {
+                TX_ERROR("Failed to build UDP tunnel handshake");
+                close_udp_tunnel();
+                return;
+            }
+            tunnel->send(hello);
+        });
+
+    return true;
+}
+
+void ClientApp::send_udp_packet(SessionId sid, const TargetAddr& target,
+                                const uint8_t* data, size_t len) {
+    if (!ensure_udp_tunnel()) return;
+
+    if (!udp_tunnel_.connected) {
+        PendingUdpPacket pkt;
+        pkt.session_id = sid;
+        pkt.target = target;
+        pkt.payload.assign(data, data + len);
+        if (udp_tunnel_.pending.size() < 1024) {
+            udp_tunnel_.pending.push_back(std::move(pkt));
+        }
+        return;
+    }
+
+    Buffer encoded;
+    if (udp_tunnel_.codec.encode_udp_packet(sid, target, data, len, encoded) &&
+        udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
+        udp_tunnel_.tunnel_session->send(encoded);
+        record_traffic(RouteAction::Proxy, true, len);
+    }
+}
+
+void ClientApp::flush_pending_udp_packets() {
+    while (udp_tunnel_.connected && !udp_tunnel_.pending.empty()) {
+        PendingUdpPacket pkt = std::move(udp_tunnel_.pending.front());
+        udp_tunnel_.pending.pop_front();
+        send_udp_packet(pkt.session_id, pkt.target, pkt.payload.data(), pkt.payload.size());
+    }
+}
+
+void ClientApp::on_udp_tunnel_handshake_read(Buffer& data) {
+    udp_tunnel_.handshake_buf.append(data);
+    data.clear();
+    if (udp_tunnel_.handshake_buf.readable() < TunnelCodec::kHandshakeSize) return;
+
+    TunnelTrafficKeys keys;
+    if (!TunnelCodec::parse_server_hello(tunnel_psk_, udp_tunnel_.handshake_state,
+                                          udp_tunnel_.handshake_buf.data(),
+                                          TunnelCodec::kHandshakeSize,
+                                          keys)) {
+        TX_ERROR("UDP tunnel handshake failed");
+        close_udp_tunnel();
+        return;
+    }
+
+    udp_tunnel_.handshake_buf.consume(TunnelCodec::kHandshakeSize);
+    udp_tunnel_.codec = TunnelCodec(keys, true);
+    TunnelCodec::cleanse_handshake_state(udp_tunnel_.handshake_state);
+    udp_tunnel_.connecting = false;
+    udp_tunnel_.connected = true;
+    TX_INFO("UDP tunnel handshake complete");
+
+    if (udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
+        udp_tunnel_.tunnel_session->start_read([this](SessionPtr, Buffer& more) {
+            udp_tunnel_.recv_buf.append(more);
+            more.clear();
+            on_udp_tunnel_read(udp_tunnel_.recv_buf);
+        });
+    }
+
+    if (!udp_tunnel_.handshake_buf.empty()) {
+        udp_tunnel_.recv_buf.append(udp_tunnel_.handshake_buf);
+        udp_tunnel_.handshake_buf.clear();
+        on_udp_tunnel_read(udp_tunnel_.recv_buf);
+    }
+    flush_pending_udp_packets();
+}
+
+void ClientApp::on_udp_tunnel_read(Buffer& data) {
+    TunnelCmd cmd;
+    SessionId sid;
+    TargetAddr target;
+    Buffer payload;
+
+    while (udp_tunnel_.codec.decode(data, cmd, sid, target, payload)) {
+        if (cmd == TunnelCmd::UdpPacket) {
+            auto key_it = udp_session_keys_.find(sid);
+            if (key_it == udp_session_keys_.end()) {
+                payload.clear();
+                continue;
+            }
+            auto flow_it = udp_flows_.find(key_it->second);
+            if (flow_it == udp_flows_.end()) {
+                payload.clear();
+                continue;
+            }
+
+            Buffer packet;
+            if (!build_socks5_udp_packet(target, payload.data(), payload.readable(), packet)) {
+                payload.clear();
+                continue;
+            }
+
+            auto* req = new uv_udp_send_t;
+            auto* data_copy = new char[packet.readable()];
+            memcpy(data_copy, packet.data(), packet.readable());
+            auto* buf = new uv_buf_t;
+            *buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
+            req->data = buf;
+            uv_udp_send(req, &socks5_udp_, buf, 1,
+                        reinterpret_cast<const sockaddr*>(&flow_it->second.client_addr),
+                        ClientApp::on_udp_send_done);
+            record_traffic(RouteAction::Proxy, false, payload.readable());
+        } else if (cmd == TunnelCmd::Disconnect) {
+            udp_session_keys_.erase(sid);
+        }
+        payload.clear();
+    }
+
+    if (udp_tunnel_.codec.has_protocol_error()) {
+        udp_tunnel_.codec.clear_protocol_error();
+        close_udp_tunnel();
+    }
+}
+
+void ClientApp::close_udp_tunnel() {
+    auto tunnel = udp_tunnel_.tunnel_session;
+    udp_tunnel_ = UdpTunnel();
+    if (tunnel && !tunnel->is_closed()) {
+        tunnel->set_close_callback(nullptr);
+        tunnel->close();
+    }
+}
+
+void ClientApp::on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    auto* data = static_cast<char*>(malloc(suggested_size));
+    *buf = uv_buf_init(data, static_cast<unsigned int>(suggested_size));
+}
+
+void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
+                            const struct sockaddr* addr, unsigned flags) {
+    std::unique_ptr<char, decltype(&free)> storage(buf->base, free);
+    if (nread <= 0 || !addr) return;
+
+    auto* app = static_cast<ClientApp*>(handle->data);
+    TargetAddr target;
+    const uint8_t* payload = nullptr;
+    size_t payload_len = 0;
+    if (!parse_socks5_udp_packet(reinterpret_cast<const uint8_t*>(buf->base),
+                                  static_cast<size_t>(nread),
+                                  target, payload, payload_len)) {
+        return;
+    }
+
+    const std::string flow_key = sockaddr_key(addr) + ">" + target.host + ":" + std::to_string(target.port);
+    auto it = app->udp_flows_.find(flow_key);
+    if (it == app->udp_flows_.end()) {
+        UdpFlow flow;
+        flow.session_id = app->next_session_id_++;
+        memset(&flow.client_addr, 0, sizeof(flow.client_addr));
+        if (addr->sa_family == AF_INET) {
+            flow.client_addr_len = sizeof(sockaddr_in);
+            memcpy(&flow.client_addr, addr, sizeof(sockaddr_in));
+        } else {
+            flow.client_addr_len = sizeof(sockaddr_in6);
+            memcpy(&flow.client_addr, addr, sizeof(sockaddr_in6));
+        }
+        it = app->udp_flows_.emplace(flow_key, flow).first;
+        app->udp_session_keys_[flow.session_id] = flow_key;
+    }
+
+    app->send_udp_packet(it->second.session_id, target, payload, payload_len);
+}
+
+void ClientApp::on_udp_send_done(uv_udp_send_t* req, int status) {
+    auto* buf = static_cast<uv_buf_t*>(req->data);
+    delete[] buf->base;
+    delete buf;
+    delete req;
 }
 
 void ClientApp::on_http_accept(SessionPtr session) {
@@ -285,6 +652,15 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
                 if (conn->socks5->state() == Socks5State::Connected &&
                     !conn->target_dispatched) {
                     conn->target_dispatched = true;
+                    if (conn->socks5->command() == Socks5Handler::Command::UdpAssociate) {
+                        Buffer resp;
+                        conn->socks5->build_connect_response(true, resp,
+                                                             "127.0.0.1",
+                                                             config_.socks5_port);
+                        conn->local_session->send(resp);
+                        conn->connected = true;
+                        return;
+                    }
                     on_target_resolved(conn);
                 }
             }

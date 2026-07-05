@@ -85,6 +85,12 @@ public:
                             const uint8_t* payload, size_t payload_len,
                             Buffer& out);
 
+    // Encode one UDP datagram with its target/source address.
+    bool encode_udp_packet(SessionId session_id,
+                           const TargetAddr& target,
+                           const uint8_t* payload, size_t payload_len,
+                           Buffer& out);
+
     // Encode DISCONNECT message
     bool encode_disconnect(SessionId session_id, Buffer& out);
 

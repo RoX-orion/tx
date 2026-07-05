@@ -23,6 +23,10 @@ class Socks5Handler {
 public:
     using TargetCallback = std::function<void(const TargetAddr& target)>;
     using DataCallback   = std::function<void(const uint8_t* data, size_t len)>;
+    enum class Command {
+        Connect,
+        UdpAssociate,
+    };
 
     Socks5Handler();
 
@@ -31,7 +35,9 @@ public:
     size_t feed(const uint8_t* data, size_t len);
 
     // Build SOCKS5 response for connect result
-    void build_connect_response(bool success, Buffer& out);
+    void build_connect_response(bool success, Buffer& out,
+                                const std::string& bind_host = "0.0.0.0",
+                                uint16_t bind_port = 0);
 
     // State
     Socks5State state() const { return state_; }
@@ -41,6 +47,7 @@ public:
 
     // Get parsed target
     const TargetAddr& target() const { return target_; }
+    Command command() const { return command_; }
 
 private:
     size_t parse_handshake(const uint8_t* data, size_t len);
@@ -48,6 +55,7 @@ private:
 
     Socks5State state_;
     TargetAddr  target_;
+    Command     command_;
     TargetCallback target_cb_;
 };
 

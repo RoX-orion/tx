@@ -1,6 +1,11 @@
 #include "server_app.h"
 #include "tx/common/log.h"
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <cstring>
+#include <cstdlib>
+
 namespace tx {
 
 namespace {
@@ -9,6 +14,44 @@ constexpr size_t kTunnelPauseWriteBacklog = 8 * 1024 * 1024;
 constexpr size_t kTunnelResumeWriteBacklog = 2 * 1024 * 1024;
 constexpr size_t kMaxTunnelWriteBacklog = 64 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
+
+struct UdpSendReq {
+    uv_udp_send_t req;
+    uv_buf_t buf;
+    char* data;
+};
+
+TargetAddr sockaddr_to_target(const sockaddr* addr) {
+    TargetAddr target;
+    char host[INET6_ADDRSTRLEN] = {0};
+    if (addr->sa_family == AF_INET) {
+        const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
+        inet_ntop(AF_INET, &a4->sin_addr, host, sizeof(host));
+        target.type = AddrType::IPv4;
+        target.host = host;
+        target.port = ntohs(a4->sin_port);
+    } else if (addr->sa_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
+        inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+        target.type = AddrType::IPv6;
+        target.host = host;
+        target.port = ntohs(a6->sin6_port);
+    }
+    return target;
+}
+
+bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
+    memset(&out, 0, sizeof(out));
+    if (target.type == AddrType::IPv4) {
+        auto* a4 = reinterpret_cast<sockaddr_in*>(&out);
+        return uv_ip4_addr(target.host.c_str(), target.port, a4) == 0;
+    }
+    if (target.type == AddrType::IPv6) {
+        auto* a6 = reinterpret_cast<sockaddr_in6*>(&out);
+        return uv_ip6_addr(target.host.c_str(), target.port, a6) == 0;
+    }
+    return false;
+}
 
 } // namespace
 
@@ -135,6 +178,9 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
             case TunnelCmd::Data:
                 handle_data(client, session_id, payload);
                 break;
+            case TunnelCmd::UdpPacket:
+                handle_udp_packet(client, session_id, target, payload);
+                break;
             case TunnelCmd::Disconnect:
                 handle_disconnect(client, session_id);
                 break;
@@ -251,6 +297,69 @@ void ServerApp::handle_data(TunnelClientPtr client, SessionId sid, Buffer& paylo
     payload.clear();
 }
 
+void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
+                                  const TargetAddr& target, Buffer& payload) {
+    if (payload.empty()) return;
+
+    auto it = client->udp_outbounds.find(sid);
+    if (it == client->udp_outbounds.end()) {
+        auto* udp = new uv_udp_t;
+        if (uv_udp_init(loop_, udp) != 0) {
+            delete udp;
+            payload.clear();
+            return;
+        }
+        auto* ctx = new UdpCtx{this, client, sid};
+        udp->data = ctx;
+
+        sockaddr_in bind_addr;
+        uv_ip4_addr("0.0.0.0", 0, &bind_addr);
+        if (uv_udp_bind(udp, reinterpret_cast<const sockaddr*>(&bind_addr), 0) != 0 ||
+            uv_udp_recv_start(udp, ServerApp::udp_alloc, ServerApp::on_udp_read) != 0) {
+            uv_close(reinterpret_cast<uv_handle_t*>(udp), ServerApp::on_udp_closed);
+            payload.clear();
+            return;
+        }
+
+        TunnelClient::UdpOutbound out;
+        out.udp = udp;
+        out.session_id = sid;
+        it = client->udp_outbounds.emplace(sid, out).first;
+    }
+
+    sockaddr_storage addr;
+    if (target_to_sockaddr(target, addr)) {
+        auto* wr = new UdpSendReq;
+        wr->data = new char[payload.readable()];
+        memcpy(wr->data, payload.data(), payload.readable());
+        wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(payload.readable()));
+        int r = uv_udp_send(&wr->req, it->second.udp, &wr->buf, 1,
+                            reinterpret_cast<const sockaddr*>(&addr),
+                            ServerApp::on_udp_send_done);
+        if (r != 0) {
+            delete[] wr->data;
+            delete wr;
+        }
+    } else if (target.type == AddrType::Domain) {
+        auto* resolve_ctx = new UdpResolveCtx;
+        resolve_ctx->app = this;
+        resolve_ctx->client = client;
+        resolve_ctx->sid = sid;
+        resolve_ctx->target = target;
+        resolve_ctx->payload.assign(payload.data(), payload.data() + payload.readable());
+        auto* req = new uv_getaddrinfo_t;
+        req->data = resolve_ctx;
+        int r = uv_getaddrinfo(loop_, req, ServerApp::on_udp_resolved,
+                               target.host.c_str(), nullptr, nullptr);
+        if (r != 0) {
+            delete resolve_ctx;
+            delete req;
+        }
+    }
+
+    payload.clear();
+}
+
 void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
     TX_DEBUG("DISCONNECT session %u", sid);
     auto it = client->outbounds.find(sid);
@@ -259,6 +368,15 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
             it->second.remote_session->close();
         }
         client->outbounds.erase(it);
+    }
+    auto udp_it = client->udp_outbounds.find(sid);
+    if (udp_it != client->udp_outbounds.end()) {
+        if (udp_it->second.udp &&
+            !uv_is_closing(reinterpret_cast<uv_handle_t*>(udp_it->second.udp))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(udp_it->second.udp),
+                     ServerApp::on_udp_closed);
+        }
+        client->udp_outbounds.erase(udp_it);
     }
 }
 
@@ -283,6 +401,19 @@ void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
         }
     } else {
         TX_ERROR("Failed to encode %zu bytes for tunnel session %u", len, sid);
+    }
+}
+
+void ServerApp::tunnel_send_udp_packet(TunnelClientPtr client, SessionId sid,
+                                       const TargetAddr& target,
+                                       const uint8_t* data, size_t len) {
+    if (!client->session || client->session->is_closed()) return;
+
+    Buffer encoded;
+    if (client->codec.encode_udp_packet(sid, target, data, len, encoded)) {
+        if (!client->session->send(encoded)) {
+            TX_ERROR("Failed to send UDP packet to tunnel for session %u", sid);
+        }
     }
 }
 
@@ -364,6 +495,88 @@ void ServerApp::resume_outbound_reads(TunnelClientPtr client) {
              client->session->pending_write_bytes());
 }
 
+void ServerApp::udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    auto* data = static_cast<char*>(malloc(suggested_size));
+    *buf = uv_buf_init(data, static_cast<unsigned int>(suggested_size));
+}
+
+void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
+                            const struct sockaddr* addr, unsigned flags) {
+    std::unique_ptr<char, decltype(&free)> storage(buf->base, free);
+    if (nread <= 0 || !addr) return;
+
+    auto* ctx = static_cast<UdpCtx*>(handle->data);
+    if (!ctx || !ctx->app) return;
+
+    TargetAddr source = sockaddr_to_target(addr);
+    ctx->app->tunnel_send_udp_packet(ctx->client, ctx->sid, source,
+                                     reinterpret_cast<const uint8_t*>(buf->base),
+                                     static_cast<size_t>(nread));
+}
+
+void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
+    auto* ctx = static_cast<UdpResolveCtx*>(req->data);
+    if (status == 0 && res && ctx && ctx->client) {
+        auto it = ctx->client->udp_outbounds.find(ctx->sid);
+        if (it != ctx->client->udp_outbounds.end()) {
+            const struct addrinfo* selected = nullptr;
+            for (auto* ai = res; ai; ai = ai->ai_next) {
+                if (ai->ai_family == AF_INET) {
+                    selected = ai;
+                    break;
+                }
+                if (!selected && ai->ai_family == AF_INET6) {
+                    selected = ai;
+                }
+            }
+
+            sockaddr_storage addr;
+            memset(&addr, 0, sizeof(addr));
+            if (selected && selected->ai_family == AF_INET) {
+                auto* a4 = reinterpret_cast<sockaddr_in*>(&addr);
+                memcpy(a4, selected->ai_addr, sizeof(sockaddr_in));
+                a4->sin_port = htons(ctx->target.port);
+            } else if (selected && selected->ai_family == AF_INET6) {
+                auto* a6 = reinterpret_cast<sockaddr_in6*>(&addr);
+                memcpy(a6, selected->ai_addr, sizeof(sockaddr_in6));
+                a6->sin6_port = htons(ctx->target.port);
+            } else {
+                if (res) uv_freeaddrinfo(res);
+                delete ctx;
+                delete req;
+                return;
+            }
+
+            auto* wr = new UdpSendReq;
+            wr->data = new char[ctx->payload.size()];
+            memcpy(wr->data, ctx->payload.data(), ctx->payload.size());
+            wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(ctx->payload.size()));
+            int r = uv_udp_send(&wr->req, it->second.udp, &wr->buf, 1,
+                                reinterpret_cast<const sockaddr*>(&addr),
+                                ServerApp::on_udp_send_done);
+            if (r != 0) {
+                delete[] wr->data;
+                delete wr;
+            }
+        }
+    }
+
+    if (res) uv_freeaddrinfo(res);
+    delete ctx;
+    delete req;
+}
+
+void ServerApp::on_udp_send_done(uv_udp_send_t* req, int status) {
+    auto* wr = reinterpret_cast<UdpSendReq*>(req);
+    delete[] wr->data;
+    delete wr;
+}
+
+void ServerApp::on_udp_closed(uv_handle_t* handle) {
+    delete static_cast<UdpCtx*>(handle->data);
+    delete reinterpret_cast<uv_udp_t*>(handle);
+}
+
 void ServerApp::on_tunnel_close(TunnelClientPtr client) {
     TX_INFO("Tunnel client disconnected");
 
@@ -377,6 +590,16 @@ void ServerApp::on_tunnel_close(TunnelClientPtr client) {
             // Clear close callback to prevent it from accessing stale state
             kv.second.remote_session->set_close_callback(nullptr);
             kv.second.remote_session->close();
+        }
+    }
+
+    auto udp_outbounds_copy = std::move(client->udp_outbounds);
+    client->udp_outbounds.clear();
+    for (auto& kv : udp_outbounds_copy) {
+        if (kv.second.udp &&
+            !uv_is_closing(reinterpret_cast<uv_handle_t*>(kv.second.udp))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(kv.second.udp),
+                     ServerApp::on_udp_closed);
         }
     }
 

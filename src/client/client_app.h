@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 #include <atomic>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
@@ -43,6 +44,7 @@ public:
 private:
     struct RouteDnsCtx;
     struct TunnelTimerCtx;
+    struct UdpResolveCtx;
 
     // ---- Proxy connection handling ----
 
@@ -69,6 +71,29 @@ private:
         bool                 tunnel_connecting;
     };
     using ProxyConnPtr = std::shared_ptr<ProxyConn>;
+
+    struct PendingUdpPacket {
+        SessionId session_id;
+        TargetAddr target;
+        std::vector<uint8_t> payload;
+    };
+
+    struct UdpFlow {
+        SessionId session_id;
+        sockaddr_storage client_addr;
+        int client_addr_len;
+    };
+
+    struct UdpTunnel {
+        SessionPtr tunnel_session;
+        TunnelCodec codec;
+        TunnelHandshakeState handshake_state;
+        Buffer handshake_buf;
+        Buffer recv_buf;
+        bool connected = false;
+        bool connecting = false;
+        std::deque<PendingUdpPacket> pending;
+    };
 
     // Accept handlers for HTTP and SOCKS5 listeners
     void on_http_accept(SessionPtr session);
@@ -108,6 +133,21 @@ private:
 
     void record_traffic(RouteAction route, bool upload, size_t bytes);
 
+    // SOCKS5 UDP ASSOCIATE / QUIC forwarding
+    bool start_udp_listener();
+    void stop_udp_listener();
+    bool ensure_udp_tunnel();
+    void send_udp_packet(SessionId sid, const TargetAddr& target,
+                         const uint8_t* data, size_t len);
+    void flush_pending_udp_packets();
+    void on_udp_tunnel_handshake_read(Buffer& data);
+    void on_udp_tunnel_read(Buffer& data);
+    void close_udp_tunnel();
+    static void on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
+    static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
+                            const struct sockaddr* addr, unsigned flags);
+    static void on_udp_send_done(uv_udp_send_t* req, int status);
+
     // ---- Members ----
     uv_loop_t*         loop_;
     ClientConfig       config_;
@@ -116,6 +156,11 @@ private:
     // Listeners
     TcpServer          http_server_;
     TcpServer          socks5_server_;
+    uv_udp_t           socks5_udp_;
+    bool               socks5_udp_started_;
+    UdpTunnel          udp_tunnel_;
+    std::unordered_map<std::string, UdpFlow> udp_flows_;
+    std::unordered_map<SessionId, std::string> udp_session_keys_;
 
     // Tunnel crypto
     std::vector<uint8_t> tunnel_psk_;

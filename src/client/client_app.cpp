@@ -45,6 +45,38 @@ bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
     return false;
 }
 
+TargetAddr sockaddr_to_target(const sockaddr* addr) {
+    TargetAddr target;
+    char host[INET6_ADDRSTRLEN] = {0};
+    if (addr->sa_family == AF_INET) {
+        const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
+        inet_ntop(AF_INET, &a4->sin_addr, host, sizeof(host));
+        target.type = AddrType::IPv4;
+        target.host = host;
+        target.port = ntohs(a4->sin_port);
+    } else if (addr->sa_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
+        inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+        target.type = AddrType::IPv6;
+        target.host = host;
+        target.port = ntohs(a6->sin6_port);
+    }
+    return target;
+}
+
+bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
+    memset(&out, 0, sizeof(out));
+    if (target.type == AddrType::IPv4) {
+        auto* a4 = reinterpret_cast<sockaddr_in*>(&out);
+        return uv_ip4_addr(target.host.c_str(), target.port, a4) == 0;
+    }
+    if (target.type == AddrType::IPv6) {
+        auto* a6 = reinterpret_cast<sockaddr_in6*>(&out);
+        return uv_ip6_addr(target.host.c_str(), target.port, a6) == 0;
+    }
+    return false;
+}
+
 std::string sockaddr_key(const sockaddr* addr) {
     char host[INET6_ADDRSTRLEN] = {0};
     uint16_t port = 0;
@@ -139,6 +171,21 @@ struct ClientApp::TunnelTimerCtx {
     ClientApp* app;
     ProxyConnPtr conn;
     std::string phase;
+};
+
+struct ClientApp::UdpResolveCtx {
+    ClientApp* app;
+    std::string flow_key;
+    TargetAddr target;
+    std::vector<uint8_t> payload;
+};
+
+struct ClientApp::DirectUdpRelay {
+    ClientApp* app;
+    std::string flow_key;
+    uv_udp_t handle;
+    int family = AF_UNSPEC;
+    bool recv_started = false;
 };
 
 ClientApp::ClientApp()
@@ -342,8 +389,120 @@ void ClientApp::stop_udp_listener() {
     if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socks5_udp_))) {
         uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
     }
+    for (auto& kv : udp_flows_) {
+        close_direct_udp_relay(kv.second);
+    }
     udp_flows_.clear();
     udp_session_keys_.clear();
+}
+
+bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
+                                        int target_family) {
+    if (flow.direct_relay) {
+        return flow.direct_relay->family == target_family;
+    }
+
+    auto* relay = new DirectUdpRelay;
+    relay->app = this;
+    relay->flow_key = flow_key;
+    relay->family = target_family;
+
+    int r = uv_udp_init(loop_, &relay->handle);
+    if (r != 0) {
+        TX_ERROR("direct UDP init failed: %s", uv_strerror(r));
+        delete relay;
+        return false;
+    }
+    relay->handle.data = relay;
+
+    if (target_family == AF_INET6) {
+        sockaddr_in6 any6;
+        uv_ip6_addr("::", 0, &any6);
+        r = uv_udp_bind(&relay->handle, reinterpret_cast<const sockaddr*>(&any6), 0);
+    } else {
+        sockaddr_in any4;
+        uv_ip4_addr("0.0.0.0", 0, &any4);
+        r = uv_udp_bind(&relay->handle, reinterpret_cast<const sockaddr*>(&any4), 0);
+    }
+    if (r != 0) {
+        TX_ERROR("direct UDP bind failed: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle), ClientApp::on_direct_udp_closed);
+        return false;
+    }
+
+    r = uv_udp_recv_start(&relay->handle, ClientApp::on_udp_alloc, ClientApp::on_direct_udp_read);
+    if (r != 0) {
+        TX_ERROR("direct UDP recv_start failed: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle), ClientApp::on_direct_udp_closed);
+        return false;
+    }
+
+    relay->recv_started = true;
+    flow.direct_relay = relay;
+    return true;
+}
+
+void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flow,
+                                       const TargetAddr& target,
+                                       const uint8_t* data, size_t len) {
+    sockaddr_storage target_addr;
+    if (target_to_sockaddr(target, target_addr)) {
+        if (!ensure_direct_udp_relay(flow_key, flow, target_addr.ss_family)) {
+            return;
+        }
+
+        auto* req = new uv_udp_send_t;
+        auto* data_copy = new char[len];
+        memcpy(data_copy, data, len);
+        auto* send_buf = new uv_buf_t;
+        *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(len));
+        req->data = send_buf;
+
+        int r = uv_udp_send(req, &flow.direct_relay->handle, send_buf, 1,
+                            reinterpret_cast<const sockaddr*>(&target_addr),
+                            ClientApp::on_udp_send_done);
+        if (r != 0) {
+            TX_WARN("[Direct][UDP] send failed to %s:%u: %s",
+                    target.host.c_str(), target.port, uv_strerror(r));
+            delete[] send_buf->base;
+            delete send_buf;
+            delete req;
+            return;
+        }
+        record_traffic(RouteAction::Direct, true, len);
+        return;
+    }
+
+    auto* req = new uv_getaddrinfo_t;
+    auto* ctx = new UdpResolveCtx;
+    ctx->app = this;
+    ctx->flow_key = flow_key;
+    ctx->target = target;
+    ctx->payload.assign(data, data + len);
+    req->data = ctx;
+
+    const std::string service = std::to_string(target.port);
+    int r = uv_getaddrinfo(loop_, req, ClientApp::on_direct_udp_resolved,
+                           target.host.c_str(), service.c_str(), nullptr);
+    if (r != 0) {
+        TX_WARN("[Direct][UDP] DNS lookup failed to start for %s:%u: %s",
+                target.host.c_str(), target.port, uv_strerror(r));
+        delete ctx;
+        delete req;
+    }
+}
+
+void ClientApp::close_direct_udp_relay(UdpFlow& flow) {
+    auto* relay = flow.direct_relay;
+    flow.direct_relay = nullptr;
+    if (!relay) return;
+    if (relay->recv_started) {
+        uv_udp_recv_stop(&relay->handle);
+        relay->recv_started = false;
+    }
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&relay->handle))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle), ClientApp::on_direct_udp_closed);
+    }
 }
 
 bool ClientApp::ensure_udp_tunnel() {
@@ -589,8 +748,8 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         return;
     }
     if (outbound->type == OutboundType::Direct) {
-        TX_WARN("[Direct][UDP] %s:%u selected but direct UDP relay is not implemented",
-                target.host.c_str(), target.port);
+        TX_DEBUG("[Direct][UDP] %s:%u", target.host.c_str(), target.port);
+        app->send_direct_udp_packet(flow_key, it->second, target, payload, payload_len);
         return;
     }
 
@@ -606,6 +765,118 @@ void ClientApp::on_udp_send_done(uv_udp_send_t* req, int status) {
     delete[] buf->base;
     delete buf;
     delete req;
+}
+
+void ClientApp::on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
+                                   const struct sockaddr* addr, unsigned flags) {
+    std::unique_ptr<char, decltype(&free)> storage(buf->base, free);
+    if (nread <= 0 || !addr) return;
+
+    auto* relay = static_cast<DirectUdpRelay*>(handle->data);
+    if (!relay || !relay->app) return;
+
+    ClientApp* app = relay->app;
+    auto flow_it = app->udp_flows_.find(relay->flow_key);
+    if (flow_it == app->udp_flows_.end()) {
+        return;
+    }
+
+    TargetAddr source = sockaddr_to_target(addr);
+    Buffer packet;
+    if (!build_socks5_udp_packet(source,
+                                  reinterpret_cast<const uint8_t*>(buf->base),
+                                  static_cast<size_t>(nread),
+                                  packet)) {
+        return;
+    }
+
+    auto* req = new uv_udp_send_t;
+    auto* data_copy = new char[packet.readable()];
+    memcpy(data_copy, packet.data(), packet.readable());
+    auto* send_buf = new uv_buf_t;
+    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
+    req->data = send_buf;
+
+    int r = uv_udp_send(req, &app->socks5_udp_, send_buf, 1,
+                        reinterpret_cast<const sockaddr*>(&flow_it->second.client_addr),
+                        ClientApp::on_udp_send_done);
+    if (r != 0) {
+        TX_WARN("[Direct][UDP] failed to send response to SOCKS5 client: %s",
+                uv_strerror(r));
+        delete[] send_buf->base;
+        delete send_buf;
+        delete req;
+        return;
+    }
+
+    app->record_traffic(RouteAction::Direct, false, static_cast<size_t>(nread));
+}
+
+void ClientApp::on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
+    auto* ctx = static_cast<UdpResolveCtx*>(req->data);
+    ClientApp* app = ctx->app;
+
+    if (status < 0 || !res) {
+        TX_WARN("[Direct][UDP] DNS lookup failed for %s:%u: %s",
+                ctx->target.host.c_str(), ctx->target.port,
+                status < 0 ? uv_strerror(status) : "no results");
+        if (res) uv_freeaddrinfo(res);
+        delete ctx;
+        delete req;
+        return;
+    }
+
+    auto flow_it = app->udp_flows_.find(ctx->flow_key);
+    if (flow_it == app->udp_flows_.end()) {
+        uv_freeaddrinfo(res);
+        delete ctx;
+        delete req;
+        return;
+    }
+
+    const sockaddr* target_addr = nullptr;
+    for (auto* ai = res; ai; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
+            target_addr = ai->ai_addr;
+            break;
+        }
+    }
+
+    if (!target_addr ||
+        !app->ensure_direct_udp_relay(ctx->flow_key, flow_it->second, target_addr->sa_family)) {
+        uv_freeaddrinfo(res);
+        delete ctx;
+        delete req;
+        return;
+    }
+
+    auto* send_req = new uv_udp_send_t;
+    auto* data_copy = new char[ctx->payload.size()];
+    memcpy(data_copy, ctx->payload.data(), ctx->payload.size());
+    auto* send_buf = new uv_buf_t;
+    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(ctx->payload.size()));
+    send_req->data = send_buf;
+
+    int r = uv_udp_send(send_req, &flow_it->second.direct_relay->handle, send_buf, 1,
+                        target_addr, ClientApp::on_udp_send_done);
+    if (r != 0) {
+        TX_WARN("[Direct][UDP] send failed to %s:%u: %s",
+                ctx->target.host.c_str(), ctx->target.port, uv_strerror(r));
+        delete[] send_buf->base;
+        delete send_buf;
+        delete send_req;
+    } else {
+        app->record_traffic(RouteAction::Direct, true, ctx->payload.size());
+    }
+
+    uv_freeaddrinfo(res);
+    delete ctx;
+    delete req;
+}
+
+void ClientApp::on_direct_udp_closed(uv_handle_t* handle) {
+    auto* relay = static_cast<DirectUdpRelay*>(handle->data);
+    delete relay;
 }
 
 void ClientApp::on_http_accept(SessionPtr session) {

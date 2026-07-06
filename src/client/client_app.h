@@ -45,6 +45,7 @@ private:
     struct RouteDnsCtx;
     struct TunnelTimerCtx;
     struct UdpResolveCtx;
+    struct DirectUdpRelay;
 
     // ---- Proxy connection handling ----
 
@@ -83,6 +84,7 @@ private:
         SessionId session_id;
         sockaddr_storage client_addr;
         int client_addr_len;
+        DirectUdpRelay* direct_relay = nullptr;
     };
 
     struct UdpTunnel {
@@ -144,6 +146,12 @@ private:
     bool ensure_udp_tunnel();
     void send_udp_packet(SessionId sid, const TargetAddr& target,
                          const uint8_t* data, size_t len);
+    bool ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
+                                 int target_family);
+    void send_direct_udp_packet(const std::string& flow_key, UdpFlow& flow,
+                                const TargetAddr& target,
+                                const uint8_t* data, size_t len);
+    void close_direct_udp_relay(UdpFlow& flow);
     void flush_pending_udp_packets();
     void on_udp_tunnel_handshake_read(Buffer& data);
     void on_udp_tunnel_read(Buffer& data);
@@ -152,6 +160,10 @@ private:
     static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
                             const struct sockaddr* addr, unsigned flags);
     static void on_udp_send_done(uv_udp_send_t* req, int status);
+    static void on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
+                                   const struct sockaddr* addr, unsigned flags);
+    static void on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
+    static void on_direct_udp_closed(uv_handle_t* handle);
 
     // ---- Members ----
     uv_loop_t*         loop_;

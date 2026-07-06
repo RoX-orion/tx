@@ -80,7 +80,7 @@ The top-level `CMakeLists.txt` expects helper modules `cmake/TxUtils.cmake` and 
 - The tunnel protocol includes `TunnelCmd::UdpPacket`.
 - `tx_client` forwards SOCKS5 UDP packets through a shared UDP TX tunnel.
 - `tx_server` sends UDP packets to targets and returns responses through the tunnel.
-- UDP routed to a `tx` outbound is proxied. UDP routed to `block` is dropped. Direct UDP relay is not implemented yet, so UDP routed to `direct` is currently dropped with a warning.
+- UDP routed to a `tx` outbound is proxied through the encrypted tunnel. UDP routed to `direct` is relayed locally by `tx_client`. UDP routed to `block` is dropped.
 
 ## Android Build Context
 - Android project path: `/mnt/f/program/android/txz`.

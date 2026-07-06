@@ -41,6 +41,8 @@ ctest --test-dir build --output-on-failure
 - OpenSSL
 - libuv
 - nlohmann_json
+- OpenSSL and the C++ runtime are intentionally linked dynamically on all platforms.
+- `OPENSSL_ROOT_DIR` is optional and should only be passed when OpenSSL is installed outside the platform's normal search paths.
 
 The top-level `CMakeLists.txt` expects helper modules `cmake/TxUtils.cmake` and `cmake/FetchDeps.cmake`. At initialization time this repository did not contain a `cmake/` directory, so a clean CMake configure may fail until those files are restored or the dependency setup is adjusted.
 
@@ -84,6 +86,7 @@ The top-level `CMakeLists.txt` expects helper modules `cmake/TxUtils.cmake` and 
 - Android project path: `/mnt/f/program/android/txz`.
 - Android NDK path: `/home/andre/Android/android-ndk-r29`.
 - Android OpenSSL path: `/mnt/f/DevEnv/AndroidSDK/android_openssl/ssl_3`.
+- Android builds should use the dynamic C++ runtime (`ANDROID_STL=c++_shared`).
 - Existing Android CMake build directory: `build-android-arm64-r29`.
 - Build the Android native library with:
 

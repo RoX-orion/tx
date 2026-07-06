@@ -44,18 +44,18 @@
 
 - CMake 3.25.1 或更新版本
 - 支持 C++14 的编译器
-- OpenSSL 开发库和静态库
-- Linux 静态 C++ 运行库（启用 `TX_STATIC_CXX_RUNTIME=ON` 时）
+- OpenSSL 开发库
 - libuv 开发库，或允许 CMake 下载到项目 `.deps/`
 - nlohmann_json，或允许 CMake 下载到项目 `.deps/`
 
 默认构建策略：
 
 - `tx_core` 本身始终构建为静态库。
-- `TX_LINK_STATIC_DEPS=ON` 时，优先静态链接第三方依赖，默认开启。
+- OpenSSL 在所有平台都使用动态库链接。
+- 所有平台强制动态链接 C++ 运行库。
 - `TX_FETCH_DEPS=ON` 时，缺失的 libuv 和 nlohmann_json 会下载到项目 `.deps/` 目录。
 - Linux / Windows 可继续构建 `tx_client` 和 `tx_server` 可执行文件。
-- Android 默认关闭命令行程序，转而构建 `libtx.so` 共享库，并将第三方依赖静态打入该库。
+- Android 默认关闭命令行程序，转而构建 `libtx.so` 共享库，并使用动态 C++ 运行库。
 
 Debian / Ubuntu 示例：
 
@@ -67,24 +67,21 @@ sudo apt install -y build-essential cmake libssl-dev
 Fedora 示例：
 
 ```sh
-sudo dnf install -y gcc gcc-c++ cmake make openssl-devel openssl-static libstdc++-static zlib-static zstd-static
+sudo dnf install -y gcc gcc-c++ cmake make openssl-devel
 ```
 
-如果 OpenSSL 或其它依赖安装在非标准路径，可以通过 CMake 变量指定，例如：
+如果依赖安装在非标准路径，可以通过 CMake 变量指定，例如：
 
 ```sh
 cmake -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DLIBUV_INCLUDE_DIR=/path/to/libuv/include \
   -DLIBUV_LIBRARY=/path/to/libuv/lib/libuv.a \
-  -DNLOHMANN_JSON_INCLUDE_DIR=/path/to/nlohmann-json/include \
-  -DOPENSSL_ROOT_DIR=/path/to/openssl
+  -DNLOHMANN_JSON_INCLUDE_DIR=/path/to/nlohmann-json/include
 ```
 
-说明：
-
-- `OpenSSL` 通过 `find_package(OpenSSL)` 查找；静态模式下会优先选择静态库。
-- Linux 上静态 OpenSSL 常见传递依赖是 `zlib`、`zstd`，构建会自动尝试补齐对应静态库。
+- `OpenSSL` 通过 `find_package(OpenSSL)` 查找，并强制使用动态库；系统路径可找到 OpenSSL 时不需要传 `OPENSSL_ROOT_DIR`。
+- 只有 OpenSSL 安装在非标准路径时，才需要额外传 `-DOPENSSL_ROOT_DIR=/path/to/openssl`。
 - `libuv` 可以显式指向静态库文件，例如 `libuv.a`、`uv_a.lib`；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
 - `nlohmann_json` 是 header-only；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
 
@@ -109,25 +106,18 @@ build/bin/tx_server
 - `-DTX_BUILD_APPS=ON|OFF`：是否构建 `tx_client` 和 `tx_server`。
 - `-DTX_BUILD_TESTS=ON|OFF`：是否构建测试，非 Android 平台默认开启。
 - `-DTX_BUILD_SHARED=ON|OFF`：是否构建共享库，主要用于 Android 场景，默认关闭。
-- `-DTX_LINK_STATIC_DEPS=ON|OFF`：是否优先静态链接第三方依赖，默认开启。
 - `-DTX_FETCH_DEPS=ON|OFF`：是否把缺失的 libuv / nlohmann_json 下载到项目 `.deps/`，默认开启。
-- `-DTX_STATIC_CXX_RUNTIME=ON|OFF`：在 GCC / Clang 下尽量静态链接 `libgcc` / `libstdc++`，默认开启。
-- `-DTX_STATIC_MSVC_RUNTIME=ON|OFF`：在 MSVC 下使用静态运行时 `/MT` 或 `/MTd`，默认开启。
 - `-DCMAKE_BUILD_TYPE=Debug|Release`：选择调试或发布构建。
 
-### Linux 静态依赖构建
+### Linux Release 构建
 
 ```sh
 cmake -B build-linux \
   -DCMAKE_BUILD_TYPE=Release \
-  -DTX_FETCH_DEPS=ON \
-  -DTX_LINK_STATIC_DEPS=ON \
-  -DTX_STATIC_CXX_RUNTIME=ON \
-  -DOPENSSL_ROOT_DIR=/path/to/openssl
+  -DTX_FETCH_DEPS=ON
 cmake --build build-linux -j$(nproc)
 ```
 
-如果系统同时安装了动态版和静态版 OpenSSL，`TX_LINK_STATIC_DEPS=ON` 会优先查找静态库。
 也可以使用 preset：
 
 ```sh
@@ -145,17 +135,14 @@ cmake -B build-win `
   -A x64 `
   -DCMAKE_BUILD_TYPE=Release `
   -DTX_FETCH_DEPS=ON `
-  -DTX_LINK_STATIC_DEPS=ON `
-  -DTX_STATIC_MSVC_RUNTIME=ON `
   -DOPENSSL_ROOT_DIR=C:/deps/openssl
 cmake --build build-win --config Release
 ```
 
 建议：
 
-- OpenSSL 准备静态库版本，并通过 `OPENSSL_ROOT_DIR` 指向安装根目录。
+- OpenSSL 准备动态库版本，并通过 `OPENSSL_ROOT_DIR` 指向安装根目录。
 - `libuv` 和 `nlohmann_json` 可以由 `TX_FETCH_DEPS=ON` 下载到 `.deps/`，也可以手工指定本地路径。
-- 如果你用的是 MinGW，也可以保留 `TX_STATIC_CXX_RUNTIME=ON`，让 `libgcc/libstdc++` 尽量静态链接。
 
 ### Android 共享库构建
 
@@ -175,9 +162,8 @@ cmake -B build-android \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-24 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DANDROID_STL=c++_static \
+  -DANDROID_STL=c++_shared \
   -DTX_FETCH_DEPS=ON \
-  -DTX_LINK_STATIC_DEPS=ON \
   -DOPENSSL_ROOT_DIR=/path/to/android/openssl
 cmake --build build-android -j$(nproc)
 ```
@@ -188,7 +174,7 @@ cmake --build build-android -j$(nproc)
 build-android/lib/libtx.so
 ```
 
-Android 模式下，第三方依赖会优先静态链接进 `libtx.so`，并使用 NDK 的 `c++_static`。
+Android 模式下使用动态 OpenSSL 和 NDK 的 `c++_shared` 动态 C++ 运行库。
 
 ## 测试
 
@@ -372,27 +358,9 @@ sudo apt install nlohmann-json3-dev
 cmake -B build -DNLOHMANN_JSON_INCLUDE_DIR=/path/to/include
 ```
 
-### OpenSSL 被链接成动态库
+### OpenSSL 查找失败
 
-确认以下条件：
-
-- `TX_LINK_STATIC_DEPS=ON`
-- 提供的是静态版 OpenSSL 安装目录
-- `OPENSSL_ROOT_DIR` 指向包含静态库的根目录
-
-例如：
-
-```sh
-cmake -B build -DTX_LINK_STATIC_DEPS=ON -DOPENSSL_ROOT_DIR=/path/to/openssl
-```
-
-### 静态 OpenSSL 链接时报缺少 zlib / zstd
-
-当前构建会自动尝试补齐这两个常见传递依赖；如果仍然失败，通常说明你的 OpenSSL 是用额外压缩后端构建的，但这些静态库没有安装到可搜索路径。此时需要：
-
-- 安装对应静态库；
-- 或把它们放到工具链默认搜索路径；
-- 或关闭 `TX_LINK_STATIC_DEPS`，退回动态依赖。
+确认已安装 OpenSSL 开发包，或通过 `OPENSSL_ROOT_DIR` 指向动态 OpenSSL 的安装根目录。
 
 ### 端口监听失败
 

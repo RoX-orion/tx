@@ -15,43 +15,15 @@ string(REPLACE " " "-" _tx_deps_generator "${_tx_deps_generator}")
 string(REPLACE "/" "-" _tx_deps_generator "${_tx_deps_generator}")
 set(FETCHCONTENT_BASE_DIR "${TX_DEPS_ROOT}/${TX_DEPS_TRIPLET}/${_tx_deps_generator}/fetchcontent" CACHE PATH "FetchContent dependency directory" FORCE)
 
-function(tx_library_suffixes out_var)
-    if(WIN32)
-        set(static_suffixes .lib .a)
-        set(shared_suffixes .dll.a .lib)
-    elseif(APPLE)
-        set(static_suffixes .a)
-        set(shared_suffixes .dylib .so)
-    else()
-        set(static_suffixes .a)
-        set(shared_suffixes .so)
-    endif()
-
-    if(TX_LINK_STATIC_DEPS)
-        set(${out_var} ${static_suffixes} PARENT_SCOPE)
-    else()
-        set(${out_var} ${CMAKE_FIND_LIBRARY_SUFFIXES} PARENT_SCOPE)
-    endif()
-endfunction()
-
 function(tx_find_openssl)
-    if(TX_LINK_STATIC_DEPS)
-        set(OPENSSL_USE_STATIC_LIBS TRUE)
-    endif()
-
+    set(OPENSSL_USE_STATIC_LIBS FALSE)
     find_package(OpenSSL REQUIRED)
     message(STATUS "Found OpenSSL: ${OPENSSL_VERSION}")
 endfunction()
 
 function(tx_find_libuv)
-    tx_library_suffixes(TX_DEP_LIBRARY_SUFFIXES)
-    set(_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${TX_DEP_LIBRARY_SUFFIXES})
-
     find_path(LIBUV_INCLUDE_DIR uv.h)
     find_library(LIBUV_LIBRARY NAMES uv_a libuv_a uv libuv)
-
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_suffixes})
 
     if(NOT LIBUV_INCLUDE_DIR OR NOT LIBUV_LIBRARY)
         find_package(libuv CONFIG QUIET)
@@ -63,11 +35,11 @@ function(tx_find_libuv)
             add_library(tx::libuv ALIAS libuv::uv_a)
             message(STATUS "Found libuv: libuv::uv_a target")
             return()
-        elseif(NOT TX_LINK_STATIC_DEPS AND TARGET uv)
+        elseif(TARGET uv)
             add_library(tx::libuv ALIAS uv)
             message(STATUS "Found libuv: uv target")
             return()
-        elseif(NOT TX_LINK_STATIC_DEPS AND TARGET libuv::uv)
+        elseif(TARGET libuv::uv)
             add_library(tx::libuv ALIAS libuv::uv)
             message(STATUS "Found libuv: libuv::uv target")
             return()
@@ -101,8 +73,8 @@ function(tx_find_libuv)
     if(NOT LIBUV_INCLUDE_DIR OR NOT LIBUV_LIBRARY)
         message(FATAL_ERROR
             "libuv development files were not found. Install libuv headers and "
-            "${TX_DEP_LIBRARY_SUFFIXES} library files, provide LIBUV_INCLUDE_DIR "
-            "and LIBUV_LIBRARY to CMake, or configure with TX_FETCH_DEPS=ON.")
+            "library files, provide LIBUV_INCLUDE_DIR and LIBUV_LIBRARY to CMake, "
+            "or configure with TX_FETCH_DEPS=ON.")
     endif()
 
     if(NOT TARGET tx::libuv)
@@ -150,51 +122,6 @@ function(tx_find_nlohmann_json)
         "nlohmann_json development files were not found. Install nlohmann_json "
         "(for example: sudo apt install nlohmann-json3-dev) or provide "
         "NLOHMANN_JSON_INCLUDE_DIR to CMake, or configure with TX_FETCH_DEPS=ON.")
-endfunction()
-
-function(tx_find_optional_static_library target_name library_var)
-    if(NOT TX_LINK_STATIC_DEPS)
-        return()
-    endif()
-
-    if(TARGET ${target_name})
-        return()
-    endif()
-
-    tx_library_suffixes(TX_DEP_LIBRARY_SUFFIXES)
-    set(_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${TX_DEP_LIBRARY_SUFFIXES})
-    find_library(${library_var} NAMES ${ARGN})
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_suffixes})
-
-    if(${library_var})
-        add_library(${target_name} UNKNOWN IMPORTED)
-        set_target_properties(${target_name} PROPERTIES
-            IMPORTED_LOCATION "${${library_var}}"
-        )
-        message(STATUS "Found ${target_name}: ${${library_var}}")
-    endif()
-endfunction()
-
-function(tx_find_static_openssl_deps)
-    if(NOT TX_LINK_STATIC_DEPS)
-        return()
-    endif()
-
-    set(TX_OPENSSL_STATIC_EXTRA_LIBS "")
-
-    set(ZLIB_USE_STATIC_LIBS ON)
-    find_package(ZLIB QUIET)
-    if(ZLIB_FOUND)
-        list(APPEND TX_OPENSSL_STATIC_EXTRA_LIBS ZLIB::ZLIB)
-    endif()
-
-    tx_find_optional_static_library(tx::zstd ZSTD_LIBRARY zstd libzstd)
-    if(TARGET tx::zstd)
-        list(APPEND TX_OPENSSL_STATIC_EXTRA_LIBS tx::zstd)
-    endif()
-
-    set(TX_OPENSSL_STATIC_EXTRA_LIBS "${TX_OPENSSL_STATIC_EXTRA_LIBS}" PARENT_SCOPE)
 endfunction()
 
 tx_find_libuv()

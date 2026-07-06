@@ -1,0 +1,105 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 1
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "TX_FETCH_DEPS": "ON"
+      }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release executables",
+      "inherits": "base",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-linux-release",
+      "cacheVariables": {
+        "TX_BUILD_APPS": "ON",
+        "TX_BUILD_SHARED": "OFF",
+        "TX_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-release",
+      "displayName": "Windows MSVC Release executables",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build-windows-msvc-release",
+      "cacheVariables": {
+        "TX_BUILD_APPS": "ON",
+        "TX_BUILD_SHARED": "OFF",
+        "TX_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "android-arm64-release",
+      "displayName": "Android arm64-v8a Release shared library",
+      "inherits": "base",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-android-arm64-release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-24",
+        "ANDROID_STL": "c++_shared",
+        "TX_BUILD_APPS": "OFF",
+        "TX_BUILD_SHARED": "ON",
+        "TX_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "android-x86_64-release",
+      "displayName": "Android x86_64 Release shared library",
+      "inherits": "base",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-android-x86_64-release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+        "ANDROID_ABI": "x86_64",
+        "ANDROID_PLATFORM": "android-24",
+        "ANDROID_STL": "c++_shared",
+        "TX_BUILD_APPS": "OFF",
+        "TX_BUILD_SHARED": "ON",
+        "TX_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "jobs": 8
+    },
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release"
+    },
+    {
+      "name": "android-arm64-release",
+      "configurePreset": "android-arm64-release",
+      "jobs": 8
+    },
+    {
+      "name": "android-x86_64-release",
+      "configurePreset": "android-x86_64-release",
+      "jobs": 8
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

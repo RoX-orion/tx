@@ -18,9 +18,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 option(TX_BUILD_APPS "Build tx_client and tx_server executables" ON)
 option(TX_BUILD_TESTS "Build unit tests" ON)
 option(TX_BUILD_SHARED "Build shared library (for Android)" OFF)
-option(TX_LINK_STATIC_DEPS "Prefer static third-party dependencies" ON)
-option(TX_STATIC_CXX_RUNTIME "Link libgcc/libstdc++ statically when supported" ON)
-option(TX_STATIC_MSVC_RUNTIME "Link the static MSVC runtime when building with MSVC" ON)
 
 if(ANDROID)
     set(TX_BUILD_APPS OFF CACHE BOOL "Build tx_client and tx_server executables" FORCE)
@@ -28,8 +25,8 @@ if(ANDROID)
     set(TX_BUILD_TESTS OFF CACHE BOOL "Build unit tests" FORCE)
 endif()
 
-if(MSVC AND TX_STATIC_MSVC_RUNTIME)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # Platform detection
@@ -61,7 +58,6 @@ include(FetchDeps)
 
 # Find OpenSSL
 tx_find_openssl()
-tx_find_static_openssl_deps()
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -99,7 +95,6 @@ target_link_libraries(tx_core PUBLIC
     tx::libuv
     OpenSSL::SSL OpenSSL::Crypto
     nlohmann_json::nlohmann_json
-    ${TX_OPENSSL_STATIC_EXTRA_LIBS}
 )
 target_include_directories(tx_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -109,13 +104,9 @@ target_include_directories(tx_core PUBLIC
 if(UNIX AND NOT ANDROID)
     target_link_libraries(tx_core PUBLIC pthread dl)
 elseif(ANDROID)
-    target_link_libraries(tx_core PUBLIC log c++_static)
+    target_link_libraries(tx_core PUBLIC log c++_shared)
 elseif(WIN32 OR MINGW)
     target_link_libraries(tx_core PUBLIC ws2_32 shlwapi userenv advapi32 iphlpapi psapi shell32 crypt32 bcrypt)
-endif()
-
-if(TX_STATIC_CXX_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT ANDROID)
-    target_link_options(tx_core PUBLIC -static-libgcc -static-libstdc++)
 endif()
 
 # Client executable

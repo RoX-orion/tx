@@ -234,6 +234,26 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             }
         }
 
+        if (j.contains("tun")) {
+            auto& tun = j["tun"];
+            config.tun_enabled = tun.value("enabled", config.tun_enabled);
+            config.tun_fd = tun.value("fd", config.tun_fd);
+            config.tun_mtu = tun.value("mtu", config.tun_mtu);
+            config.tun_name = tun.value("name", config.tun_name);
+            config.tun_address = tun.value("address", config.tun_address);
+            config.tun_prefix = tun.value("prefix", config.tun_prefix);
+            config.tun_auto_config = tun.value("auto_config", config.tun_auto_config);
+            if (tun.contains("routes")) {
+                config.tun_routes.clear();
+                for (auto& route : tun["routes"]) {
+                    config.tun_routes.push_back(route.get<std::string>());
+                }
+            }
+            config.tun_mode = to_lower(tun.value("mode", config.tun_mode));
+            config.tun_tcp_stack = to_lower(tun.value("tcp_stack", config.tun_tcp_stack));
+            config.tun_udp_stack = to_lower(tun.value("udp_stack", config.tun_udp_stack));
+        }
+
         if (j.contains("geo") || j.contains("server")) {
             TX_ERROR("Old server/geo routing config is no longer supported; use outbounds and routing.rules");
             return false;

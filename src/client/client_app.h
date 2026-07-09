@@ -7,11 +7,13 @@
 #include <vector>
 #include <deque>
 #include <atomic>
+#include "platform_tun.h"
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
 #include "tx/protocol/tunnel.h"
 #include "tx/protocol/socks5.h"
 #include "tx/protocol/http_proxy.h"
+#include "tx/net/tun_packet.h"
 #include "tx/router/router.h"
 #include "config.h"
 
@@ -80,10 +82,18 @@ private:
         std::vector<uint8_t> payload;
     };
 
+    enum class UdpFlowKind {
+        Socks5,
+        Tun,
+    };
+
     struct UdpFlow {
         SessionId session_id;
+        UdpFlowKind kind = UdpFlowKind::Socks5;
         sockaddr_storage client_addr;
         int client_addr_len;
+        IpAddr tun_src_ip;
+        IpAddr tun_dst_ip;
         DirectUdpRelay* direct_relay = nullptr;
     };
 
@@ -152,6 +162,9 @@ private:
                                 const TargetAddr& target,
                                 const uint8_t* data, size_t len);
     void close_direct_udp_relay(UdpFlow& flow);
+    void send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr& source,
+                                   const uint8_t* data, size_t len,
+                                   RouteAction route);
     void flush_pending_udp_packets();
     void on_udp_tunnel_handshake_read(Buffer& data);
     void on_udp_tunnel_read(Buffer& data);
@@ -165,6 +178,17 @@ private:
     static void on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
     static void on_direct_udp_closed(uv_handle_t* handle);
 
+    // Native TUN input. Mixed mode currently handles UDP packets natively and
+    // keeps TCP on the configured system-stack path.
+    bool start_tun_listener();
+    void stop_tun_listener();
+    void drain_tun_packets();
+    void handle_tun_packet(const uint8_t* data, size_t len);
+    bool write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
+                              const uint8_t* data, size_t len);
+    static void on_tun_poll(uv_poll_t* handle, int status, int events);
+    static void on_tun_timer(uv_timer_t* timer);
+
     // ---- Members ----
     uv_loop_t*         loop_;
     ClientConfig       config_;
@@ -175,6 +199,13 @@ private:
     TcpServer          socks5_server_;
     uv_udp_t           socks5_udp_;
     bool               socks5_udp_started_;
+    int                tun_fd_;
+    bool               tun_started_;
+    uv_poll_t          tun_poll_;
+    uv_timer_t         tun_timer_;
+    bool               tun_timer_started_;
+    std::unique_ptr<PlatformTunDevice> tun_device_;
+    std::vector<uint8_t> tun_read_buf_;
     UdpTunnel          udp_tunnel_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;

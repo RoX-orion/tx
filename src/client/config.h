@@ -33,6 +33,19 @@ struct ClientConfig {
     std::string socks5_host = "127.0.0.1";
     uint16_t    socks5_port = 1080;
 
+    // Native TUN input. Android should pass the fd through the C API.
+    bool        tun_enabled = false;
+    int         tun_fd = -1;
+    int         tun_mtu = 1500;
+    std::string tun_name = "tx0";
+    std::string tun_address = "10.10.0.1";
+    int         tun_prefix = 24;
+    bool        tun_auto_config = true;
+    std::vector<std::string> tun_routes;
+    std::string tun_mode = "mixed";
+    std::string tun_tcp_stack = "system";
+    std::string tun_udp_stack = "gvisor";
+
     // Outbound connections
     std::vector<OutboundConfig> outbounds;
     std::unordered_map<std::string, size_t> outbound_index;

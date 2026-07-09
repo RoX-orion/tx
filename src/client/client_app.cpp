@@ -45,6 +45,16 @@ bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
     return false;
 }
 
+std::string ipaddr_host_string(const IpAddr& ip) {
+    char host[INET6_ADDRSTRLEN] = {0};
+    if (ip.family == IpAddr::IPv4) {
+        inet_ntop(AF_INET, ip.data.v4, host, sizeof(host));
+    } else {
+        inet_ntop(AF_INET6, ip.data.v6, host, sizeof(host));
+    }
+    return host;
+}
+
 TargetAddr sockaddr_to_target(const sockaddr* addr) {
     TargetAddr target;
     char host[INET6_ADDRSTRLEN] = {0};
@@ -193,6 +203,9 @@ ClientApp::ClientApp()
       http_server_(loop_),
       socks5_server_(loop_),
       socks5_udp_started_(false),
+      tun_fd_(-1),
+      tun_started_(false),
+      tun_timer_started_(false),
       next_session_id_(1) {}
 
 ClientApp::~ClientApp() {
@@ -207,30 +220,40 @@ bool ClientApp::init(const ClientConfig& config) {
         TX_WARN("Router load failed, all traffic will be proxied");
     }
 
-    // Start HTTP proxy listener
-    http_server_.set_accept_callback([this](SessionPtr s) { on_http_accept(s); });
-    if (!http_server_.listen(config.http_host, config.http_port)) {
-        TX_ERROR("Failed to start HTTP proxy on %s:%u",
-                 config.http_host.c_str(), config.http_port);
-        return false;
-    }
-
-    // Start SOCKS5 proxy listener
-    socks5_server_.set_accept_callback([this](SessionPtr s) { on_socks5_accept(s); });
-    if (!socks5_server_.listen(config.socks5_host, config.socks5_port)) {
-        TX_ERROR("Failed to start SOCKS5 proxy on %s:%u",
-                 config.socks5_host.c_str(), config.socks5_port);
-        return false;
-    }
-    if (!start_udp_listener()) {
-        TX_ERROR("Failed to start SOCKS5 UDP associate listener on %s:%u",
-                 config.socks5_host.c_str(), config.socks5_port);
-        return false;
-    }
-
     TX_INFO("TX Client started");
-    TX_INFO("  HTTP   proxy: %s:%u", config.http_host.c_str(), config.http_port);
-    TX_INFO("  SOCKS5 proxy: %s:%u", config.socks5_host.c_str(), config.socks5_port);
+    if (config_.tun_enabled) {
+        if (!start_tun_listener()) {
+            return false;
+        }
+        TX_INFO("  TUN mixed:    fd=%d mtu=%d tcp=%s udp=%s",
+                tun_fd_, config_.tun_mtu,
+                config_.tun_tcp_stack.c_str(),
+                config_.tun_udp_stack.c_str());
+    } else {
+        // Proxy mode keeps the previous HTTP/SOCKS entrypoints and does not
+        // require tun2socks.
+        http_server_.set_accept_callback([this](SessionPtr s) { on_http_accept(s); });
+        if (!http_server_.listen(config.http_host, config.http_port)) {
+            TX_ERROR("Failed to start HTTP proxy on %s:%u",
+                     config.http_host.c_str(), config.http_port);
+            return false;
+        }
+
+        socks5_server_.set_accept_callback([this](SessionPtr s) { on_socks5_accept(s); });
+        if (!socks5_server_.listen(config.socks5_host, config.socks5_port)) {
+            TX_ERROR("Failed to start SOCKS5 proxy on %s:%u",
+                     config.socks5_host.c_str(), config.socks5_port);
+            return false;
+        }
+        if (!start_udp_listener()) {
+            TX_ERROR("Failed to start SOCKS5 UDP associate listener on %s:%u",
+                     config.socks5_host.c_str(), config.socks5_port);
+            return false;
+        }
+
+        TX_INFO("  HTTP   proxy: %s:%u", config.http_host.c_str(), config.http_port);
+        TX_INFO("  SOCKS5 proxy: %s:%u", config.socks5_host.c_str(), config.socks5_port);
+    }
     TX_INFO("  Outbounds:    %zu", config.outbounds.size());
     return true;
 }
@@ -240,6 +263,7 @@ int ClientApp::run() {
 }
 
 void ClientApp::stop() {
+    stop_tun_listener();
     stop_udp_listener();
     close_udp_tunnel();
     http_server_.stop();
@@ -505,6 +529,42 @@ void ClientApp::close_direct_udp_relay(UdpFlow& flow) {
     }
 }
 
+void ClientApp::send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr& source,
+                                          const uint8_t* data, size_t len,
+                                          RouteAction route) {
+    if (flow.kind == UdpFlowKind::Tun) {
+        if (write_tun_udp_packet(flow, source, data, len)) {
+            record_traffic(route, false, len);
+        }
+        return;
+    }
+
+    Buffer packet;
+    if (!build_socks5_udp_packet(source, data, len, packet)) {
+        return;
+    }
+
+    auto* req = new uv_udp_send_t;
+    auto* data_copy = new char[packet.readable()];
+    memcpy(data_copy, packet.data(), packet.readable());
+    auto* send_buf = new uv_buf_t;
+    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
+    req->data = send_buf;
+
+    int r = uv_udp_send(req, &socks5_udp_, send_buf, 1,
+                        reinterpret_cast<const sockaddr*>(&flow.client_addr),
+                        ClientApp::on_udp_send_done);
+    if (r != 0) {
+        TX_WARN("[%s][UDP] failed to send response to SOCKS5 client: %s",
+                route == RouteAction::Direct ? "Direct" : "Proxy", uv_strerror(r));
+        delete[] send_buf->base;
+        delete send_buf;
+        delete req;
+        return;
+    }
+    record_traffic(route, false, len);
+}
+
 bool ClientApp::ensure_udp_tunnel() {
     if (udp_tunnel_.connected) return true;
     if (udp_tunnel_.connecting) return true;
@@ -653,22 +713,9 @@ void ClientApp::on_udp_tunnel_read(Buffer& data) {
                 continue;
             }
 
-            Buffer packet;
-            if (!build_socks5_udp_packet(target, payload.data(), payload.readable(), packet)) {
-                payload.clear();
-                continue;
-            }
-
-            auto* req = new uv_udp_send_t;
-            auto* data_copy = new char[packet.readable()];
-            memcpy(data_copy, packet.data(), packet.readable());
-            auto* buf = new uv_buf_t;
-            *buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
-            req->data = buf;
-            uv_udp_send(req, &socks5_udp_, buf, 1,
-                        reinterpret_cast<const sockaddr*>(&flow_it->second.client_addr),
-                        ClientApp::on_udp_send_done);
-            record_traffic(RouteAction::Proxy, false, payload.readable());
+            send_udp_response_to_flow(flow_it->second, target,
+                                      payload.data(), payload.readable(),
+                                      RouteAction::Proxy);
         } else if (cmd == TunnelCmd::Disconnect) {
             udp_session_keys_.erase(sid);
         }
@@ -715,6 +762,7 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
     if (it == app->udp_flows_.end()) {
         UdpFlow flow;
         flow.session_id = app->next_session_id_++;
+        flow.kind = UdpFlowKind::Socks5;
         memset(&flow.client_addr, 0, sizeof(flow.client_addr));
         if (addr->sa_family == AF_INET) {
             flow.client_addr_len = sizeof(sockaddr_in);
@@ -782,34 +830,10 @@ void ClientApp::on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf
     }
 
     TargetAddr source = sockaddr_to_target(addr);
-    Buffer packet;
-    if (!build_socks5_udp_packet(source,
-                                  reinterpret_cast<const uint8_t*>(buf->base),
-                                  static_cast<size_t>(nread),
-                                  packet)) {
-        return;
-    }
-
-    auto* req = new uv_udp_send_t;
-    auto* data_copy = new char[packet.readable()];
-    memcpy(data_copy, packet.data(), packet.readable());
-    auto* send_buf = new uv_buf_t;
-    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
-    req->data = send_buf;
-
-    int r = uv_udp_send(req, &app->socks5_udp_, send_buf, 1,
-                        reinterpret_cast<const sockaddr*>(&flow_it->second.client_addr),
-                        ClientApp::on_udp_send_done);
-    if (r != 0) {
-        TX_WARN("[Direct][UDP] failed to send response to SOCKS5 client: %s",
-                uv_strerror(r));
-        delete[] send_buf->base;
-        delete send_buf;
-        delete req;
-        return;
-    }
-
-    app->record_traffic(RouteAction::Direct, false, static_cast<size_t>(nread));
+    app->send_udp_response_to_flow(flow_it->second, source,
+                                   reinterpret_cast<const uint8_t*>(buf->base),
+                                   static_cast<size_t>(nread),
+                                   RouteAction::Direct);
 }
 
 void ClientApp::on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
@@ -877,6 +901,221 @@ void ClientApp::on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct
 void ClientApp::on_direct_udp_closed(uv_handle_t* handle) {
     auto* relay = static_cast<DirectUdpRelay*>(handle->data);
     delete relay;
+}
+
+bool ClientApp::start_tun_listener() {
+    if (!config_.tun_enabled) return true;
+    if (tun_started_) return true;
+    if (config_.tun_fd < 0) {
+        TX_INFO("TUN fd not provided; creating platform TUN device");
+    }
+    if (config_.tun_mode != "mixed") {
+        TX_ERROR("Unsupported TUN mode: %s", config_.tun_mode.c_str());
+        return false;
+    }
+    if (config_.tun_tcp_stack != "system" || config_.tun_udp_stack != "gvisor") {
+        TX_ERROR("Unsupported TUN stack combination: tcp=%s udp=%s",
+                 config_.tun_tcp_stack.c_str(), config_.tun_udp_stack.c_str());
+        return false;
+    }
+
+    tun_device_ = PlatformTunDevice::create();
+    if (!tun_device_) {
+        TX_ERROR("TUN is not supported on this platform");
+        return false;
+    }
+
+    std::string error;
+    if (!tun_device_->open(config_, error)) {
+        TX_ERROR("Failed to open TUN device: %s", error.c_str());
+        tun_device_.reset();
+        return false;
+    }
+
+    tun_fd_ = tun_device_->fd();
+    tun_read_buf_.resize(static_cast<size_t>(config_.tun_mtu > 0 ? config_.tun_mtu : 1500) + 256);
+
+    if (tun_fd_ >= 0) {
+        int r = uv_poll_init(loop_, &tun_poll_, tun_fd_);
+        if (r != 0) {
+            TX_ERROR("uv_poll_init for TUN fd failed: %s", uv_strerror(r));
+            tun_device_.reset();
+            tun_fd_ = -1;
+            return false;
+        }
+        tun_poll_.data = this;
+
+        r = uv_poll_start(&tun_poll_, UV_READABLE, ClientApp::on_tun_poll);
+        if (r != 0) {
+            TX_ERROR("uv_poll_start for TUN fd failed: %s", uv_strerror(r));
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+            tun_device_.reset();
+            tun_fd_ = -1;
+            return false;
+        }
+    } else {
+        int r = uv_timer_init(loop_, &tun_timer_);
+        if (r != 0) {
+            TX_ERROR("uv_timer_init for TUN failed: %s", uv_strerror(r));
+            tun_device_.reset();
+            return false;
+        }
+        tun_timer_.data = this;
+        r = uv_timer_start(&tun_timer_, ClientApp::on_tun_timer, 1, 1);
+        if (r != 0) {
+            TX_ERROR("uv_timer_start for TUN failed: %s", uv_strerror(r));
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_timer_), nullptr);
+            tun_device_.reset();
+            return false;
+        }
+        tun_timer_started_ = true;
+    }
+
+    tun_started_ = true;
+    return true;
+}
+
+void ClientApp::stop_tun_listener() {
+    if (!tun_started_) return;
+    tun_started_ = false;
+    if (tun_fd_ >= 0) {
+        uv_poll_stop(&tun_poll_);
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_poll_))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+        }
+    }
+    if (tun_timer_started_) {
+        tun_timer_started_ = false;
+        uv_timer_stop(&tun_timer_);
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_timer_))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_timer_), nullptr);
+        }
+    }
+    if (tun_device_) {
+        tun_device_->close();
+        tun_device_.reset();
+    }
+    tun_fd_ = -1;
+}
+
+void ClientApp::on_tun_poll(uv_poll_t* handle, int status, int events) {
+    auto* app = static_cast<ClientApp*>(handle->data);
+    if (!app || !app->tun_started_) return;
+    if (status < 0) {
+        TX_WARN("TUN poll error: %s", uv_strerror(status));
+        return;
+    }
+    if ((events & UV_READABLE) == 0) return;
+    app->drain_tun_packets();
+}
+
+void ClientApp::on_tun_timer(uv_timer_t* timer) {
+    auto* app = static_cast<ClientApp*>(timer->data);
+    if (!app || !app->tun_started_) return;
+    app->drain_tun_packets();
+}
+
+void ClientApp::drain_tun_packets() {
+    if (!tun_device_) return;
+    for (;;) {
+        std::string error;
+        std::ptrdiff_t nread = tun_device_->read_packet(tun_read_buf_.data(),
+                                                        tun_read_buf_.size(),
+                                                        error);
+        if (nread > 0) {
+            handle_tun_packet(tun_read_buf_.data(), static_cast<size_t>(nread));
+            continue;
+        }
+        if (nread < 0 && !error.empty()) {
+            TX_WARN("TUN read failed: %s", error.c_str());
+        }
+        break;
+    }
+}
+
+void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
+    TunPacketView packet;
+    if (!parse_tun_packet(data, len, packet)) {
+        return;
+    }
+
+    if (packet.protocol == TunL4Protocol::Tcp) {
+        TX_DEBUG("[TUN][TCP] system stack packet %s:%u -> %s:%u ignored by UDP path",
+                 packet.src_ip.to_string().c_str(), packet.src_port,
+                 packet.dst_ip.to_string().c_str(), packet.dst_port);
+        return;
+    }
+
+    TargetAddr target;
+    target.type = packet.dst_ip.family == IpAddr::IPv4 ? AddrType::IPv4 : AddrType::IPv6;
+    target.host = ipaddr_host_string(packet.dst_ip);
+    target.port = packet.dst_port;
+
+    const std::string flow_key =
+        std::string("tun:") + packet.src_ip.to_string() + ">" +
+        packet.dst_ip.to_string() + "/" + std::to_string(static_cast<int>(packet.protocol));
+
+    auto it = udp_flows_.find(flow_key);
+    if (it == udp_flows_.end()) {
+        UdpFlow flow;
+        flow.session_id = next_session_id_++;
+        flow.kind = UdpFlowKind::Tun;
+        flow.client_addr_len = 0;
+        flow.tun_src_ip = packet.src_ip;
+        flow.tun_dst_ip = packet.dst_ip;
+        it = udp_flows_.emplace(flow_key, flow).first;
+        udp_session_keys_[flow.session_id] = flow_key;
+    }
+
+    RouteDecision decision = router_.decide_by_ip(packet.dst_ip);
+    const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
+    if (!outbound) {
+        TX_ERROR("TUN UDP route selected unknown outboundTag: %s",
+                 decision.outbound_tag.c_str());
+        return;
+    }
+    if (outbound->type == OutboundType::Block) {
+        TX_DEBUG("[TUN][Block][UDP] %s:%u", target.host.c_str(), target.port);
+        return;
+    }
+    if (outbound->type == OutboundType::Direct) {
+        TX_DEBUG("[TUN][Direct][UDP] %s:%u", target.host.c_str(), target.port);
+        send_direct_udp_packet(flow_key, it->second, target,
+                               packet.payload, packet.payload_len);
+        return;
+    }
+
+    if (udp_tunnel_.outbound && udp_tunnel_.outbound != outbound) {
+        close_udp_tunnel();
+    }
+    udp_tunnel_.outbound = outbound;
+    send_udp_packet(it->second.session_id, target, packet.payload, packet.payload_len);
+}
+
+bool ClientApp::write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
+                                     const uint8_t* data, size_t len) {
+    if (!tun_started_ || !tun_device_) return false;
+
+    IpAddr src = IpAddr::from_string(source.host);
+    if (src.family != flow.tun_src_ip.family) {
+        return false;
+    }
+
+    Buffer packet;
+    if (!build_udp_tun_packet(src, source.port,
+                              flow.tun_src_ip, flow.tun_src_ip.port,
+                              data, len, packet)) {
+        return false;
+    }
+
+    std::string error;
+    if (!tun_device_->write_packet(packet.data(), packet.readable(), error)) {
+        if (!error.empty()) {
+            TX_WARN("TUN write failed: %s", error.c_str());
+        }
+        return false;
+    }
+    return true;
 }
 
 void ClientApp::on_http_accept(SessionPtr session) {

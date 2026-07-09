@@ -3,6 +3,18 @@
         "http": {"host": "127.0.0.1", "port": 8080},
         "socks5": {"host": "127.0.0.1", "port": 1080}
     },
+    "tun": {
+        "enabled": false,
+        "name": "tx0",
+        "address": "10.10.0.1",
+        "prefix": 24,
+        "mode": "mixed",
+        "mtu": 1500,
+        "auto_config": true,
+        "routes": [],
+        "tcp_stack": "system",
+        "udp_stack": "gvisor"
+    },
     "outbounds": [
         {
             "tag": "direct-out",

@@ -82,6 +82,7 @@ set(ALL_LIB_SOURCES
 set(TX_CLIENT_APP_SOURCES
     src/client/client_app.cpp
     src/client/config.cpp
+    src/client/platform_tun.cpp
 )
 
 set(TX_SERVER_APP_SOURCES

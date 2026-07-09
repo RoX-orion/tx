@@ -42,6 +42,10 @@ typedef struct {
 // Start the client. Returns handle or NULL on failure.
 TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
 
+// Start the client with a VpnService TUN fd. The fd must remain valid for the
+// lifetime of the client.
+TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd);
+
 // Stop the client.
 TX_API void tx_client_stop(tx_handle_t handle);
 

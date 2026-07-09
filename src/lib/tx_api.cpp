@@ -24,6 +24,10 @@ struct TxServerHandle {
 extern "C" {
 
 tx_handle_t tx_client_start(const tx_client_config_t* config) {
+    return tx_client_start_with_tun_fd(config, -1);
+}
+
+tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
     if (!config || !config->config_path) return nullptr;
 
     auto* handle = new TxClientHandle;
@@ -37,6 +41,10 @@ tx_handle_t tx_client_start(const tx_client_config_t* config) {
 
     if (config->log_level) {
         cfg.log_level = config->log_level;
+    }
+    if (tun_fd >= 0) {
+        cfg.tun_enabled = true;
+        cfg.tun_fd = tun_fd;
     }
 
     if (!handle->app->init(cfg)) {

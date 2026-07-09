@@ -216,7 +216,13 @@ private:
             return false;
         }
 
-        for (const auto& route : config.tun_routes) {
+        std::vector<std::string> routes = config.tun_routes;
+        if (config.tun_auto_route && routes.empty()) {
+            routes.push_back("0.0.0.0/1");
+            routes.push_back("128.0.0.0/1");
+        }
+
+        for (const auto& route : routes) {
             if (!add_route(sock, route, error)) {
                 close_sock();
                 return false;

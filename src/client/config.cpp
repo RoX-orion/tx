@@ -91,6 +91,27 @@ bool ClientConfig::validate() const {
         return false;
     }
 
+    if (tun_enabled) {
+        if (tun_mtu <= 0) {
+            TX_ERROR("tun.mtu must be positive");
+            return false;
+        }
+        if (tun_prefix < 0 || tun_prefix > 32) {
+            TX_ERROR("tun.prefix must be between 0 and 32");
+            return false;
+        }
+        if (tun_auto_redirect) {
+            if (tun_redirect_port == 0) {
+                TX_ERROR("tun.redirect_port must be non-zero when auto_redirect is enabled");
+                return false;
+            }
+            if (tun_redirect_mark == 0) {
+                TX_ERROR("tun.redirect_mark must be non-zero when auto_redirect is enabled");
+                return false;
+            }
+        }
+    }
+
     for (const auto& outbound : outbounds) {
         if (outbound.tag.empty()) {
             TX_ERROR("Outbound tag is empty");
@@ -243,6 +264,10 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             config.tun_address = tun.value("address", config.tun_address);
             config.tun_prefix = tun.value("prefix", config.tun_prefix);
             config.tun_auto_config = tun.value("auto_config", config.tun_auto_config);
+            config.tun_auto_route = tun.value("auto_route", config.tun_auto_route);
+            config.tun_auto_redirect = tun.value("auto_redirect", config.tun_auto_redirect);
+            config.tun_redirect_port = tun.value("redirect_port", config.tun_redirect_port);
+            config.tun_redirect_mark = tun.value("redirect_mark", config.tun_redirect_mark);
             if (tun.contains("routes")) {
                 config.tun_routes.clear();
                 for (auto& route : tun["routes"]) {

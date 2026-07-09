@@ -2,8 +2,58 @@
 #include "tx/common/log.h"
 #include <cstring>
 #include <arpa/inet.h>
+#include <cerrno>
+
+#if defined(TX_PLATFORM_LINUX)
+#include <sys/socket.h>
+#endif
 
 namespace tx {
+
+namespace {
+
+uint32_t g_tcp_outbound_mark = 0;
+
+#if defined(TX_PLATFORM_LINUX)
+void apply_outbound_mark(uv_tcp_t* tcp) {
+    if (g_tcp_outbound_mark == 0) return;
+
+    uv_os_fd_t fd;
+    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) != 0) {
+        return;
+    }
+
+    uint32_t mark = g_tcp_outbound_mark;
+    if (setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_MARK,
+                   &mark, sizeof(mark)) != 0) {
+        TX_WARN("SO_MARK 0x%x failed: %s", mark, std::strerror(errno));
+    }
+}
+
+bool enable_transparent_socket(uv_tcp_t* tcp) {
+    uv_os_fd_t fd;
+    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) != 0) {
+        return false;
+    }
+
+    int one = 1;
+    if (setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_REUSEADDR,
+                   &one, sizeof(one)) != 0) {
+        TX_ERROR("SO_REUSEADDR failed: %s", std::strerror(errno));
+        return false;
+    }
+    if (setsockopt(static_cast<int>(fd), SOL_IP, IP_TRANSPARENT,
+                   &one, sizeof(one)) != 0) {
+        TX_ERROR("IP_TRANSPARENT failed: %s", std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+#else
+void apply_outbound_mark(uv_tcp_t*) {}
+#endif
+
+} // namespace
 
 // DNS resolution context for TcpSession::connect
 struct DnsResolveCtx {
@@ -68,6 +118,7 @@ void TcpSession::init(uv_tcp_t* server_handle) {
 void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     auto* req = new uv_connect_t;
     tcp_.data = this;
+    apply_outbound_mark(&tcp_);
 
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
@@ -113,6 +164,39 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
         delete resolve_ctx;
         delete dns_req;
     }
+}
+
+bool TcpSession::local_addr(std::string& host, uint16_t& port) const {
+    sockaddr_storage addr;
+    int len = sizeof(addr);
+    if (uv_tcp_getsockname(const_cast<uv_tcp_t*>(&tcp_),
+                           reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        return false;
+    }
+
+    char ipbuf[INET6_ADDRSTRLEN] = {0};
+    if (addr.ss_family == AF_INET) {
+        const auto* a4 = reinterpret_cast<const sockaddr_in*>(&addr);
+        if (!inet_ntop(AF_INET, &a4->sin_addr, ipbuf, sizeof(ipbuf))) {
+            return false;
+        }
+        port = ntohs(a4->sin_port);
+    } else if (addr.ss_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+        if (!inet_ntop(AF_INET6, &a6->sin6_addr, ipbuf, sizeof(ipbuf))) {
+            return false;
+        }
+        port = ntohs(a6->sin6_port);
+    } else {
+        return false;
+    }
+
+    host = ipbuf;
+    return true;
+}
+
+void TcpSession::set_outbound_mark(uint32_t mark) {
+    g_tcp_outbound_mark = mark;
 }
 
 bool TcpSession::send(const uint8_t* data, size_t len) {
@@ -368,7 +452,7 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
 // ==================== TcpServer ====================
 
 TcpServer::TcpServer(uv_loop_t* loop)
-    : loop_(loop), listening_(false) {
+    : loop_(loop), listening_(false), transparent_(false) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 }
@@ -378,6 +462,7 @@ TcpServer::~TcpServer() {
 }
 
 bool TcpServer::listen(const std::string& host, uint16_t port) {
+    transparent_ = false;
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
     struct sockaddr* sa;
@@ -390,6 +475,49 @@ bool TcpServer::listen(const std::string& host, uint16_t port) {
         TX_ERROR("Invalid listen address: %s:%u", host.c_str(), port);
         return false;
     }
+
+    int r = uv_tcp_bind(&tcp_, sa, 0);
+    if (r != 0) {
+        TX_ERROR("uv_tcp_bind failed: %s", uv_strerror(r));
+        return false;
+    }
+
+    r = uv_listen(reinterpret_cast<uv_stream_t*>(&tcp_), 128, on_connection);
+    if (r != 0) {
+        TX_ERROR("uv_listen failed: %s", uv_strerror(r));
+        return false;
+    }
+
+    listening_ = true;
+    TX_INFO("Listening on %s:%u", host.c_str(), port);
+    return true;
+}
+
+bool TcpServer::listen_transparent(const std::string& host, uint16_t port) {
+    transparent_ = true;
+    struct sockaddr_in addr4;
+    struct sockaddr_in6 addr6;
+    struct sockaddr* sa;
+
+    if (uv_ip4_addr(host.c_str(), port, &addr4) == 0) {
+        sa = reinterpret_cast<struct sockaddr*>(&addr4);
+    } else if (uv_ip6_addr(host.c_str(), port, &addr6) == 0) {
+        sa = reinterpret_cast<struct sockaddr*>(&addr6);
+    } else {
+        TX_ERROR("Invalid listen address: %s:%u", host.c_str(), port);
+        return false;
+    }
+
+#if defined(TX_PLATFORM_LINUX)
+    if (transparent_ && !enable_transparent_socket(&tcp_)) {
+        return false;
+    }
+#else
+    if (transparent_) {
+        TX_ERROR("Transparent TCP listen is only supported on Linux");
+        return false;
+    }
+#endif
 
     int r = uv_tcp_bind(&tcp_, sa, 0);
     if (r != 0) {

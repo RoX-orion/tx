@@ -182,6 +182,9 @@ private:
     // keeps TCP on the configured system-stack path.
     bool start_tun_listener();
     void stop_tun_listener();
+    bool start_tun_tcp_redirect();
+    void stop_tun_tcp_redirect();
+    void on_tun_tcp_accept(SessionPtr session);
     void drain_tun_packets();
     void handle_tun_packet(const uint8_t* data, size_t len);
     bool write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
@@ -197,6 +200,7 @@ private:
     // Listeners
     TcpServer          http_server_;
     TcpServer          socks5_server_;
+    TcpServer          tun_tcp_server_;
     uv_udp_t           socks5_udp_;
     bool               socks5_udp_started_;
     int                tun_fd_;
@@ -204,6 +208,7 @@ private:
     uv_poll_t          tun_poll_;
     uv_timer_t         tun_timer_;
     bool               tun_timer_started_;
+    bool               tun_tcp_redirect_started_;
     std::unique_ptr<PlatformTunDevice> tun_device_;
     std::vector<uint8_t> tun_read_buf_;
     UdpTunnel          udp_tunnel_;

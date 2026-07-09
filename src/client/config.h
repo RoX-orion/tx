@@ -41,6 +41,10 @@ struct ClientConfig {
     std::string tun_address = "10.10.0.1";
     int         tun_prefix = 24;
     bool        tun_auto_config = true;
+    bool        tun_auto_route = false;
+    bool        tun_auto_redirect = false;
+    uint16_t    tun_redirect_port = 12345;
+    uint32_t    tun_redirect_mark = 0x2024;
     std::vector<std::string> tun_routes;
     std::string tun_mode = "mixed";
     std::string tun_tcp_stack = "system";

@@ -7,6 +7,13 @@
 #include <netdb.h>
 #include <random>
 #include <cstdlib>
+#include <sstream>
+
+#if defined(TX_PLATFORM_LINUX)
+#include <cerrno>
+#include <linux/netfilter_ipv4.h>
+#include <sys/socket.h>
+#endif
 
 namespace tx {
 
@@ -86,6 +93,73 @@ bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
     }
     return false;
 }
+
+#if defined(TX_PLATFORM_LINUX)
+bool run_auto_redirect_cmd(const std::string& cmd) {
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+        TX_WARN("auto_redirect command failed (%d): %s", rc, cmd.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::string hex_u32(uint32_t value) {
+    std::ostringstream oss;
+    oss << std::hex << value;
+    return oss.str();
+}
+
+bool original_tcp_destination(SessionPtr session, TargetAddr& target) {
+    uv_os_fd_t fd;
+    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(session->handle()), &fd) == 0) {
+        sockaddr_in orig4;
+        socklen_t len4 = sizeof(orig4);
+        if (getsockopt(static_cast<int>(fd), IPPROTO_IP, SO_ORIGINAL_DST,
+                       &orig4, &len4) == 0) {
+            target.type = AddrType::IPv4;
+            char host[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &orig4.sin_addr, host, sizeof(host));
+            target.host = host;
+            target.port = ntohs(orig4.sin_port);
+            return true;
+        }
+    }
+
+    std::string host;
+    uint16_t port = 0;
+    if (!session->local_addr(host, port)) {
+        return false;
+    }
+
+    target.host = host;
+    target.port = port;
+    target.type = host.find(':') == std::string::npos ? AddrType::IPv4 : AddrType::IPv6;
+    return port != 0;
+}
+
+bool install_linux_auto_redirect(uint16_t port, uint32_t mark) {
+    run_auto_redirect_cmd("nft delete table inet tx_auto_redirect >/dev/null 2>&1");
+
+    bool ok = true;
+    ok = run_auto_redirect_cmd("nft add table inet tx_auto_redirect") && ok;
+    ok = run_auto_redirect_cmd(
+        "nft 'add chain inet tx_auto_redirect output { type nat hook output priority dstnat; policy accept; }'") && ok;
+    ok = run_auto_redirect_cmd(
+        "nft add rule inet tx_auto_redirect output meta mark 0x" +
+        hex_u32(mark) + " return") && ok;
+    ok = run_auto_redirect_cmd(
+        "nft 'add rule inet tx_auto_redirect output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return'") && ok;
+    ok = run_auto_redirect_cmd(
+        "nft add rule inet tx_auto_redirect output ip protocol tcp redirect to :" +
+        std::to_string(port)) && ok;
+    return ok;
+}
+
+void uninstall_linux_auto_redirect() {
+    run_auto_redirect_cmd("nft delete table inet tx_auto_redirect >/dev/null 2>&1");
+}
+#endif
 
 std::string sockaddr_key(const sockaddr* addr) {
     char host[INET6_ADDRSTRLEN] = {0};
@@ -202,10 +276,12 @@ ClientApp::ClientApp()
     : loop_(uv_default_loop()),
       http_server_(loop_),
       socks5_server_(loop_),
+      tun_tcp_server_(loop_),
       socks5_udp_started_(false),
       tun_fd_(-1),
       tun_started_(false),
       tun_timer_started_(false),
+      tun_tcp_redirect_started_(false),
       next_session_id_(1) {}
 
 ClientApp::~ClientApp() {
@@ -971,6 +1047,26 @@ bool ClientApp::start_tun_listener() {
         tun_timer_started_ = true;
     }
 
+    if (!start_tun_tcp_redirect()) {
+        if (tun_fd_ >= 0) {
+            uv_poll_stop(&tun_poll_);
+            if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_poll_))) {
+                uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+            }
+        }
+        if (tun_timer_started_) {
+            tun_timer_started_ = false;
+            uv_timer_stop(&tun_timer_);
+            if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_timer_))) {
+                uv_close(reinterpret_cast<uv_handle_t*>(&tun_timer_), nullptr);
+            }
+        }
+        tun_device_->close();
+        tun_device_.reset();
+        tun_fd_ = -1;
+        return false;
+    }
+
     tun_started_ = true;
     return true;
 }
@@ -978,6 +1074,7 @@ bool ClientApp::start_tun_listener() {
 void ClientApp::stop_tun_listener() {
     if (!tun_started_) return;
     tun_started_ = false;
+    stop_tun_tcp_redirect();
     if (tun_fd_ >= 0) {
         uv_poll_stop(&tun_poll_);
         if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_poll_))) {
@@ -996,6 +1093,105 @@ void ClientApp::stop_tun_listener() {
         tun_device_.reset();
     }
     tun_fd_ = -1;
+}
+
+bool ClientApp::start_tun_tcp_redirect() {
+    if (!config_.tun_auto_redirect) {
+        TcpSession::set_outbound_mark(0);
+        return true;
+    }
+
+#if !defined(TX_PLATFORM_LINUX)
+    TX_ERROR("tun.auto_redirect is only supported on Linux");
+    return false;
+#else
+    tun_tcp_server_.set_accept_callback([this](SessionPtr s) { on_tun_tcp_accept(s); });
+    if (!tun_tcp_server_.listen_transparent("0.0.0.0", config_.tun_redirect_port)) {
+        TX_ERROR("Failed to start TUN TCP transparent listener on 0.0.0.0:%u",
+                 config_.tun_redirect_port);
+        return false;
+    }
+
+    TcpSession::set_outbound_mark(config_.tun_redirect_mark);
+    if (!install_linux_auto_redirect(config_.tun_redirect_port,
+                                     config_.tun_redirect_mark)) {
+        TcpSession::set_outbound_mark(0);
+        tun_tcp_server_.stop();
+        TX_ERROR("Failed to install Linux tun.auto_redirect nft rules");
+        return false;
+    }
+
+    tun_tcp_redirect_started_ = true;
+    TX_INFO("  TUN TCP redirect: 0.0.0.0:%u mark=0x%s",
+            config_.tun_redirect_port,
+            hex_u32(config_.tun_redirect_mark).c_str());
+    return true;
+#endif
+}
+
+void ClientApp::stop_tun_tcp_redirect() {
+    if (!tun_tcp_redirect_started_) return;
+    tun_tcp_redirect_started_ = false;
+#if defined(TX_PLATFORM_LINUX)
+    uninstall_linux_auto_redirect();
+#endif
+    TcpSession::set_outbound_mark(0);
+    tun_tcp_server_.stop();
+}
+
+void ClientApp::on_tun_tcp_accept(SessionPtr session) {
+    TargetAddr target;
+#if defined(TX_PLATFORM_LINUX)
+    if (!original_tcp_destination(session, target)) {
+        TX_WARN("[TUN][TCP] failed to get original destination");
+        session->close();
+        return;
+    }
+#else
+    session->close();
+    return;
+#endif
+
+    auto conn = std::make_shared<ProxyConn>();
+    conn->local_session = session;
+    conn->socks5 = nullptr;
+    conn->http = nullptr;
+    conn->target = target;
+    conn->route = RouteAction::Proxy;
+    conn->outbound = nullptr;
+    conn->connected = false;
+    conn->connect_result_sent = false;
+    conn->target_dispatched = true;
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = false;
+    conn->tunnel_timer = nullptr;
+    conn->session_id = next_session_id_++;
+
+    session->set_close_callback([this, conn](SessionPtr) {
+        on_proxy_close(conn);
+    });
+
+    session->start_read([this, conn](SessionPtr, Buffer& data) {
+        conn->proto_buf.append(data);
+        data.clear();
+
+        if (!conn->connected) {
+            return;
+        }
+        if (conn->route == RouteAction::Direct && conn->direct_session) {
+            size_t bytes = conn->proto_buf.readable();
+            conn->direct_session->send(conn->proto_buf);
+            record_traffic(RouteAction::Direct, true, bytes);
+            conn->proto_buf.clear();
+        } else if (!conn->proto_buf.empty()) {
+            tunnel_send(conn, conn->proto_buf.data(), conn->proto_buf.readable());
+            conn->proto_buf.clear();
+        }
+    });
+
+    TX_DEBUG("[TUN][TCP] accepted transparent flow to %s:%u",
+             conn->target.host.c_str(), conn->target.port);
+    on_target_resolved(conn);
 }
 
 void ClientApp::on_tun_poll(uv_poll_t* handle, int status, int events) {
@@ -1704,6 +1900,9 @@ void ClientApp::fail_tunnel_connection(ProxyConnPtr conn) {
             Buffer resp;
             conn->http->build_error_response(502, resp);
             conn->local_session->send(resp);
+        }
+        if (!conn->socks5 && !conn->http) {
+            conn->local_session->close();
         }
         return;
     }

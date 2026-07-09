@@ -55,7 +55,10 @@ public:
     // Remote address
     const std::string& remote_addr() const { return remote_addr_; }
     uint16_t remote_port() const { return remote_port_; }
+    bool local_addr(std::string& host, uint16_t& port) const;
     size_t pending_write_bytes() const { return pending_write_bytes_; }
+
+    static void set_outbound_mark(uint32_t mark);
 
 private:
     static void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
@@ -98,6 +101,7 @@ public:
     ~TcpServer();
 
     bool listen(const std::string& host, uint16_t port);
+    bool listen_transparent(const std::string& host, uint16_t port);
     void stop();
 
     void set_accept_callback(AcceptCallback cb) { accept_cb_ = std::move(cb); }
@@ -110,6 +114,7 @@ private:
     uv_loop_t*     loop_;
     uv_tcp_t       tcp_;
     bool           listening_;
+    bool           transparent_;
     AcceptCallback accept_cb_;
 };
 

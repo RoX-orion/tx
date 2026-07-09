@@ -11,6 +11,10 @@
         "mode": "mixed",
         "mtu": 1500,
         "auto_config": true,
+        "auto_route": true,
+        "auto_redirect": true,
+        "redirect_port": 54321,
+        "redirect_mark": 8228,
         "routes": [],
         "tcp_stack": "system",
         "udp_stack": "gvisor"

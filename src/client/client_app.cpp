@@ -305,30 +305,16 @@ bool ClientApp::init(const ClientConfig& config) {
                 tun_fd_, config_.tun_mtu,
                 config_.tun_tcp_stack.c_str(),
                 config_.tun_udp_stack.c_str());
+        if (!config_.tun_auto_redirect) {
+            if (!start_proxy_listeners()) {
+                return false;
+            }
+            TX_INFO("  TUN proxy bridge enabled for TCP/SOCKS compatibility");
+        }
     } else {
-        // Proxy mode keeps the previous HTTP/SOCKS entrypoints and does not
-        // require tun2socks.
-        http_server_.set_accept_callback([this](SessionPtr s) { on_http_accept(s); });
-        if (!http_server_.listen(config.http_host, config.http_port)) {
-            TX_ERROR("Failed to start HTTP proxy on %s:%u",
-                     config.http_host.c_str(), config.http_port);
+        if (!start_proxy_listeners()) {
             return false;
         }
-
-        socks5_server_.set_accept_callback([this](SessionPtr s) { on_socks5_accept(s); });
-        if (!socks5_server_.listen(config.socks5_host, config.socks5_port)) {
-            TX_ERROR("Failed to start SOCKS5 proxy on %s:%u",
-                     config.socks5_host.c_str(), config.socks5_port);
-            return false;
-        }
-        if (!start_udp_listener()) {
-            TX_ERROR("Failed to start SOCKS5 UDP associate listener on %s:%u",
-                     config.socks5_host.c_str(), config.socks5_port);
-            return false;
-        }
-
-        TX_INFO("  HTTP   proxy: %s:%u", config.http_host.c_str(), config.http_port);
-        TX_INFO("  SOCKS5 proxy: %s:%u", config.socks5_host.c_str(), config.socks5_port);
     }
     TX_INFO("  Outbounds:    %zu", config.outbounds.size());
     return true;
@@ -438,6 +424,32 @@ void ClientApp::block_connection(ProxyConnPtr conn) {
         conn->local_session->send(resp);
     }
     conn->local_session->close();
+}
+
+bool ClientApp::start_proxy_listeners() {
+    http_server_.set_accept_callback([this](SessionPtr s) { on_http_accept(s); });
+    if (!http_server_.listen(config_.http_host, config_.http_port)) {
+        TX_ERROR("Failed to start HTTP proxy on %s:%u",
+                 config_.http_host.c_str(), config_.http_port);
+        return false;
+    }
+
+    socks5_server_.set_accept_callback([this](SessionPtr s) { on_socks5_accept(s); });
+    if (!socks5_server_.listen(config_.socks5_host, config_.socks5_port)) {
+        TX_ERROR("Failed to start SOCKS5 proxy on %s:%u",
+                 config_.socks5_host.c_str(), config_.socks5_port);
+        return false;
+    }
+
+    if (!start_udp_listener()) {
+        TX_ERROR("Failed to start SOCKS5 UDP associate listener on %s:%u",
+                 config_.socks5_host.c_str(), config_.socks5_port);
+        return false;
+    }
+
+    TX_INFO("  HTTP   proxy: %s:%u", config_.http_host.c_str(), config_.http_port);
+    TX_INFO("  SOCKS5 proxy: %s:%u", config_.socks5_host.c_str(), config_.socks5_port);
+    return true;
 }
 
 bool ClientApp::start_udp_listener() {

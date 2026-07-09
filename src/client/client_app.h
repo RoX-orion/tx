@@ -151,6 +151,7 @@ private:
     void record_traffic(RouteAction route, bool upload, size_t bytes);
 
     // SOCKS5 UDP ASSOCIATE / QUIC forwarding
+    bool start_proxy_listeners();
     bool start_udp_listener();
     void stop_udp_listener();
     bool ensure_udp_tunnel();

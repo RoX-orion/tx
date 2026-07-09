@@ -6,6 +6,7 @@
 
 #if defined(TX_PLATFORM_LINUX)
 #include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace tx {
@@ -15,42 +16,75 @@ namespace {
 uint32_t g_tcp_outbound_mark = 0;
 
 #if defined(TX_PLATFORM_LINUX)
-void apply_outbound_mark(uv_tcp_t* tcp) {
-    if (g_tcp_outbound_mark == 0) return;
-
-    uv_os_fd_t fd;
-    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) != 0) {
-        return;
-    }
+bool set_outbound_mark(int fd) {
+    if (g_tcp_outbound_mark == 0) return true;
 
     uint32_t mark = g_tcp_outbound_mark;
-    if (setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_MARK,
-                   &mark, sizeof(mark)) != 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) {
         TX_WARN("SO_MARK 0x%x failed: %s", mark, std::strerror(errno));
+        return false;
     }
+    return true;
 }
 
-bool enable_transparent_socket(uv_tcp_t* tcp) {
+bool ensure_outbound_socket(uv_tcp_t* tcp, int family) {
+    if (g_tcp_outbound_mark == 0) return true;
+
     uv_os_fd_t fd;
-    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) != 0) {
+    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) == 0) {
+        return set_outbound_mark(static_cast<int>(fd));
+    }
+
+    int sock = ::socket(family, SOCK_STREAM, 0);
+    if (sock < 0) {
+        TX_WARN("socket() for SO_MARK failed: %s", std::strerror(errno));
+        return false;
+    }
+
+    if (!set_outbound_mark(sock)) {
+        ::close(sock);
+        return false;
+    }
+
+    int r = uv_tcp_open(tcp, static_cast<uv_os_sock_t>(sock));
+    if (r != 0) {
+        TX_WARN("uv_tcp_open for marked socket failed: %s", uv_strerror(r));
+        ::close(sock);
+        return false;
+    }
+    return true;
+}
+
+bool open_transparent_socket(uv_tcp_t* tcp, int family) {
+    int fd = ::socket(family, SOCK_STREAM, 0);
+    if (fd < 0) {
+        TX_ERROR("socket() for transparent listen failed: %s", std::strerror(errno));
         return false;
     }
 
     int one = 1;
-    if (setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_REUSEADDR,
-                   &one, sizeof(one)) != 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
         TX_ERROR("SO_REUSEADDR failed: %s", std::strerror(errno));
+        ::close(fd);
         return false;
     }
-    if (setsockopt(static_cast<int>(fd), SOL_IP, IP_TRANSPARENT,
-                   &one, sizeof(one)) != 0) {
+    if (family == AF_INET &&
+        setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) != 0) {
         TX_ERROR("IP_TRANSPARENT failed: %s", std::strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    int r = uv_tcp_open(tcp, static_cast<uv_os_sock_t>(fd));
+    if (r != 0) {
+        TX_ERROR("uv_tcp_open for transparent listen failed: %s", uv_strerror(r));
+        ::close(fd);
         return false;
     }
     return true;
 }
 #else
-void apply_outbound_mark(uv_tcp_t*) {}
+bool ensure_outbound_socket(uv_tcp_t*, int) { return true; }
 #endif
 
 } // namespace
@@ -118,7 +152,6 @@ void TcpSession::init(uv_tcp_t* server_handle) {
 void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     auto* req = new uv_connect_t;
     tcp_.data = this;
-    apply_outbound_mark(&tcp_);
 
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
@@ -131,6 +164,13 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     }
 
     if (sa) {
+        if (!ensure_outbound_socket(&tcp_, sa->sa_family)) {
+            cb(false);
+            close();
+            delete req;
+            return;
+        }
+
         // Direct IP connect
         req->data = new ConnectCtx{std::move(cb), shared_from_this()};
         int r = uv_tcp_connect(req, &tcp_, sa, on_connect);
@@ -429,6 +469,17 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
     }
 
     // Connect using resolved address
+    if (!ensure_outbound_socket(&ctx->session->tcp_, sa->sa_family)) {
+        ctx->cb(false);
+        if (!ctx->session->is_closed()) {
+            ctx->session->close();
+        }
+        uv_freeaddrinfo(res);
+        delete ctx;
+        delete req;
+        return;
+    }
+
     auto* connect_req = new uv_connect_t;
     connect_req->data = new ConnectCtx{std::move(ctx->cb), ctx->session};
 
@@ -509,7 +560,7 @@ bool TcpServer::listen_transparent(const std::string& host, uint16_t port) {
     }
 
 #if defined(TX_PLATFORM_LINUX)
-    if (transparent_ && !enable_transparent_socket(&tcp_)) {
+    if (!open_transparent_socket(&tcp_, sa->sa_family)) {
         return false;
     }
 #else

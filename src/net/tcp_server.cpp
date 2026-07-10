@@ -3,8 +3,9 @@
 #include <cstring>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <utility>
 
-#if defined(TX_PLATFORM_LINUX)
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -26,35 +27,54 @@ bool set_outbound_mark(int fd) {
     }
     return true;
 }
+#endif
 
-bool ensure_outbound_socket(uv_tcp_t* tcp, int family) {
-    if (g_tcp_outbound_mark == 0) return true;
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
+                            const SocketProtectCallback& socket_protector) {
+    if (g_tcp_outbound_mark == 0 && !socket_protector) return true;
 
     uv_os_fd_t fd;
     if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) == 0) {
-        return set_outbound_mark(static_cast<int>(fd));
+        int socket_fd = static_cast<int>(fd);
+        if (socket_protector && !socket_protector(socket_fd)) {
+            TX_ERROR("Socket protector rejected TCP fd %d", socket_fd);
+            return false;
+        }
+#if defined(TX_PLATFORM_LINUX)
+        return set_outbound_mark(socket_fd);
+#else
+        return true;
+#endif
     }
 
     int sock = ::socket(family, SOCK_STREAM, 0);
     if (sock < 0) {
-        TX_WARN("socket() for SO_MARK failed: %s", std::strerror(errno));
+        TX_WARN("Failed to create outbound TCP socket: %s", std::strerror(errno));
         return false;
     }
 
+    if (socket_protector && !socket_protector(sock)) {
+        TX_ERROR("Socket protector rejected TCP fd %d", sock);
+        ::close(sock);
+        return false;
+    }
+#if defined(TX_PLATFORM_LINUX)
     if (!set_outbound_mark(sock)) {
         ::close(sock);
         return false;
     }
+#endif
 
     int r = uv_tcp_open(tcp, static_cast<uv_os_sock_t>(sock));
     if (r != 0) {
-        TX_WARN("uv_tcp_open for marked socket failed: %s", uv_strerror(r));
+        TX_WARN("uv_tcp_open for outbound socket failed: %s", uv_strerror(r));
         ::close(sock);
         return false;
     }
     return true;
 }
-
+#if defined(TX_PLATFORM_LINUX)
 bool open_transparent_socket(uv_tcp_t* tcp, int family) {
     int fd = ::socket(family, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -83,8 +103,16 @@ bool open_transparent_socket(uv_tcp_t* tcp, int family) {
     }
     return true;
 }
+#endif
 #else
-bool ensure_outbound_socket(uv_tcp_t*, int) { return true; }
+bool ensure_outbound_socket(uv_tcp_t*, int,
+                            const SocketProtectCallback& socket_protector) {
+    if (socket_protector) {
+        TX_ERROR("Socket protection is not supported on this platform");
+        return false;
+    }
+    return true;
+}
 #endif
 
 } // namespace
@@ -103,12 +131,13 @@ struct ConnectCtx {
 
 // ==================== TcpSession ====================
 
-TcpSession::TcpSession(uv_loop_t* loop)
+TcpSession::TcpSession(uv_loop_t* loop, SocketProtectCallback socket_protector)
     : loop_(loop), closed_(false), reading_(false), remote_port_(0),
       pending_write_bytes_(0),
       write_high_watermark_(4 * 1024 * 1024),
       write_low_watermark_(1024 * 1024),
-      paused_for_write_(false) {
+      paused_for_write_(false),
+      socket_protector_(std::move(socket_protector)) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 }
@@ -164,7 +193,7 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     }
 
     if (sa) {
-        if (!ensure_outbound_socket(&tcp_, sa->sa_family)) {
+        if (!ensure_outbound_socket(&tcp_, sa->sa_family, socket_protector_)) {
             cb(false);
             close();
             delete req;
@@ -469,7 +498,8 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
     }
 
     // Connect using resolved address
-    if (!ensure_outbound_socket(&ctx->session->tcp_, sa->sa_family)) {
+    if (!ensure_outbound_socket(&ctx->session->tcp_, sa->sa_family,
+                                ctx->session->socket_protector_)) {
         ctx->cb(false);
         if (!ctx->session->is_closed()) {
             ctx->session->close();

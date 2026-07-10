@@ -29,7 +29,7 @@ struct ClientTrafficStats {
 // Client application: runs HTTP/SOCKS5 proxies and tunnels traffic to server.
 class ClientApp {
 public:
-    ClientApp();
+    explicit ClientApp(SocketProtectCallback socket_protector = SocketProtectCallback());
     ~ClientApp();
 
     // Initialize with configuration
@@ -224,6 +224,7 @@ private:
     std::atomic<uint64_t> direct_download_bytes_;
     std::atomic<uint64_t> proxy_upload_bytes_;
     std::atomic<uint64_t> proxy_download_bytes_;
+    SocketProtectCallback socket_protector_;
 };
 
 } // namespace tx

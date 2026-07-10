@@ -8,11 +8,16 @@
 #include <random>
 #include <cstdlib>
 #include <sstream>
+#include <utility>
+
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+#include <cerrno>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #if defined(TX_PLATFORM_LINUX)
-#include <cerrno>
 #include <linux/netfilter_ipv4.h>
-#include <sys/socket.h>
 #endif
 
 namespace tx {
@@ -272,7 +277,7 @@ struct ClientApp::DirectUdpRelay {
     bool recv_started = false;
 };
 
-ClientApp::ClientApp()
+ClientApp::ClientApp(SocketProtectCallback socket_protector)
     : loop_(uv_default_loop()),
       http_server_(loop_),
       socks5_server_(loop_),
@@ -282,7 +287,8 @@ ClientApp::ClientApp()
       tun_started_(false),
       tun_timer_started_(false),
       tun_tcp_redirect_started_(false),
-      next_session_id_(1) {}
+      next_session_id_(1),
+      socket_protector_(std::move(socket_protector)) {}
 
 ClientApp::~ClientApp() {
     stop();
@@ -527,6 +533,38 @@ bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& fl
     }
     relay->handle.data = relay;
 
+    if (socket_protector_) {
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+        int socket_fd = ::socket(target_family, SOCK_DGRAM, 0);
+        if (socket_fd < 0) {
+            TX_ERROR("Failed to create direct UDP socket: %s", std::strerror(errno));
+            uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                     ClientApp::on_direct_udp_closed);
+            return false;
+        }
+        if (!socket_protector_(socket_fd)) {
+            TX_ERROR("Socket protector rejected UDP fd %d", socket_fd);
+            ::close(socket_fd);
+            uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                     ClientApp::on_direct_udp_closed);
+            return false;
+        }
+        r = uv_udp_open(&relay->handle, static_cast<uv_os_sock_t>(socket_fd));
+        if (r != 0) {
+            TX_ERROR("uv_udp_open for protected socket failed: %s", uv_strerror(r));
+            ::close(socket_fd);
+            uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                     ClientApp::on_direct_udp_closed);
+            return false;
+        }
+#else
+        TX_ERROR("Socket protection is not supported on this platform");
+        uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                 ClientApp::on_direct_udp_closed);
+        return false;
+#endif
+    }
+
     if (target_family == AF_INET6) {
         sockaddr_in6 any6;
         uv_ip6_addr("::", 0, &any6);
@@ -663,7 +701,7 @@ bool ClientApp::ensure_udp_tunnel() {
         return false;
     }
 
-    auto tunnel = std::make_shared<TcpSession>(loop_);
+    auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
     udp_tunnel_.tunnel_session = tunnel;
     udp_tunnel_.connected = false;
     udp_tunnel_.connecting = true;
@@ -1638,7 +1676,7 @@ void ClientApp::on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct 
 void ClientApp::connect_direct(ProxyConnPtr conn) {
     TX_INFO("[Direct] Connecting to %s:%u", conn->target.host.c_str(), conn->target.port);
 
-    auto direct = std::make_shared<TcpSession>(loop_);
+    auto direct = std::make_shared<TcpSession>(loop_, socket_protector_);
     conn->direct_session = direct;
 
     direct->set_close_callback([this, conn](SessionPtr) {
@@ -1721,7 +1759,7 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
         return true;
     }
 
-    auto tunnel = std::make_shared<TcpSession>(loop_);
+    auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
     conn->tunnel_session = tunnel;
     conn->tunnel_connected = false;
     conn->tunnel_connecting = true;

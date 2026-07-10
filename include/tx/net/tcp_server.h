@@ -17,11 +17,13 @@ using AcceptCallback = std::function<void(SessionPtr session)>;
 using ReadCallback   = std::function<void(SessionPtr session, Buffer& data)>;
 using CloseCallbackS = std::function<void(SessionPtr session)>;
 using WriteDrainCallback = std::function<void(SessionPtr session)>;
+using SocketProtectCallback = std::function<bool(int fd)>;
 
 // A single TCP connection session
 class TcpSession : public std::enable_shared_from_this<TcpSession> {
 public:
-    explicit TcpSession(uv_loop_t* loop);
+    explicit TcpSession(uv_loop_t* loop,
+                        SocketProtectCallback socket_protector = SocketProtectCallback());
     ~TcpSession();
 
     // Initialize from an accepted handle
@@ -83,6 +85,7 @@ private:
     size_t       write_high_watermark_;
     size_t       write_low_watermark_;
     bool         paused_for_write_;
+    SocketProtectCallback socket_protector_;
 
     struct WriteReq {
         uv_write_t req;

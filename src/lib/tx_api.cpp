@@ -8,6 +8,7 @@
 #include <thread>
 #include <memory>
 #include <atomic>
+#include <utility>
 
 struct TxClientHandle {
     std::unique_ptr<tx::ClientApp> app;
@@ -21,17 +22,21 @@ struct TxServerHandle {
     std::atomic<bool> running{false};
 };
 
-extern "C" {
+namespace {
 
-tx_handle_t tx_client_start(const tx_client_config_t* config) {
-    return tx_client_start_with_tun_fd(config, -1);
-}
-
-tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
+tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
+                         tx_socket_protect_fn protect_fn, void* protect_user_data) {
     if (!config || !config->config_path) return nullptr;
 
+    tx::SocketProtectCallback socket_protector;
+    if (protect_fn) {
+        socket_protector = [protect_fn, protect_user_data](int fd) {
+            return protect_fn(fd, protect_user_data) != 0;
+        };
+    }
+
     auto* handle = new TxClientHandle;
-    handle->app = std::make_unique<tx::ClientApp>();
+    handle->app = std::make_unique<tx::ClientApp>(std::move(socket_protector));
 
     tx::ClientConfig cfg;
     if (!tx::load_client_config(config->config_path, cfg)) {
@@ -59,6 +64,25 @@ tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tu
     });
 
     return static_cast<tx_handle_t>(handle);
+}
+
+} // namespace
+
+extern "C" {
+
+tx_handle_t tx_client_start(const tx_client_config_t* config) {
+    return start_client(config, -1, nullptr, nullptr);
+}
+
+tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
+    return start_client(config, tun_fd, nullptr, nullptr);
+}
+
+tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
+                                    tx_socket_protect_fn protect_fn,
+                                    void* protect_user_data) {
+    if (tun_fd < 0 || !protect_fn) return nullptr;
+    return start_client(config, tun_fd, protect_fn, protect_user_data);
 }
 
 void tx_client_stop(tx_handle_t handle) {

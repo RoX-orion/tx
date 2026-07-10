@@ -1,6 +1,7 @@
 #include "config.h"
 #include "tx/common/log.h"
 #include "tx/crypto/secret.h"
+#include "tx/net/udp_flow_timeout.h"
 
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -10,6 +11,11 @@ using json = nlohmann::json;
 namespace tx {
 
 bool ServerConfig::validate() const {
+    if (udp_idle_timeout_ms < 1000 || udp_idle_timeout_ms > 24 * 60 * 60 * 1000ULL) {
+        TX_ERROR("udp.idle_timeout must be between 1 and 86400 seconds");
+        return false;
+    }
+
     if (psk.size() != Secret::kPskLen) {
         TX_ERROR("High-entropy secret not configured; use secret with base64:, hex:, or uuid-v4:");
         return false;
@@ -44,6 +50,18 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
                 TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
                 return false;
             }
+        }
+
+        if (j.contains("udp")) {
+            const auto& udp = j["udp"];
+            int64_t idle_timeout = udp.value("idle_timeout",
+                                             static_cast<int64_t>(
+                                                 kDefaultUdpFlowIdleTimeoutMs / 1000));
+            if (idle_timeout < 1 || idle_timeout > 86400) {
+                TX_ERROR("udp.idle_timeout must be between 1 and 86400 seconds");
+                return false;
+            }
+            config.udp_idle_timeout_ms = static_cast<uint64_t>(idle_timeout) * 1000;
         }
 
         if (j.contains("secret")) {

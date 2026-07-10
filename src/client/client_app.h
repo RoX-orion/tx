@@ -95,6 +95,8 @@ private:
         IpAddr tun_src_ip;
         IpAddr tun_dst_ip;
         DirectUdpRelay* direct_relay = nullptr;
+        uint64_t last_activity_ms = 0;
+        bool proxied = false;
     };
 
     struct UdpTunnel {
@@ -163,6 +165,10 @@ private:
                                 const TargetAddr& target,
                                 const uint8_t* data, size_t len);
     void close_direct_udp_relay(UdpFlow& flow);
+    bool start_udp_cleanup_timer();
+    void stop_udp_cleanup_timer();
+    void cleanup_idle_udp_flows(uint64_t now_ms);
+    void remove_udp_flow(const std::string& flow_key, bool notify_peer);
     void send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr& source,
                                    const uint8_t* data, size_t len,
                                    RouteAction route);
@@ -178,6 +184,7 @@ private:
                                    const struct sockaddr* addr, unsigned flags);
     static void on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
     static void on_direct_udp_closed(uv_handle_t* handle);
+    static void on_udp_cleanup_timer(uv_timer_t* timer);
 
     // Native TUN input. Mixed mode currently handles UDP packets natively and
     // keeps TCP on the configured system-stack path.
@@ -215,6 +222,8 @@ private:
     UdpTunnel          udp_tunnel_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;
+    uv_timer_t         udp_cleanup_timer_;
+    bool               udp_cleanup_timer_started_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

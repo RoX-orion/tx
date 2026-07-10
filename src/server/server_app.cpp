@@ -1,5 +1,6 @@
 #include "server_app.h"
 #include "tx/common/log.h"
+#include "tx/net/udp_flow_timeout.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -57,7 +58,8 @@ bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
 
 ServerApp::ServerApp()
     : loop_(uv_default_loop()),
-      server_(loop_) {}
+      server_(loop_),
+      udp_cleanup_timer_started_(false) {}
 
 ServerApp::~ServerApp() {
     stop();
@@ -72,9 +74,14 @@ bool ServerApp::init(const ServerConfig& config) {
                  config.listen_host.c_str(), config.listen_port);
         return false;
     }
+    if (!start_udp_cleanup_timer()) {
+        server_.stop();
+        return false;
+    }
 
-    TX_INFO("TX Server started on %s:%u",
-            config.listen_host.c_str(), config.listen_port);
+    TX_INFO("TX Server started on %s:%u (UDP timeout: %llu seconds)",
+            config.listen_host.c_str(), config.listen_port,
+            static_cast<unsigned long long>(config_.udp_idle_timeout_ms / 1000));
     return true;
 }
 
@@ -83,6 +90,7 @@ int ServerApp::run() {
 }
 
 void ServerApp::stop() {
+    stop_udp_cleanup_timer();
     server_.stop();
     for (auto& kv : clients_) {
         if (kv.second->session && !kv.second->session->is_closed()) {
@@ -91,6 +99,72 @@ void ServerApp::stop() {
     }
     clients_.clear();
     uv_stop(loop_);
+}
+
+bool ServerApp::start_udp_cleanup_timer() {
+    if (udp_cleanup_timer_started_) return true;
+
+    int r = uv_timer_init(loop_, &udp_cleanup_timer_);
+    if (r != 0) {
+        TX_ERROR("Failed to initialize UDP cleanup timer: %s", uv_strerror(r));
+        return false;
+    }
+    udp_cleanup_timer_.data = this;
+
+    uint64_t interval = udp_flow_cleanup_interval(config_.udp_idle_timeout_ms);
+    r = uv_timer_start(&udp_cleanup_timer_, ServerApp::on_udp_cleanup_timer,
+                       interval, interval);
+    if (r != 0) {
+        TX_ERROR("Failed to start UDP cleanup timer: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_), nullptr);
+        return false;
+    }
+    udp_cleanup_timer_started_ = true;
+    return true;
+}
+
+void ServerApp::stop_udp_cleanup_timer() {
+    if (!udp_cleanup_timer_started_) return;
+    udp_cleanup_timer_started_ = false;
+    uv_timer_stop(&udp_cleanup_timer_);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_), nullptr);
+    }
+}
+
+void ServerApp::cleanup_idle_udp_outbounds(uint64_t now_ms) {
+    size_t cleaned = 0;
+    for (auto& client_entry : clients_) {
+        auto& client = client_entry.second;
+        for (auto it = client->udp_outbounds.begin();
+             it != client->udp_outbounds.end();) {
+            if (!udp_flow_is_idle(now_ms, it->second.last_activity_ms,
+                                  config_.udp_idle_timeout_ms)) {
+                ++it;
+                continue;
+            }
+
+            SessionId sid = it->first;
+            tunnel_send_disconnect(client, sid);
+            if (it->second.udp &&
+                !uv_is_closing(reinterpret_cast<uv_handle_t*>(it->second.udp))) {
+                uv_close(reinterpret_cast<uv_handle_t*>(it->second.udp),
+                         ServerApp::on_udp_closed);
+            }
+            it = client->udp_outbounds.erase(it);
+            ++cleaned;
+        }
+    }
+    if (cleaned > 0) {
+        TX_DEBUG("Cleaned up %zu idle UDP outbounds", cleaned);
+    }
+}
+
+void ServerApp::on_udp_cleanup_timer(uv_timer_t* timer) {
+    auto* app = static_cast<ServerApp*>(timer->data);
+    if (app) {
+        app->cleanup_idle_udp_outbounds(uv_now(app->loop_));
+    }
 }
 
 void ServerApp::on_tunnel_accept(SessionPtr session) {
@@ -309,7 +383,8 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
             payload.clear();
             return;
         }
-        auto* ctx = new UdpCtx{this, client, sid};
+        const uint64_t generation = client->next_udp_generation++;
+        auto* ctx = new UdpCtx{this, client, sid, generation};
         udp->data = ctx;
 
         sockaddr_in bind_addr;
@@ -324,8 +399,11 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
         TunnelClient::UdpOutbound out;
         out.udp = udp;
         out.session_id = sid;
+        out.generation = generation;
+        out.last_activity_ms = uv_now(loop_);
         it = client->udp_outbounds.emplace(sid, out).first;
     }
+    it->second.last_activity_ms = uv_now(loop_);
 
     sockaddr_storage addr;
     if (target_to_sockaddr(target, addr)) {
@@ -345,6 +423,7 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
         resolve_ctx->app = this;
         resolve_ctx->client = client;
         resolve_ctx->sid = sid;
+        resolve_ctx->generation = it->second.generation;
         resolve_ctx->target = target;
         resolve_ctx->payload.assign(payload.data(), payload.data() + payload.readable());
         auto* req = new uv_getaddrinfo_t;
@@ -508,6 +587,13 @@ void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
     auto* ctx = static_cast<UdpCtx*>(handle->data);
     if (!ctx || !ctx->app) return;
 
+    auto it = ctx->client->udp_outbounds.find(ctx->sid);
+    if (it == ctx->client->udp_outbounds.end() ||
+        it->second.generation != ctx->generation) {
+        return;
+    }
+    it->second.last_activity_ms = uv_now(ctx->app->loop_);
+
     TargetAddr source = sockaddr_to_target(addr);
     ctx->app->tunnel_send_udp_packet(ctx->client, ctx->sid, source,
                                      reinterpret_cast<const uint8_t*>(buf->base),
@@ -518,7 +604,9 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
     auto* ctx = static_cast<UdpResolveCtx*>(req->data);
     if (status == 0 && res && ctx && ctx->client) {
         auto it = ctx->client->udp_outbounds.find(ctx->sid);
-        if (it != ctx->client->udp_outbounds.end()) {
+        if (it != ctx->client->udp_outbounds.end() &&
+            it->second.generation == ctx->generation) {
+            it->second.last_activity_ms = uv_now(ctx->app->loop_);
             const struct addrinfo* selected = nullptr;
             for (auto* ai = res; ai; ai = ai->ai_next) {
                 if (ai->ai_family == AF_INET) {

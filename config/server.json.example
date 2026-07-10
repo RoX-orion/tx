@@ -3,6 +3,9 @@
         "host": "0.0.0.0", //support IPV6 -> ::
         "port": 443
     },
+    "udp": {
+        "idle_timeout": 300
+    },
     "secret": "uuid-v4:your-uuid-v4",
     "cipher": "aes-256-gcm",
     "log_level": "info"

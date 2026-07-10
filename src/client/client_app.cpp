@@ -1,7 +1,9 @@
 #include "client_app.h"
 #include "tx/common/log.h"
 #include "tx/common/endian.h"
+#include "tx/net/udp_flow_timeout.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cstring>
 #include <netdb.h>
@@ -265,6 +267,7 @@ struct ClientApp::TunnelTimerCtx {
 struct ClientApp::UdpResolveCtx {
     ClientApp* app;
     std::string flow_key;
+    SessionId session_id;
     TargetAddr target;
     std::vector<uint8_t> payload;
 };
@@ -272,6 +275,7 @@ struct ClientApp::UdpResolveCtx {
 struct ClientApp::DirectUdpRelay {
     ClientApp* app;
     std::string flow_key;
+    SessionId session_id;
     uv_udp_t handle;
     int family = AF_UNSPEC;
     bool recv_started = false;
@@ -287,6 +291,7 @@ ClientApp::ClientApp(SocketProtectCallback socket_protector)
       tun_started_(false),
       tun_timer_started_(false),
       tun_tcp_redirect_started_(false),
+      udp_cleanup_timer_started_(false),
       next_session_id_(1),
       socket_protector_(std::move(socket_protector)) {}
 
@@ -322,7 +327,12 @@ bool ClientApp::init(const ClientConfig& config) {
             return false;
         }
     }
+    if (!start_udp_cleanup_timer()) {
+        return false;
+    }
     TX_INFO("  Outbounds:    %zu", config.outbounds.size());
+    TX_INFO("  UDP timeout:  %llu seconds",
+            static_cast<unsigned long long>(config_.udp_idle_timeout_ms / 1000));
     return true;
 }
 
@@ -331,6 +341,7 @@ int ClientApp::run() {
 }
 
 void ClientApp::stop() {
+    stop_udp_cleanup_timer();
     stop_tun_listener();
     stop_udp_listener();
     close_udp_tunnel();
@@ -501,17 +512,98 @@ bool ClientApp::start_udp_listener() {
 }
 
 void ClientApp::stop_udp_listener() {
-    if (!socks5_udp_started_) return;
-    socks5_udp_started_ = false;
-    uv_udp_recv_stop(&socks5_udp_);
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socks5_udp_))) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+    if (socks5_udp_started_) {
+        socks5_udp_started_ = false;
+        uv_udp_recv_stop(&socks5_udp_);
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&socks5_udp_))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&socks5_udp_), nullptr);
+        }
     }
     for (auto& kv : udp_flows_) {
         close_direct_udp_relay(kv.second);
     }
     udp_flows_.clear();
     udp_session_keys_.clear();
+}
+
+bool ClientApp::start_udp_cleanup_timer() {
+    if (udp_cleanup_timer_started_) return true;
+
+    int r = uv_timer_init(loop_, &udp_cleanup_timer_);
+    if (r != 0) {
+        TX_ERROR("Failed to initialize UDP cleanup timer: %s", uv_strerror(r));
+        return false;
+    }
+    udp_cleanup_timer_.data = this;
+
+    uint64_t interval = udp_flow_cleanup_interval(config_.udp_idle_timeout_ms);
+    r = uv_timer_start(&udp_cleanup_timer_, ClientApp::on_udp_cleanup_timer,
+                       interval, interval);
+    if (r != 0) {
+        TX_ERROR("Failed to start UDP cleanup timer: %s", uv_strerror(r));
+        uv_close(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_), nullptr);
+        return false;
+    }
+    udp_cleanup_timer_started_ = true;
+    return true;
+}
+
+void ClientApp::stop_udp_cleanup_timer() {
+    if (!udp_cleanup_timer_started_) return;
+    udp_cleanup_timer_started_ = false;
+    uv_timer_stop(&udp_cleanup_timer_);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_), nullptr);
+    }
+}
+
+void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
+    auto it = udp_flows_.find(flow_key);
+    if (it == udp_flows_.end()) return;
+
+    SessionId sid = it->second.session_id;
+    if (notify_peer && it->second.proxied && udp_tunnel_.connected &&
+        udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
+        Buffer encoded;
+        if (udp_tunnel_.codec.encode_disconnect(sid, encoded)) {
+            udp_tunnel_.tunnel_session->send(encoded);
+        }
+    }
+
+    close_direct_udp_relay(it->second);
+    udp_session_keys_.erase(sid);
+    udp_tunnel_.pending.erase(
+        std::remove_if(udp_tunnel_.pending.begin(), udp_tunnel_.pending.end(),
+                       [sid](const PendingUdpPacket& pkt) {
+                           return pkt.session_id == sid;
+                       }),
+        udp_tunnel_.pending.end());
+    udp_flows_.erase(it);
+}
+
+void ClientApp::cleanup_idle_udp_flows(uint64_t now_ms) {
+    std::vector<std::string> expired;
+    expired.reserve(udp_flows_.size());
+    for (const auto& kv : udp_flows_) {
+        if (udp_flow_is_idle(now_ms, kv.second.last_activity_ms,
+                             config_.udp_idle_timeout_ms)) {
+            expired.push_back(kv.first);
+        }
+    }
+
+    for (const auto& flow_key : expired) {
+        remove_udp_flow(flow_key, true);
+    }
+    if (!expired.empty()) {
+        TX_DEBUG("Cleaned up %zu idle UDP flows", expired.size());
+    }
+}
+
+void ClientApp::on_udp_cleanup_timer(uv_timer_t* timer) {
+    auto* app = static_cast<ClientApp*>(timer->data);
+    if (app) {
+        app->cleanup_idle_udp_flows(uv_now(app->loop_));
+    }
 }
 
 bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
@@ -523,6 +615,7 @@ bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& fl
     auto* relay = new DirectUdpRelay;
     relay->app = this;
     relay->flow_key = flow_key;
+    relay->session_id = flow.session_id;
     relay->family = target_family;
 
     int r = uv_udp_init(loop_, &relay->handle);
@@ -627,6 +720,7 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
     auto* ctx = new UdpResolveCtx;
     ctx->app = this;
     ctx->flow_key = flow_key;
+    ctx->session_id = flow.session_id;
     ctx->target = target;
     ctx->payload.assign(data, data + len);
     req->data = ctx;
@@ -839,11 +933,16 @@ void ClientApp::on_udp_tunnel_read(Buffer& data) {
                 continue;
             }
 
+            flow_it->second.last_activity_ms = uv_now(loop_);
             send_udp_response_to_flow(flow_it->second, target,
                                       payload.data(), payload.readable(),
                                       RouteAction::Proxy);
         } else if (cmd == TunnelCmd::Disconnect) {
-            udp_session_keys_.erase(sid);
+            auto key_it = udp_session_keys_.find(sid);
+            if (key_it != udp_session_keys_.end()) {
+                std::string flow_key = key_it->second;
+                remove_udp_flow(flow_key, false);
+            }
         }
         payload.clear();
     }
@@ -889,6 +988,7 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         UdpFlow flow;
         flow.session_id = app->next_session_id_++;
         flow.kind = UdpFlowKind::Socks5;
+        flow.last_activity_ms = uv_now(app->loop_);
         memset(&flow.client_addr, 0, sizeof(flow.client_addr));
         if (addr->sa_family == AF_INET) {
             flow.client_addr_len = sizeof(sockaddr_in);
@@ -900,6 +1000,7 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         it = app->udp_flows_.emplace(flow_key, flow).first;
         app->udp_session_keys_[flow.session_id] = flow_key;
     }
+    it->second.last_activity_ms = uv_now(app->loop_);
 
     RouteDecision decision;
     if (target.type == AddrType::Domain) {
@@ -931,6 +1032,7 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         app->close_udp_tunnel();
     }
     app->udp_tunnel_.outbound = outbound;
+    it->second.proxied = true;
     app->send_udp_packet(it->second.session_id, target, payload, payload_len);
 }
 
@@ -951,10 +1053,12 @@ void ClientApp::on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf
 
     ClientApp* app = relay->app;
     auto flow_it = app->udp_flows_.find(relay->flow_key);
-    if (flow_it == app->udp_flows_.end()) {
+    if (flow_it == app->udp_flows_.end() ||
+        flow_it->second.session_id != relay->session_id) {
         return;
     }
 
+    flow_it->second.last_activity_ms = uv_now(app->loop_);
     TargetAddr source = sockaddr_to_target(addr);
     app->send_udp_response_to_flow(flow_it->second, source,
                                    reinterpret_cast<const uint8_t*>(buf->base),
@@ -977,7 +1081,8 @@ void ClientApp::on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct
     }
 
     auto flow_it = app->udp_flows_.find(ctx->flow_key);
-    if (flow_it == app->udp_flows_.end()) {
+    if (flow_it == app->udp_flows_.end() ||
+        flow_it->second.session_id != ctx->session_id) {
         uv_freeaddrinfo(res);
         delete ctx;
         delete req;
@@ -1306,12 +1411,14 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
         UdpFlow flow;
         flow.session_id = next_session_id_++;
         flow.kind = UdpFlowKind::Tun;
+        flow.last_activity_ms = uv_now(loop_);
         flow.client_addr_len = 0;
         flow.tun_src_ip = packet.src_ip;
         flow.tun_dst_ip = packet.dst_ip;
         it = udp_flows_.emplace(flow_key, flow).first;
         udp_session_keys_[flow.session_id] = flow_key;
     }
+    it->second.last_activity_ms = uv_now(loop_);
 
     RouteDecision decision = router_.decide_by_ip(packet.dst_ip);
     const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
@@ -1335,6 +1442,7 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
         close_udp_tunnel();
     }
     udp_tunnel_.outbound = outbound;
+    it->second.proxied = true;
     send_udp_packet(it->second.session_id, target, packet.payload, packet.payload_len);
 }
 

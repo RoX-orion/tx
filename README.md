@@ -232,6 +232,7 @@ cp config/client.json.example client.json
 - `listen.port`：服务端监听端口。
 - `secret`：客户端与服务端共享的高熵 PSK，支持 `base64:`、`hex:`、`uuid-v4:` 前缀；推荐使用 `--gen-secret` 生成 `base64:`。
 - `cipher`：隧道 AEAD 算法，可选 `aes-256-gcm` 或 `chacha20-poly1305`。
+- `udp.idle_timeout`：UDP 出站空闲回收时间，单位秒，默认 300，范围 1～86400。
 - `log_level`：日志级别，可选 `debug`、`info`、`warn`、`error`。
 
 ### 客户端配置
@@ -264,6 +265,7 @@ cp config/client.json.example client.json
 
 - `listen.http`：本地 HTTP 代理监听地址和端口。
 - `listen.socks5`：本地 SOCKS5 代理监听地址和端口。
+- `udp.idle_timeout`：UDP flow 空闲回收时间，单位秒，默认 300，范围 1～86400。
 - `server.host`：远端 `tx_server` 地址。
 - `server.port`：远端 `tx_server` 端口。
 - `server.secret`：与服务端一致的高熵 PSK。

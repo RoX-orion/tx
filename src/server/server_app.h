@@ -31,6 +31,7 @@ private:
         Buffer           handshake_buf;
         Buffer           recv_buf;
         bool             outbounds_paused = false;
+        uint64_t         next_udp_generation = 1;
 
         // Outbound connections by session ID
         struct Outbound {
@@ -42,6 +43,8 @@ private:
         struct UdpOutbound {
             uv_udp_t* udp;
             SessionId session_id;
+            uint64_t generation;
+            uint64_t last_activity_ms;
         };
         std::unordered_map<SessionId, Outbound> outbounds;
         std::unordered_map<SessionId, UdpOutbound> udp_outbounds;
@@ -52,11 +55,13 @@ private:
         ServerApp* app;
         TunnelClientPtr client;
         SessionId sid;
+        uint64_t generation;
     };
     struct UdpResolveCtx {
         ServerApp* app;
         TunnelClientPtr client;
         SessionId sid;
+        uint64_t generation;
         TargetAddr target;
         std::vector<uint8_t> payload;
     };
@@ -72,6 +77,9 @@ private:
     void handle_udp_packet(TunnelClientPtr client, SessionId sid,
                            const TargetAddr& target, Buffer& payload);
     void handle_disconnect(TunnelClientPtr client, SessionId sid);
+    bool start_udp_cleanup_timer();
+    void stop_udp_cleanup_timer();
+    void cleanup_idle_udp_outbounds(uint64_t now_ms);
 
     // Send encrypted data back to client
     void tunnel_send_data(TunnelClientPtr client, SessionId sid,
@@ -89,10 +97,13 @@ private:
     static void on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
     static void on_udp_send_done(uv_udp_send_t* req, int status);
     static void on_udp_closed(uv_handle_t* handle);
+    static void on_udp_cleanup_timer(uv_timer_t* timer);
 
     uv_loop_t*         loop_;
     ServerConfig       config_;
     TcpServer          server_;
+    uv_timer_t         udp_cleanup_timer_;
+    bool               udp_cleanup_timer_started_;
 
     // Active tunnel clients
     std::unordered_map<uv_tcp_t*, TunnelClientPtr> clients_;

@@ -103,7 +103,7 @@ VpnService TUN fd -> tun2socks -> local SOCKS5 127.0.0.1:1080 -> tx router -> di
 - Because Android still depends on tun2socks for TCP/domain traffic, TUN mode must keep the HTTP/SOCKS5 and SOCKS5 UDP listeners available unless a fully native platform TCP path is enabled.
 - The current code keeps proxy listeners in TUN mode when `tun.auto_redirect=false`. This preserves Android/tun2socks compatibility.
 - Linux `tun.auto_redirect` is not available on Android; do not assume Android can use nftables/IP_TRANSPARENT.
-- Android direct/tunnel/DNS/healthcheck sockets still need `VpnService.protect(fd)` integration to avoid VPN routing loops; this remains future work.
+- Native direct/tunnel sockets support a protector callback through `tx_client_start_android()`. The Android JNI layer still needs to call `VpnService.protect(fd)`; system DNS sockets require a separate bypass strategy.
 
 ## UDP / QUIC Status
 - SOCKS5 `UDP ASSOCIATE` is supported.
@@ -111,7 +111,7 @@ VpnService TUN fd -> tun2socks -> local SOCKS5 127.0.0.1:1080 -> tx router -> di
 - `tx_client` forwards SOCKS5 UDP packets through a shared UDP TX tunnel.
 - `tx_server` sends UDP packets to targets and returns responses through the tunnel.
 - UDP routed to a `tx` outbound is proxied through the encrypted tunnel. UDP routed to `direct` is relayed locally by `tx_client`. UDP routed to `block` is dropped.
-- UDP flow timeout cleanup is still missing and should be added before relying on long-running high-volume UDP workloads.
+- Client and server UDP flows are removed after an idle timeout. Configure `udp.idle_timeout` in seconds; the default is 300 seconds.
 
 ## Android Build Context
 - Android project path: `/mnt/f/program/android/txz`.
@@ -175,4 +175,4 @@ cmake --build build-android-arm64 -j$(nproc)
 
 - The Android native build currently passes with `ANDROID_STL=c++_shared`. It may still emit unused lambda capture warnings in `src/client/client_app.cpp`.
 - Runtime Linux auto_redirect has not been fully validated with root/CAP_NET_ADMIN in this session; test it with real nftables privileges before treating it as production-ready.
-- Current known future work: full Linux gateway `PREROUTING TPROXY`, stronger outbound bypass/policy routing, DNS/fake-IP with domain preservation, Android `VpnService.protect(fd)`, UDP flow cleanup, Windows Wintun compile/runtime validation, and a Windows TCP system-stack mechanism such as WFP or WinDivert.
+- Current known future work: full Linux gateway `PREROUTING TPROXY`, stronger outbound bypass/policy routing, DNS/fake-IP with domain preservation, Android JNI `VpnService.protect(fd)` and DNS bypass, Windows Wintun compile/runtime validation, and a Windows TCP system-stack mechanism such as WFP or WinDivert.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <unordered_map>
 #include "tx/crypto/aead.h"
@@ -49,6 +50,9 @@ struct ClientConfig {
     std::string tun_mode = "mixed";
     std::string tun_tcp_stack = "system";
     std::string tun_udp_stack = "gvisor";
+
+    // UDP flows are removed after this much inactivity.
+    uint64_t    udp_idle_timeout_ms = 300000;
 
     // Outbound connections
     std::vector<OutboundConfig> outbounds;

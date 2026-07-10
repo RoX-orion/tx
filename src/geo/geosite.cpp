@@ -1,8 +1,9 @@
 #include "tx/geo/geosite.h"
 #include "tx/common/log.h"
-#include <cstring>
+#include "geo_file.h"
 #include <algorithm>
 #include <cctype>
+#include <functional>
 
 namespace tx {
 
@@ -206,10 +207,11 @@ GeoSiteMatcher::GeoSiteMatcher() = default;
 GeoSiteMatcher::~GeoSiteMatcher() = default;
 
 bool GeoSiteMatcher::load(const std::string& path) {
-    if (!data_.load_geosite(path)) {
+    std::vector<uint8_t> data;
+    if (!detail::read_geo_file(path, data)) {
         return false;
     }
-    return parse_geosite(data_.geosite_data(), data_.geosite_size());
+    return parse_geosite(data.data(), data.size());
 }
 
 bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {

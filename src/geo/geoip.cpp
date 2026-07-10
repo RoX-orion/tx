@@ -1,9 +1,10 @@
 #include "tx/geo/geoip.h"
 #include "tx/common/log.h"
-#include "tx/common/endian.h"
+#include "geo_file.h"
 #include <algorithm>
 #include <cctype>
-#include <cstring>
+#include <functional>
+#include <vector>
 
 namespace tx {
 
@@ -18,11 +19,6 @@ static std::string to_lower_ascii(std::string s) {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
-
-struct PbSlice {
-    const uint8_t* data;
-    size_t len;
-};
 
 // Read a varint from data, advance position
 static bool read_varint(const uint8_t* data, size_t len, size_t& pos, uint64_t& val) {
@@ -177,10 +173,11 @@ GeoIpMatcher::GeoIpMatcher() = default;
 GeoIpMatcher::~GeoIpMatcher() = default;
 
 bool GeoIpMatcher::load(const std::string& path) {
-    if (!data_.load_geoip(path)) {
+    std::vector<uint8_t> data;
+    if (!detail::read_geo_file(path, data)) {
         return false;
     }
-    return parse_geoip(data_.geoip_data(), data_.geoip_size());
+    return parse_geoip(data.data(), data.size());
 }
 
 bool GeoIpMatcher::parse_geoip(const uint8_t* data, size_t len) {

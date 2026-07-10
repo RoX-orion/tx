@@ -7,7 +7,6 @@
 #include <unordered_map>
 #include "tx/geo/trie.h"
 #include "tx/geo/aho_corasick.h"
-#include "tx/geo/geo_data.h"
 
 namespace tx {
 
@@ -56,8 +55,6 @@ private:
 
     // Regex patterns (rare, fallback)
     std::vector<RegexEntry> regex_patterns_;
-
-    GeoData data_;
 };
 
 } // namespace tx

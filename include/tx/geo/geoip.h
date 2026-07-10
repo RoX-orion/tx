@@ -2,10 +2,7 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
-#include <unordered_map>
 #include "tx/geo/radix_tree.h"
-#include "tx/geo/geo_data.h"
 #include "tx/common/types.h"
 
 namespace tx {
@@ -35,7 +32,6 @@ private:
 
     RadixTree tree_v4_;
     RadixTree tree_v6_;
-    GeoData   data_;
 };
 
 } // namespace tx

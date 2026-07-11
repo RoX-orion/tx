@@ -66,7 +66,10 @@ public:
         if (config.tun_fd >= 0) {
             fd_ = config.tun_fd;
             external_fd_ = true;
-            set_nonblocking(error);
+            if (!set_nonblocking(error)) {
+                close();
+                return false;
+            }
             return true;
         }
 
@@ -294,8 +297,11 @@ std::wstring widen(const std::string& s) {
     if (s.empty()) return std::wstring();
     int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (len <= 0) return std::wstring(s.begin(), s.end());
-    std::wstring out(static_cast<size_t>(len - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &out[0], len);
+    std::wstring out(static_cast<size_t>(len), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &out[0], len) <= 0) {
+        return std::wstring(s.begin(), s.end());
+    }
+    out.resize(static_cast<size_t>(len - 1));
     return out;
 }
 

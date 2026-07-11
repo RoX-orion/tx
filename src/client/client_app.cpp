@@ -148,19 +148,23 @@ bool original_tcp_destination(SessionPtr session, TargetAddr& target) {
 bool install_linux_auto_redirect(uint16_t port, uint32_t mark) {
     run_auto_redirect_cmd("nft delete table inet tx_auto_redirect >/dev/null 2>&1");
 
-    bool ok = true;
-    ok = run_auto_redirect_cmd("nft add table inet tx_auto_redirect") && ok;
-    ok = run_auto_redirect_cmd(
-        "nft 'add chain inet tx_auto_redirect output { type nat hook output priority dstnat; policy accept; }'") && ok;
-    ok = run_auto_redirect_cmd(
+    const std::vector<std::string> commands = {
+        "nft add table inet tx_auto_redirect",
+        "nft 'add chain inet tx_auto_redirect output { type nat hook output priority dstnat; policy accept; }'",
         "nft add rule inet tx_auto_redirect output meta mark 0x" +
-        hex_u32(mark) + " return") && ok;
-    ok = run_auto_redirect_cmd(
-        "nft 'add rule inet tx_auto_redirect output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return'") && ok;
-    ok = run_auto_redirect_cmd(
+            hex_u32(mark) + " return",
+        "nft 'add rule inet tx_auto_redirect output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return'",
         "nft add rule inet tx_auto_redirect output ip protocol tcp redirect to :" +
-        std::to_string(port)) && ok;
-    return ok;
+            std::to_string(port),
+    };
+    for (const auto& command : commands) {
+        if (!run_auto_redirect_cmd(command)) {
+            run_auto_redirect_cmd(
+                "nft delete table inet tx_auto_redirect >/dev/null 2>&1");
+            return false;
+        }
+    }
+    return true;
 }
 
 void uninstall_linux_auto_redirect() {

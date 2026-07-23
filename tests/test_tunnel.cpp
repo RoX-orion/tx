@@ -108,6 +108,14 @@ static void test_handshake_authentication_failure() {
                                                    tampered.size(),
                                                    parsed_client_hello));
 
+    std::vector<uint8_t> old_version(client_hello.data(),
+                                     client_hello.data() + client_hello.readable());
+    old_version[0] = 'T'; old_version[1] = 'X';
+    old_version[2] = 'H'; old_version[3] = '2';
+    TX_ASSERT(!tx::TunnelCodec::parse_client_hello(psk, old_version.data(),
+                                                   old_version.size(),
+                                                   parsed_client_hello));
+
     printf("OK\n");
 }
 
@@ -186,6 +194,37 @@ static void test_connect_round_trip_ip_addresses() {
     printf("OK\n");
 }
 
+static void test_udp_packet_round_trip_domain() {
+    printf("  test_udp_packet_round_trip_domain... ");
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
+
+    tx::TargetAddr target;
+    target.type = tx::AddrType::Domain;
+    target.host = "video.example";
+    target.port = 443;
+
+    const uint8_t datagram[] = {0xde, 0xad, 0xbe, 0xef};
+    tx::Buffer encoded;
+    TX_ASSERT(encoder.encode(tx::TunnelCmd::UdpPacket, 43, target,
+                             datagram, sizeof(datagram), encoded));
+
+    tx::TunnelCmd cmd;
+    tx::SessionId session_id = 0;
+    tx::TargetAddr decoded_target;
+    tx::Buffer decoded_payload;
+    TX_ASSERT(decoder.decode(encoded, cmd, session_id, decoded_target, decoded_payload));
+    TX_ASSERT(cmd == tx::TunnelCmd::UdpPacket);
+    TX_ASSERT(session_id == 43);
+    TX_ASSERT(decoded_target.type == tx::AddrType::Domain);
+    TX_ASSERT(decoded_target.host == "video.example");
+    TX_ASSERT(decoded_target.port == 443);
+    TX_ASSERT(decoded_payload.readable() == sizeof(datagram));
+    TX_ASSERT(memcmp(decoded_payload.data(), datagram, sizeof(datagram)) == 0);
+
+    printf("OK\n");
+}
+
 static void test_data_disconnect_and_connect_result() {
     printf("  test_data_disconnect_and_connect_result... ");
     auto encoder = make_client_codec();
@@ -196,6 +235,7 @@ static void test_data_disconnect_and_connect_result() {
     TX_ASSERT(encoder.encode_data(100, reinterpret_cast<const uint8_t*>(data),
                                   strlen(data), encoded));
     TX_ASSERT(encoder.encode_connect_result(100, true, encoded));
+    TX_ASSERT(encoder.encode_half_close(100, encoded));
     TX_ASSERT(encoder.encode_disconnect(100, encoded));
 
     tx::TunnelCmd cmd;
@@ -214,6 +254,11 @@ static void test_data_disconnect_and_connect_result() {
     TX_ASSERT(session_id == 100);
     TX_ASSERT(payload.readable() == 1);
     TX_ASSERT(payload.data()[0] == 1);
+
+    TX_ASSERT(decoder.decode(encoded, cmd, session_id, target, payload));
+    TX_ASSERT(cmd == tx::TunnelCmd::HalfClose);
+    TX_ASSERT(session_id == 100);
+    TX_ASSERT(payload.empty());
 
     TX_ASSERT(decoder.decode(encoded, cmd, session_id, target, payload));
     TX_ASSERT(cmd == tx::TunnelCmd::Disconnect);
@@ -354,6 +399,7 @@ int main() {
     test_handshake_authentication_failure();
     test_connect_round_trip_domain();
     test_connect_round_trip_ip_addresses();
+    test_udp_packet_round_trip_domain();
     test_data_disconnect_and_connect_result();
     test_partial_frame_waits_for_more_data();
     test_data_chunking();

@@ -9,6 +9,10 @@
 #include <memory>
 #include <atomic>
 #include <utility>
+#include <cstring>
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+#include <unistd.h>
+#endif
 
 struct TxClientHandle {
     std::unique_ptr<tx::ClientApp> app;
@@ -25,21 +29,52 @@ struct TxServerHandle {
 namespace {
 
 tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
-                         tx_socket_protect_fn protect_fn, void* protect_user_data) {
+                         const tx_android_network_hooks_t* hooks) {
     if (!config || !config->config_path) return nullptr;
 
     tx::SocketProtectCallback socket_protector;
-    if (protect_fn) {
-        socket_protector = [protect_fn, protect_user_data](int fd) {
-            return protect_fn(fd, protect_user_data) != 0;
+    tx::DnsResolver::HostResolveHook host_resolver;
+    tx::DnsResolver::QueryHook dns_query;
+    if (hooks && hooks->protect_socket) {
+        socket_protector = [hooks = *hooks](int fd) {
+            return hooks.protect_socket(fd, hooks.user_data) != 0;
+        };
+    }
+    if (hooks && hooks->resolve_host) {
+        host_resolver = [hooks = *hooks](const std::string& host, int family) {
+            tx_android_address_t output[TX_ANDROID_MAX_RESOLVED_ADDRESSES]{};
+            int count = hooks.resolve_host(host.c_str(), family, output,
+                                           TX_ANDROID_MAX_RESOLVED_ADDRESSES,
+                                           hooks.user_data);
+            std::vector<std::string> result;
+            for (int i = 0; i < count && i < static_cast<int>(TX_ANDROID_MAX_RESOLVED_ADDRESSES); ++i)
+                if (output[i].address[0]) result.emplace_back(output[i].address);
+            return result;
+        };
+    }
+    if (hooks && hooks->query_dns) {
+        dns_query = [hooks = *hooks](const uint8_t* query, size_t length) {
+            std::vector<uint8_t> response(65535);
+            unsigned int response_length = 0;
+            int ok = hooks.query_dns(query, static_cast<unsigned int>(length),
+                                     response.data(), static_cast<unsigned int>(response.size()),
+                                     &response_length, hooks.user_data);
+            if (!ok || response_length > response.size()) return std::vector<uint8_t>();
+            response.resize(response_length);
+            return response;
         };
     }
 
     auto* handle = new TxClientHandle;
-    handle->app = std::make_unique<tx::ClientApp>(std::move(socket_protector));
+    handle->app = std::make_unique<tx::ClientApp>(std::move(socket_protector),
+                                                  std::move(host_resolver),
+                                                  std::move(dns_query));
 
     tx::ClientConfig cfg;
     if (!tx::load_client_config(config->config_path, cfg)) {
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+        if (tun_fd >= 0) ::close(tun_fd);
+#endif
         delete handle;
         return nullptr;
     }
@@ -71,18 +106,37 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
 extern "C" {
 
 tx_handle_t tx_client_start(const tx_client_config_t* config) {
-    return start_client(config, -1, nullptr, nullptr);
+    return start_client(config, -1, nullptr);
 }
 
 tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
-    return start_client(config, tun_fd, nullptr, nullptr);
+    return start_client(config, tun_fd, nullptr);
 }
 
 tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
                                     tx_socket_protect_fn protect_fn,
                                     void* protect_user_data) {
     if (tun_fd < 0 || !protect_fn) return nullptr;
-    return start_client(config, tun_fd, protect_fn, protect_user_data);
+    tx_android_network_hooks_t hooks{};
+    hooks.struct_size = sizeof(hooks);
+    hooks.version = TX_ANDROID_NETWORK_HOOKS_VERSION;
+    hooks.protect_socket = protect_fn;
+    hooks.user_data = protect_user_data;
+    return start_client(config, tun_fd, &hooks);
+}
+
+tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
+                                       const tx_android_network_hooks_t* hooks) {
+    if (tun_fd < 0 || !hooks || hooks->struct_size < sizeof(tx_android_network_hooks_t) ||
+        hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket ||
+        !hooks->resolve_host || !hooks->query_dns) return nullptr;
+    return start_client(config, tun_fd, hooks);
+}
+
+void tx_client_notify_network_changed(tx_handle_t handle) {
+    if (!handle) return;
+    auto* h = static_cast<TxClientHandle*>(handle);
+    if (h->app) h->app->notify_network_changed();
 }
 
 void tx_client_stop(tx_handle_t handle) {

@@ -65,6 +65,7 @@ enum class TunnelCmd : uint8_t {
     Disconnect    = 0x03,
     ConnectResult = 0x04,
     UdpPacket     = 0x05,
+    HalfClose     = 0x06,
 };
 
 // Route decision

@@ -2,8 +2,7 @@
 #include "tx/common/log.h"
 #include "tx/net/udp_flow_timeout.h"
 
-#include <arpa/inet.h>
-#include <netdb.h>
+#include "tx/common/network.h"
 #include <cstring>
 #include <cstdlib>
 
@@ -11,9 +10,9 @@ namespace tx {
 
 namespace {
 
-constexpr size_t kTunnelPauseWriteBacklog = 8 * 1024 * 1024;
-constexpr size_t kTunnelResumeWriteBacklog = 2 * 1024 * 1024;
-constexpr size_t kMaxTunnelWriteBacklog = 64 * 1024 * 1024;
+constexpr size_t kTunnelPauseWriteBacklog = 4 * 1024 * 1024;
+constexpr size_t kTunnelResumeWriteBacklog = 1024 * 1024;
+constexpr size_t kMaxTunnelWriteBacklog = 16 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
 
 struct UdpSendReq {
@@ -258,6 +257,9 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
             case TunnelCmd::Disconnect:
                 handle_disconnect(client, session_id);
                 break;
+            case TunnelCmd::HalfClose:
+                handle_half_close(client, session_id);
+                break;
             case TunnelCmd::ConnectResult:
                 TX_DEBUG("Unexpected CONNECT_RESULT from client for session %u", session_id);
                 break;
@@ -297,6 +299,20 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
             client->outbounds.erase(it);
         }
     });
+    remote->set_eof_callback([this, client, sid](SessionPtr) {
+        auto it = client->outbounds.find(sid);
+        if (it == client->outbounds.end()) return;
+        it->second.remote_eof = true;
+        tunnel_send_half_close(client, sid);
+    });
+    remote->set_write_drain_callback([client](SessionPtr remote_session) {
+        if (client->inbound_paused && client->session &&
+            !client->session->is_closed() &&
+            remote_session->pending_write_bytes() <= kTunnelResumeWriteBacklog) {
+            client->inbound_paused = false;
+            client->session->resume_read();
+        }
+    });
 
     remote->connect(target.host, target.port,
         [this, client, sid, remote, target](bool success) {
@@ -331,6 +347,13 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
                 it->second.pending_data.clear();
             }
 
+            // HALF_CLOSE may immediately follow CONNECT while the asynchronous
+            // target connect is still pending. Apply it only after queued data
+            // has been handed to the connected socket.
+            if (it->second.client_eof && !remote->is_closed()) {
+                remote->shutdown_write();
+            }
+
             if (!client->outbounds_paused) {
                 // Start reading from remote → forward back through tunnel.
                 remote->start_read([this, client, sid](SessionPtr, Buffer& data) {
@@ -351,10 +374,22 @@ void ServerApp::handle_data(TunnelClientPtr client, SessionId sid, Buffer& paylo
     if (it->second.connected &&
         it->second.remote_session && !it->second.remote_session->is_closed()) {
         size_t payload_len = payload.readable();
+        if (it->second.remote_session->pending_write_bytes() + payload_len >
+            kMaxTunnelWriteBacklog) {
+            TX_ERROR("Target write backlog too large for session %u", sid);
+            handle_disconnect(client, sid);
+            payload.clear();
+            return;
+        }
         if (!it->second.remote_session->send(payload)) {
             TX_ERROR("Failed to send %zu bytes to target for session %u",
                      payload_len, sid);
             handle_disconnect(client, sid);
+        } else if (!client->inbound_paused &&
+                   it->second.remote_session->pending_write_bytes() >=
+                       kTunnelPauseWriteBacklog) {
+            client->inbound_paused = true;
+            client->session->pause_read();
         }
     } else {
         // Buffer data until remote connection is established
@@ -459,6 +494,16 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
     }
 }
 
+void ServerApp::handle_half_close(TunnelClientPtr client, SessionId sid) {
+    auto it = client->outbounds.find(sid);
+    if (it == client->outbounds.end()) return;
+    it->second.client_eof = true;
+    if (it->second.connected && it->second.remote_session &&
+        !it->second.remote_session->is_closed()) {
+        it->second.remote_session->shutdown_write();
+    }
+}
+
 void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
                                    const uint8_t* data, size_t len) {
     if (!client->session || client->session->is_closed()) return;
@@ -505,6 +550,15 @@ void ServerApp::tunnel_send_disconnect(TunnelClientPtr client, SessionId sid) {
         }
     } else {
         TX_ERROR("Failed to encode DISCONNECT for session %u", sid);
+    }
+}
+
+void ServerApp::tunnel_send_half_close(TunnelClientPtr client, SessionId sid) {
+    if (!client->session || client->session->is_closed()) return;
+    Buffer encoded;
+    if (client->codec.encode_half_close(sid, encoded) &&
+        !client->session->send(encoded)) {
+        TX_ERROR("Failed to send HALF_CLOSE for session %u", sid);
     }
 }
 

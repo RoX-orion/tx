@@ -65,6 +65,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Collect common sources
 file(GLOB COMMON_SOURCES src/common/*.cpp)
 file(GLOB NET_SOURCES src/net/*.cpp)
+file(GLOB LWIP_NET_SOURCES src/net/lwip/*.cpp)
 file(GLOB CRYPTO_SOURCES src/crypto/*.cpp)
 file(GLOB PROTOCOL_SOURCES src/protocol/*.cpp)
 file(GLOB GEO_SOURCES src/geo/*.cpp)
@@ -73,6 +74,7 @@ file(GLOB ROUTER_SOURCES src/router/*.cpp)
 set(ALL_LIB_SOURCES
     ${COMMON_SOURCES}
     ${NET_SOURCES}
+    ${LWIP_NET_SOURCES}
     ${CRYPTO_SOURCES}
     ${PROTOCOL_SOURCES}
     ${GEO_SOURCES}
@@ -94,6 +96,7 @@ set(TX_SERVER_APP_SOURCES
 add_library(tx_core STATIC ${ALL_LIB_SOURCES})
 target_link_libraries(tx_core PUBLIC
     tx::libuv
+    tx::hev_lwip
     OpenSSL::SSL OpenSSL::Crypto
     nlohmann_json::nlohmann_json
 )
@@ -134,7 +137,19 @@ if(TX_BUILD_SHARED OR ANDROID)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/client
         ${CMAKE_CURRENT_SOURCE_DIR}/src/server
     )
-    set_target_properties(tx_shared PROPERTIES OUTPUT_NAME "tx")
+    set_target_properties(tx_shared PROPERTIES
+        OUTPUT_NAME "tx"
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
+    if(ANDROID OR (UNIX AND NOT APPLE))
+        # Keep implementation symbols pulled from static archives local to
+        # libtx.so. Android also loads tun2socks, which embeds a differently
+        # configured lwIP; exporting both copies lets the dynamic linker bind
+        # tun2socks calls to TX's incompatible lwIP ABI.
+        target_link_options(tx_shared PRIVATE "LINKER:--exclude-libs,ALL")
+    endif()
 endif()
 
 # Tests

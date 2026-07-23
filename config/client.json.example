@@ -7,20 +7,27 @@
         "idle_timeout": 300
     },
     "tun": {
-        "enabled": false,
-        "name": "tx0",
-        "address": "10.10.0.1",
-        "prefix": 24,
-        "mode": "mixed",
+        "enabled": true,
+        "name": "TX-TUN",
         "mtu": 1500,
+        "addresses": ["198.18.0.1/30", "fd00:198:18::1/126"],
         "auto_config": true,
         "auto_route": true,
-        "auto_redirect": true,
+        "auto_redirect": false,
         "redirect_port": 54321,
         "redirect_mark": 8228,
         "routes": [],
-        "tcp_stack": "system",
-        "udp_stack": "gvisor"
+        "bypass_mark": 8228,
+        "route_table": 20220,
+        "rule_priority": 10000,
+        "tcp_stack": "lwip",
+        "udp_stack": "lwip"
+    },
+    "dns": {
+        "mode": "fake-ip",
+        "fake_ipv4_range": "198.18.0.0/16",
+        "fake_ipv6_range": "fd00:198:18::/96",
+        "cache_ttl": 60
     },
     "outbounds": [
         {
@@ -43,6 +50,7 @@
         }
     ],
     "routing": {
+        "domainStrategy": "AsIs",
         "geoip_path": "geoip.dat",
         "geosite_path": "geosite.dat",
         "rules": [

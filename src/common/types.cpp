@@ -1,5 +1,5 @@
 #include "tx/common/types.h"
-#include <arpa/inet.h>
+#include "tx/common/network.h"
 #include <sstream>
 
 namespace tx {

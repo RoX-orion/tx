@@ -11,11 +11,14 @@
 
 - 本地 HTTP 代理入口。
 - 本地 SOCKS5 代理入口。
+- SOCKS5 UDP ASSOCIATE、UDP 直连和 TX 隧道转发。
 - 客户端与服务端之间的自定义隧道协议。
 - AES-GCM / ChaCha20-Poly1305 AEAD 加密。
 - 高熵 PSK 认证和 X25519/ECDHE 会话密钥派生。
-- 基于 GeoIP / GeoSite 的路由规则。
-- Linux / Windows / Android 相关平台条件支持。
+- 基于 GeoIP / GeoSite 的有序路由规则，以及 direct / tx / block 出站。
+- IPv4 / IPv6 TUN UDP 数据包处理。
+- Linux TUN 自动配置、路由和本机 TCP 透明重定向。
+- Android VpnService TUN fd 和出站 socket protector C API。
 - 简单的 assert 风格单元测试。
 
 ## 目录结构
@@ -84,6 +87,7 @@ cmake -B build \
 - 只有 OpenSSL 安装在非标准路径时，才需要额外传 `-DOPENSSL_ROOT_DIR=/path/to/openssl`。
 - `libuv` 可以显式指向静态库文件，例如 `libuv.a`、`uv_a.lib`；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
 - `nlohmann_json` 是 header-only；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
+- TUN UDP 前端使用固定提交的 HEV lwIP，并由 CMake FetchContent 下载到 `.deps/` 后静态链接。
 
 ## 构建
 
@@ -186,7 +190,8 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-当前测试覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router 和 tunnel 等模块。
+当前测试覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、tunnel、
+TUN packet、HEV lwIP UDP、socket protector 和 UDP flow timeout，共 11 个测试目标。
 
 ## 配置
 
@@ -208,7 +213,8 @@ cp config/client.json.example client.json
 ./build/bin/tx_server --gen-secret
 ```
 
-把输出的 `base64:...` 同时填入服务端 `secret` 和客户端 `server.secret`。
+把输出的 `base64:...` 同时填入服务端 `secret` 和客户端 TX 出站的
+`outbounds[*].server.secret`。
 
 ### 服务端配置
 
@@ -245,17 +251,63 @@ cp config/client.json.example client.json
         "http": {"host": "127.0.0.1", "port": 8080},
         "socks5": {"host": "127.0.0.1", "port": 1080}
     },
-    "server": {
-        "host": "your-server.example.com",
-        "port": 443,
-        "secret": "base64:REPLACE_WITH_GEN_SECRET_OUTPUT",
-        "cipher": "aes-256-gcm"
+    "udp": {
+        "idle_timeout": 300
     },
-    "geo": {
+    "tun": {
+        "enabled": false,
+        "name": "tx0",
+        "mtu": 1500,
+        "addresses": ["10.10.0.1/24", "fd00:2024::1/64"],
+        "auto_config": true,
+        "auto_route": true,
+        "auto_redirect": false,
+        "redirect_port": 54321,
+        "redirect_mark": 8228,
+        "routes": [],
+        "bypass_mark": 8228,
+        "route_table": 20220,
+        "rule_priority": 10000,
+        "tcp_stack": "lwip",
+        "udp_stack": "lwip"
+    },
+    "dns": {
+        "mode": "fake-ip",
+        "fake_ipv4_range": "198.18.0.0/16",
+        "fake_ipv6_range": "fd00:198:18::/96",
+        "upstreams": [],
+        "cache_ttl": 60
+    },
+    "outbounds": [
+        {
+            "tag": "direct-out",
+            "type": "direct"
+        },
+        {
+            "tag": "block",
+            "type": "block"
+        },
+        {
+            "tag": "proxy-out-tx",
+            "type": "tx",
+            "server": {
+                "host": "your-server.example.com",
+                "port": 443,
+                "secret": "base64:REPLACE_WITH_GEN_SECRET_OUTPUT",
+                "cipher": "aes-256-gcm"
+            }
+        }
+    ],
+    "routing": {
         "geoip_path": "geoip.dat",
         "geosite_path": "geosite.dat",
-        "direct_geoip": ["cn", "private"],
-        "direct_geosite": ["cn"]
+        "rules": [
+            {"ip": ["geoip:private"], "outboundTag": "direct-out"},
+            {"domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+            {"domain": ["geosite:cn"], "outboundTag": "direct-out"},
+            {"ip": ["geoip:cn"], "outboundTag": "direct-out"},
+            {"outboundTag": "proxy-out-tx"}
+        ]
     },
     "log_level": "info"
 }
@@ -266,15 +318,40 @@ cp config/client.json.example client.json
 - `listen.http`：本地 HTTP 代理监听地址和端口。
 - `listen.socks5`：本地 SOCKS5 代理监听地址和端口。
 - `udp.idle_timeout`：UDP flow 空闲回收时间，单位秒，默认 300，范围 1～86400。
-- `server.host`：远端 `tx_server` 地址。
-- `server.port`：远端 `tx_server` 端口。
-- `server.secret`：与服务端一致的高熵 PSK。
-- `server.cipher`：与服务端一致的 AEAD 算法，可选 `aes-256-gcm` 或 `chacha20-poly1305`。
-- `geo.geoip_path`：GeoIP 数据文件路径。
-- `geo.geosite_path`：GeoSite 数据文件路径。
-- `geo.direct_geoip`：命中后直连的 GeoIP 标签。
-- `geo.direct_geosite`：命中后直连的 GeoSite 标签。
+- `outbounds`：具名出站列表。每个 `tag` 必须唯一，`type` 可选 `direct`、`tx` 或 `block`。
+- `outbounds[*].server`：仅 `tx` 出站使用，指定远端地址、端口、PSK 和 AEAD 算法。
+- `routing.geoip_path`：GeoIP 数据文件路径。
+- `routing.geosite_path`：GeoSite 数据文件路径。
+- `routing.rules`：从上到下匹配；规则的 `outboundTag` 仅引用某个出站，不直接表示处理方式。
+- `routing.rules[*].ip`：IP/CIDR 或 `geoip:<tag>` 匹配项。
+- `routing.rules[*].domain`：域名或 `geosite:<tag>` 匹配项。
+- `routing.rules` 的最后一条应作为无 matcher 的默认出站。私网 IP 规则应放在最前，避免 LAN 流量进入远端隧道。
 - `log_level`：日志级别，可选 `debug`、`info`、`warn`、`error`。
+
+旧版顶层 `server`、`geo.direct_geoip` 和 `geo.direct_geosite` 配置已不再支持。
+
+### TUN 模式
+
+默认原生数据面为 `tcp_stack: "lwip"`、`udp_stack: "lwip"`。同一个 HEV lwIP
+netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由。`tun.mode`
+仅作为一个版本的弃用兼容字段；`tcp_stack: "system"` 只在 Linux 上保留。
+
+- `tun.addresses` 接受 IPv4/IPv6 CIDR；旧 `tun.address` 仍作为 IPv4 别名。
+- Linux lwIP 模式使用独立路由表（默认 `20220`）、bypass mark（默认 `0x2024`）和有序 policy rules；split-default 同时覆盖 IPv4/IPv6。
+- Linux `tun.auto_redirect` 使用 nftables 表 `inet tx_auto_redirect` 重定向本机 IPv4 TCP `OUTPUT` 流量，并通过 `tun.redirect_mark` 排除 TX 出站 socket，避免重定向循环。
+- `auto_redirect=true` 只能和 Linux `tcp_stack=system` 一起使用；lwIP 模式会在配置校验阶段拒绝该组合。
+- 当前 Linux redirect 不是网关/旁路由的 `PREROUTING TPROXY` 实现；TUN 和 nftables 配置通常需要 root 或 `CAP_NET_ADMIN`。
+- Android 由 `VpnService` 提供真实 TUN fd，txlib 接管 fd 所有权并直接运行 lwIP；APK 不再包含或启动 tun2socks。所有 native 出站 socket 必须通过 `VpnService.protect(fd)`。
+- 内置 fake-IP DNS 支持 UDP/TCP A、AAAA、稳定正反映射和域名路由；默认池为 `198.18.0.0/16` 与 `fd00:198:18::/96`。
+- ICMP 当前丢弃；DoH/DoT 不经过内置 DNS，因此只能按目标 IP 路由。
+
+Android 共享库提供以下启动接口：
+
+- `tx_client_start_with_tun_fd()`：使用 `VpnService` 提供的 TUN fd 启动客户端。
+- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。
+
+TX 客户端与服务端隧道帧协议已升级为 v2，并通过 `HalfClose` 命令传播双向 TCP
+FIN。v1 帧会明确作为版本不匹配拒绝，升级时必须同步部署客户端和服务端。
 
 ## 运行
 

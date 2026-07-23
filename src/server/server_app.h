@@ -31,6 +31,7 @@ private:
         Buffer           handshake_buf;
         Buffer           recv_buf;
         bool             outbounds_paused = false;
+        bool             inbound_paused = false;
         uint64_t         next_udp_generation = 1;
 
         // Outbound connections by session ID
@@ -39,6 +40,8 @@ private:
             SessionId  session_id;
             Buffer     pending_data;   // buffered before remote connected
             bool       connected;      // remote fully connected?
+            bool       client_eof = false;
+            bool       remote_eof = false;
         };
         struct UdpOutbound {
             uv_udp_t* udp;
@@ -77,6 +80,7 @@ private:
     void handle_udp_packet(TunnelClientPtr client, SessionId sid,
                            const TargetAddr& target, Buffer& payload);
     void handle_disconnect(TunnelClientPtr client, SessionId sid);
+    void handle_half_close(TunnelClientPtr client, SessionId sid);
     bool start_udp_cleanup_timer();
     void stop_udp_cleanup_timer();
     void cleanup_idle_udp_outbounds(uint64_t now_ms);
@@ -88,6 +92,7 @@ private:
                                 const TargetAddr& target,
                                 const uint8_t* data, size_t len);
     void tunnel_send_disconnect(TunnelClientPtr client, SessionId sid);
+    void tunnel_send_half_close(TunnelClientPtr client, SessionId sid);
     void tunnel_send_connect_result(TunnelClientPtr client, SessionId sid, bool success);
     void pause_outbound_reads(TunnelClientPtr client);
     void resume_outbound_reads(TunnelClientPtr client);

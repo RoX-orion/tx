@@ -1,9 +1,16 @@
 #include "tx/net/tcp_server.h"
 #include "tx/common/log.h"
 #include <cstring>
-#include <arpa/inet.h>
 #include <cerrno>
+#include <atomic>
 #include <utility>
+
+#if defined(TX_PLATFORM_WINDOWS)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 #include <sys/socket.h>
@@ -15,6 +22,9 @@ namespace tx {
 namespace {
 
 uint32_t g_tcp_outbound_mark = 0;
+uint32_t g_outbound_ipv4_interface = 0;
+uint32_t g_outbound_ipv6_interface = 0;
+std::atomic<uint64_t> g_socket_sequence{0};
 
 #if defined(TX_PLATFORM_LINUX)
 bool set_outbound_mark(int fd) {
@@ -104,6 +114,27 @@ bool open_transparent_socket(uv_tcp_t* tcp, int family) {
     return true;
 }
 #endif
+#elif defined(TX_PLATFORM_WINDOWS)
+bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
+                            const SocketProtectCallback& socket_protector) {
+    if (socket_protector) return false;
+    uint32_t index = family == AF_INET6 ? g_outbound_ipv6_interface
+                                        : g_outbound_ipv4_interface;
+    if (!index) return true;
+    SOCKET socket_fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_fd == INVALID_SOCKET) return false;
+    DWORD network_index = htonl(index);
+    int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+    int option = family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
+    if (setsockopt(socket_fd, level, option,
+                   reinterpret_cast<const char*>(&network_index),
+                   sizeof(network_index)) != 0 ||
+        uv_tcp_open(tcp, socket_fd) != 0) {
+        closesocket(socket_fd);
+        return false;
+    }
+    return true;
+}
 #else
 bool ensure_outbound_socket(uv_tcp_t*, int,
                             const SocketProtectCallback& socket_protector) {
@@ -122,22 +153,30 @@ struct DnsResolveCtx {
     TcpSession::ConnectCb cb;
     SessionPtr            session;
     uint16_t              port;
+    uint64_t              timeout_ms;
 };
 
 struct ConnectCtx {
     TcpSession::ConnectCb cb;
     SessionPtr            session;
+    uv_timer_t*           timer;
+    bool                  completed;
+    uint64_t              started_ns;
+    uint64_t              socket_sequence;
+    std::string           address;
 };
 
 // ==================== TcpSession ====================
 
 TcpSession::TcpSession(uv_loop_t* loop, SocketProtectCallback socket_protector)
-    : loop_(loop), closed_(false), reading_(false), remote_port_(0),
+    : loop_(loop), closed_(false), reading_(false), read_eof_(false),
+      write_shutdown_(false), shutdown_pending_(false), remote_port_(0),
       pending_write_bytes_(0),
       write_high_watermark_(4 * 1024 * 1024),
       write_low_watermark_(1024 * 1024),
       paused_for_write_(false),
-      socket_protector_(std::move(socket_protector)) {
+      socket_protector_(std::move(socket_protector)),
+      socket_sequence_(0) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 }
@@ -179,6 +218,11 @@ void TcpSession::init(uv_tcp_t* server_handle) {
 }
 
 void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
+    connect(host, port, 0, std::move(cb));
+}
+
+void TcpSession::connect(const std::string& host, uint16_t port, uint64_t timeout_ms,
+                         ConnectCb cb) {
     auto* req = new uv_connect_t;
     tcp_.data = this;
 
@@ -193,7 +237,15 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
     }
 
     if (sa) {
+        socket_sequence_ = g_socket_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        remote_addr_ = host;
+        remote_port_ = port;
+        TX_DEBUG("TCP socket #%llu prepare family=%s target=%s:%u",
+                 static_cast<unsigned long long>(socket_sequence_),
+                 sa->sa_family == AF_INET6 ? "IPv6" : "IPv4", host.c_str(), port);
         if (!ensure_outbound_socket(&tcp_, sa->sa_family, socket_protector_)) {
+            TX_ERROR("TCP socket #%llu prepare failed for %s:%u",
+                     static_cast<unsigned long long>(socket_sequence_), host.c_str(), port);
             cb(false);
             close();
             delete req;
@@ -201,23 +253,64 @@ void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
         }
 
         // Direct IP connect
-        req->data = new ConnectCtx{std::move(cb), shared_from_this()};
+        auto* ctx = new ConnectCtx{std::move(cb), shared_from_this(), nullptr, false,
+                                   uv_hrtime(), socket_sequence_,
+                                   host + ":" + std::to_string(port)};
+        req->data = ctx;
         int r = uv_tcp_connect(req, &tcp_, sa, on_connect);
         if (r != 0) {
-            TX_ERROR("uv_tcp_connect failed: %s", uv_strerror(r));
-            auto* ctx = static_cast<ConnectCtx*>(req->data);
+            TX_ERROR("TCP socket #%llu connect error for %s:%u: %s",
+                     static_cast<unsigned long long>(socket_sequence_), host.c_str(), port,
+                     uv_strerror(r));
+            ctx->completed = true;
             ctx->cb(false);
             if (!ctx->session->is_closed()) {
                 ctx->session->close();
             }
             delete ctx;
             delete req;
+        } else if (timeout_ms > 0) {
+            ctx->timer = new uv_timer_t;
+            ctx->timer->data = ctx;
+            int timer_status = uv_timer_init(loop_, ctx->timer);
+            if (timer_status != 0) {
+                TX_WARN("TCP socket #%llu could not start connect timer: %s",
+                        static_cast<unsigned long long>(socket_sequence_),
+                        uv_strerror(timer_status));
+                delete ctx->timer;
+                ctx->timer = nullptr;
+            } else {
+                timer_status = uv_timer_start(ctx->timer, on_connect_timeout,
+                                              timeout_ms, 0);
+                if (timer_status != 0) {
+                    TX_WARN("TCP socket #%llu could not start connect timer: %s",
+                            static_cast<unsigned long long>(socket_sequence_),
+                            uv_strerror(timer_status));
+                    uv_close(reinterpret_cast<uv_handle_t*>(ctx->timer),
+                             [](uv_handle_t* handle) {
+                                 delete reinterpret_cast<uv_timer_t*>(handle);
+                             });
+                    ctx->timer = nullptr;
+                }
+            }
         }
         return;
     }
 
+#if defined(TX_PLATFORM_ANDROID)
+    // Android callers must resolve through android_getaddrinfofornetwork() and
+    // pass a numeric candidate. Falling back to uv_getaddrinfo here could bind
+    // resolution to the VPN itself and create a routing loop.
+    TX_ERROR("Android outbound requires a network-bound resolver for %s", host.c_str());
+    cb(false);
+    close();
+    delete req;
+    return;
+#endif
+
     // DNS resolution needed
-    auto* resolve_ctx = new DnsResolveCtx{std::move(cb), shared_from_this(), port};
+    auto* resolve_ctx = new DnsResolveCtx{std::move(cb), shared_from_this(), port,
+                                          timeout_ms};
     auto* dns_req = new uv_getaddrinfo_t;
     dns_req->data = resolve_ctx;
     delete req;
@@ -268,8 +361,18 @@ void TcpSession::set_outbound_mark(uint32_t mark) {
     g_tcp_outbound_mark = mark;
 }
 
+void TcpSession::set_outbound_interfaces(uint32_t ipv4_index, uint32_t ipv6_index) {
+    g_outbound_ipv4_interface = ipv4_index;
+    g_outbound_ipv6_interface = ipv6_index;
+}
+
+uint32_t TcpSession::outbound_interface(int family) {
+    return family == AF_INET6 ? g_outbound_ipv6_interface
+                              : g_outbound_ipv4_interface;
+}
+
 bool TcpSession::send(const uint8_t* data, size_t len) {
-    if (closed_ || len == 0) return false;
+    if (closed_ || write_shutdown_ || shutdown_pending_ || len == 0) return false;
 
     auto* wr = new WriteReq;
     wr->data = new char[len];
@@ -289,13 +392,6 @@ bool TcpSession::send(const uint8_t* data, size_t len) {
     }
 
     pending_write_bytes_ += len;
-    if (pending_write_bytes_ > write_high_watermark_ && reading_) {
-        paused_for_write_ = true;
-        uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
-        reading_ = false;
-        TX_DEBUG("Write backlog high (%zu bytes), pausing reads", pending_write_bytes_);
-    }
-
     return true;
 }
 
@@ -309,7 +405,7 @@ bool TcpSession::send(Buffer& buf) {
 }
 
 void TcpSession::start_read(ReadCallback cb) {
-    if (closed_) return;
+    if (closed_ || read_eof_) return;
     read_cb_ = std::move(cb);
     paused_for_write_ = false;
     if (reading_) return;
@@ -329,6 +425,12 @@ void TcpSession::stop_read() {
     uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
 }
 
+void TcpSession::resume_read() {
+    if (closed_ || read_eof_ || reading_ || !read_cb_) return;
+    int r = uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp_), on_alloc, on_read);
+    if (r == 0 || r == UV_EALREADY) reading_ = true;
+}
+
 void TcpSession::close() {
     if (closed_) return;
     closed_ = true;
@@ -336,6 +438,8 @@ void TcpSession::close() {
     paused_for_write_ = false;
     read_cb_ = nullptr;
     write_drain_cb_ = nullptr;
+    eof_cb_ = nullptr;
+    error_cb_ = nullptr;
     try {
         self_ref_ = shared_from_this();
     } catch (const std::bad_weak_ptr&) {
@@ -343,6 +447,23 @@ void TcpSession::close() {
         // keep the old behavior rather than throwing during shutdown.
     }
     uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), on_close);
+}
+
+void TcpSession::shutdown_write() {
+    if (closed_ || write_shutdown_ || shutdown_pending_) return;
+    auto* req = new uv_shutdown_t;
+    req->data = new SessionPtr(shared_from_this());
+    shutdown_pending_ = true;
+    int r = uv_shutdown(req, reinterpret_cast<uv_stream_t*>(&tcp_), on_shutdown);
+    if (r != 0) {
+        shutdown_pending_ = false;
+        delete static_cast<SessionPtr*>(req->data);
+        delete req;
+        if (r != UV_ENOTCONN) {
+            TX_DEBUG("uv_shutdown failed: %s", uv_strerror(r));
+        }
+        close();
+    }
 }
 
 void TcpSession::on_alloc(uv_handle_t*, size_t, uv_buf_t* buf) {
@@ -360,14 +481,51 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
     if (nread > 0) {
         Buffer tmp(static_cast<size_t>(nread));
         tmp.append(reinterpret_cast<uint8_t*>(buf->base), static_cast<size_t>(nread));
-        if (self->read_cb_) {
-            self->read_cb_(self->shared_from_this(), tmp);
+        // The callback is allowed to replace/clear itself (the tunnel
+        // handshake does exactly that when it switches to framed reads).
+        // Keep a copy alive until the invocation returns; invoking the
+        // std::function member directly while it is reassigned is undefined
+        // behavior and used to cause intermittent use-after-free crashes.
+        auto cb = self->read_cb_;
+        if (cb) {
+            cb(self->shared_from_this(), tmp);
         }
+    } else if (nread == UV_EOF) {
+        self->reading_ = false;
+        self->read_eof_ = true;
+        uv_read_stop(stream);
+        auto cb = self->eof_cb_;
+        if (cb) {
+            cb(self->shared_from_this());
+        } else {
+            self->close();
+        }
+        if (!self->closed_ && self->write_shutdown_) self->close();
     } else if (nread < 0) {
-        if (nread != UV_EOF) {
-            TX_DEBUG("Read error: %s", uv_strerror(static_cast<int>(nread)));
+        TX_DEBUG("Read error: %s", uv_strerror(static_cast<int>(nread)));
+        auto cb = self->error_cb_;
+        if (cb) {
+            cb(self->shared_from_this(), static_cast<int>(nread));
         }
         self->close();
+    }
+}
+
+void TcpSession::on_shutdown(uv_shutdown_t* req, int status) {
+    auto* holder = static_cast<SessionPtr*>(req->data);
+    SessionPtr session = *holder;
+    delete holder;
+    delete req;
+    if (!session) return;
+    session->shutdown_pending_ = false;
+    if (status == 0) {
+        session->write_shutdown_ = true;
+        // Once both directions have completed, all writes queued before
+        // uv_shutdown have drained and the handle can be closed safely.
+        if (session->read_eof_ && !session->closed_) session->close();
+    } else if (status != UV_ECANCELED) {
+        TX_DEBUG("TCP shutdown error: %s", uv_strerror(status));
+        if (!session->closed_) session->close();
     }
 }
 
@@ -383,23 +541,11 @@ void TcpSession::on_write_free(uv_write_t* req, int status) {
         }
     }
 
-    if (self && !self->closed_ && self->paused_for_write_ &&
-        self->pending_write_bytes_ <= self->write_low_watermark_ &&
-        self->read_cb_) {
-        self->paused_for_write_ = false;
-        int r = uv_read_start(reinterpret_cast<uv_stream_t*>(&self->tcp_),
-                              on_alloc, on_read);
-        if (r == 0) {
-            self->reading_ = true;
-        } else if (r != UV_EALREADY) {
-            TX_DEBUG("uv_read_start after write drain failed: %s", uv_strerror(r));
-        }
-    }
-
     if (self && !self->closed_ &&
         self->pending_write_bytes_ <= self->write_low_watermark_ &&
         self->write_drain_cb_) {
-        self->write_drain_cb_(self->shared_from_this());
+        auto cb = self->write_drain_cb_;
+        cb(self->shared_from_this());
     }
 
     if (status < 0 && status != UV_ECANCELED) {
@@ -419,6 +565,8 @@ void TcpSession::on_close(uv_handle_t* handle) {
     auto cb = std::move(self->close_cb_);
     self->read_cb_ = nullptr;
     self->write_drain_cb_ = nullptr;
+    self->eof_cb_ = nullptr;
+    self->error_cb_ = nullptr;
     if (cb) {
         cb(self->shared_from_this());
     }
@@ -426,9 +574,32 @@ void TcpSession::on_close(uv_handle_t* handle) {
 
 void TcpSession::on_connect(uv_connect_t* req, int status) {
     auto* ctx = static_cast<ConnectCtx*>(req->data);
+    if (ctx->timer) {
+        uv_timer_stop(ctx->timer);
+        ctx->timer->data = nullptr;
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(ctx->timer))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(ctx->timer), [](uv_handle_t* handle) {
+                delete reinterpret_cast<uv_timer_t*>(handle);
+            });
+        }
+        ctx->timer = nullptr;
+    }
+    if (ctx->completed) {
+        delete ctx;
+        delete req;
+        return;
+    }
+    ctx->completed = true;
     bool success = (status == 0);
+    double elapsed_ms = static_cast<double>(uv_hrtime() - ctx->started_ns) / 1000000.0;
     if (!success) {
-        TX_ERROR("Connect failed: %s", uv_strerror(status));
+        TX_ERROR("TCP socket #%llu connect error for %s after %.1f ms: %s",
+                 static_cast<unsigned long long>(ctx->socket_sequence),
+                 ctx->address.c_str(), elapsed_ms, uv_strerror(status));
+    } else {
+        TX_DEBUG("TCP socket #%llu connected to %s in %.1f ms",
+                 static_cast<unsigned long long>(ctx->socket_sequence),
+                 ctx->address.c_str(), elapsed_ms);
     }
     ctx->cb(success);
     if (!success && !ctx->session->is_closed()) {
@@ -436,6 +607,19 @@ void TcpSession::on_connect(uv_connect_t* req, int status) {
     }
     delete ctx;
     delete req;
+}
+
+void TcpSession::on_connect_timeout(uv_timer_t* timer) {
+    auto* ctx = static_cast<ConnectCtx*>(timer->data);
+    if (!ctx || ctx->completed) return;
+    ctx->completed = true;
+    double elapsed_ms = static_cast<double>(uv_hrtime() - ctx->started_ns) / 1000000.0;
+    TX_ERROR("TCP socket #%llu connect timeout for %s after %.1f ms",
+             static_cast<unsigned long long>(ctx->socket_sequence),
+             ctx->address.c_str(), elapsed_ms);
+    uv_timer_stop(timer);
+    if (!ctx->session->is_closed()) ctx->session->close();
+    ctx->cb(false);
 }
 
 void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
@@ -511,7 +695,15 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
     }
 
     auto* connect_req = new uv_connect_t;
-    connect_req->data = new ConnectCtx{std::move(ctx->cb), ctx->session};
+    ctx->session->socket_sequence_ =
+        g_socket_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    ctx->session->remote_addr_ = ctx->session->remote_addr_.empty()
+        ? std::string("resolved-address") : ctx->session->remote_addr_;
+    auto* connect_ctx = new ConnectCtx{std::move(ctx->cb), ctx->session, nullptr, false,
+                                       uv_hrtime(), ctx->session->socket_sequence_,
+                                       ctx->session->remote_addr_ + ":" +
+                                           std::to_string(ctx->port)};
+    connect_req->data = connect_ctx;
 
     int r = uv_tcp_connect(connect_req, &ctx->session->tcp_, sa, on_connect);
     if (r != 0) {
@@ -523,6 +715,26 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
         }
         delete connect_ctx;
         delete connect_req;
+    } else if (ctx->timeout_ms > 0) {
+        connect_ctx->timer = new uv_timer_t;
+        connect_ctx->timer->data = connect_ctx;
+        int timer_status = uv_timer_init(ctx->session->loop_, connect_ctx->timer);
+        bool timer_initialized = timer_status == 0;
+        if (timer_status == 0) {
+            timer_status = uv_timer_start(connect_ctx->timer, on_connect_timeout,
+                                          ctx->timeout_ms, 0);
+        }
+        if (timer_status != 0) {
+            if (timer_initialized) {
+                uv_close(reinterpret_cast<uv_handle_t*>(connect_ctx->timer),
+                         [](uv_handle_t* handle) {
+                             delete reinterpret_cast<uv_timer_t*>(handle);
+                         });
+            } else {
+                delete connect_ctx->timer;
+            }
+            connect_ctx->timer = nullptr;
+        }
     }
 
     uv_freeaddrinfo(res);

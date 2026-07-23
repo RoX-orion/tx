@@ -52,7 +52,7 @@ struct TunnelTrafficKeys {
 
 class TunnelCodec {
 public:
-    static constexpr uint8_t kVersion = 0x01;
+    static constexpr uint8_t kVersion = 0x02;
     static constexpr size_t kLenPrefixSize = 4;    // big-endian length prefix
     static constexpr size_t kMinFrameSize = kLenPrefixSize + AeadCipher::kOverhead;
     static constexpr size_t kMaxPlaintextSize = 66000;
@@ -93,6 +93,10 @@ public:
 
     // Encode DISCONNECT message
     bool encode_disconnect(SessionId session_id, Buffer& out);
+
+    // Encode a one-way TCP FIN. Unlike DISCONNECT this keeps the opposite
+    // direction alive until it is also half-closed.
+    bool encode_half_close(SessionId session_id, Buffer& out);
 
     // Encode CONNECT result message. Payload is a single byte: 1=success, 0=failure.
     bool encode_connect_result(SessionId session_id, bool success, Buffer& out);

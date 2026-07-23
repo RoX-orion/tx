@@ -20,6 +20,11 @@ static void on_fatal_signal(int signum) {
 }
 
 static void install_crash_handlers() {
+#ifdef SIGPIPE
+    // Closed tunnel/target sockets are normal flow-level failures. Never let
+    // a concurrent write terminate the entire proxy process.
+    signal(SIGPIPE, SIG_IGN);
+#endif
     signal(SIGSEGV, on_fatal_signal);
     signal(SIGABRT, on_fatal_signal);
 #ifdef SIGBUS
@@ -108,6 +113,10 @@ int main(int argc, char* argv[]) {
     }, SIGTERM);
     sigint.data = &app;
     sigterm.data = &app;
+    // Signal watchers must not be the last referenced handles keeping the
+    // loop alive after ClientApp has closed all proxy sessions/listeners.
+    uv_unref(reinterpret_cast<uv_handle_t*>(&sigint));
+    uv_unref(reinterpret_cast<uv_handle_t*>(&sigterm));
 
     TX_INFO("TX Client running. Press Ctrl+C to stop.");
     int ret = app.run();
@@ -116,6 +125,7 @@ int main(int argc, char* argv[]) {
     uv_signal_stop(&sigterm);
     uv_close(reinterpret_cast<uv_handle_t*>(&sigint), nullptr);
     uv_close(reinterpret_cast<uv_handle_t*>(&sigterm), nullptr);
+    uv_run(uv_default_loop(), UV_RUN_NOWAIT);
 
     TX_INFO("TX Client stopped.");
     return ret;

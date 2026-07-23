@@ -1,12 +1,13 @@
 #include "client_app.h"
 #include "tx/common/log.h"
 #include "tx/common/endian.h"
+#include "tx/protocol/tls_sni.h"
 #include "tx/net/udp_flow_timeout.h"
 
 #include <algorithm>
-#include <arpa/inet.h>
+#include <atomic>
+#include "tx/common/network.h"
 #include <cstring>
-#include <netdb.h>
 #include <random>
 #include <cstdlib>
 #include <sstream>
@@ -28,36 +29,7 @@ namespace {
 
 constexpr uint64_t kTunnelHandshakeTimeoutMs = 8000;
 constexpr uint64_t kTunnelConnectResultTimeoutMs = 15000;
-
-bool is_ip_literal(const std::string& host) {
-    struct in_addr v4;
-    struct in6_addr v6;
-    return inet_pton(AF_INET, host.c_str(), &v4) == 1 ||
-           inet_pton(AF_INET6, host.c_str(), &v6) == 1;
-}
-
-bool sockaddr_to_ipaddr(const sockaddr* addr, uint16_t port, IpAddr& out) {
-    if (!addr) return false;
-
-    if (addr->sa_family == AF_INET) {
-        const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
-        out = IpAddr::from_ipv4(
-            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[0],
-            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[1],
-            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[2],
-            reinterpret_cast<const uint8_t*>(&a4->sin_addr)[3],
-            port);
-        return true;
-    }
-
-    if (addr->sa_family == AF_INET6) {
-        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
-        out = IpAddr::from_ipv6(reinterpret_cast<const uint8_t*>(&a6->sin6_addr), port);
-        return true;
-    }
-
-    return false;
-}
+constexpr uint64_t kTcpConnectTimeoutMs = 5000;
 
 std::string ipaddr_host_string(const IpAddr& ip) {
     char host[INET6_ADDRSTRLEN] = {0};
@@ -257,23 +229,10 @@ bool build_socks5_udp_packet(const TargetAddr& target,
 
 } // namespace
 
-struct ClientApp::RouteDnsCtx {
-    ClientApp* app;
-    ProxyConnPtr conn;
-};
-
 struct ClientApp::TunnelTimerCtx {
     ClientApp* app;
     ProxyConnPtr conn;
     std::string phase;
-};
-
-struct ClientApp::UdpResolveCtx {
-    ClientApp* app;
-    std::string flow_key;
-    SessionId session_id;
-    TargetAddr target;
-    std::vector<uint8_t> payload;
 };
 
 struct ClientApp::DirectUdpRelay {
@@ -285,8 +244,16 @@ struct ClientApp::DirectUdpRelay {
     bool recv_started = false;
 };
 
-ClientApp::ClientApp(SocketProtectCallback socket_protector)
+ClientApp::ClientApp(SocketProtectCallback socket_protector,
+                     DnsResolver::HostResolveHook host_resolver,
+                     DnsResolver::QueryHook dns_query)
     : loop_(uv_default_loop()),
+      stop_async_initialized_(false),
+      network_async_initialized_(false),
+      ready_to_run_(false),
+      stop_requested_(false),
+      stopping_(false),
+      dns_resolver_(loop_),
       http_server_(loop_),
       socks5_server_(loop_),
       tun_tcp_server_(loop_),
@@ -297,14 +264,48 @@ ClientApp::ClientApp(SocketProtectCallback socket_protector)
       tun_tcp_redirect_started_(false),
       udp_cleanup_timer_started_(false),
       next_session_id_(1),
-      socket_protector_(std::move(socket_protector)) {}
+      socket_protector_(std::move(socket_protector)),
+      host_resolver_(std::move(host_resolver)),
+      dns_query_(std::move(dns_query)) {}
 
 ClientApp::~ClientApp() {
     stop();
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+    if (config_.tun_fd >= 0) {
+        ::close(config_.tun_fd);
+        config_.tun_fd = -1;
+    }
+#endif
 }
 
 bool ClientApp::init(const ClientConfig& config) {
+    if (!stop_async_initialized_) {
+        int r = uv_async_init(loop_, &stop_async_, ClientApp::on_stop_async);
+        if (r != 0) {
+            TX_ERROR("Failed to initialize client stop handle: %s", uv_strerror(r));
+            return false;
+        }
+        stop_async_.data = this;
+        stop_async_initialized_ = true;
+    }
+    if (!network_async_initialized_) {
+        int r = uv_async_init(loop_, &network_async_, ClientApp::on_network_async);
+        if (r != 0) return false;
+        network_async_.data = this;
+        network_async_initialized_ = true;
+    }
+
     config_ = config;
+
+    std::string dns_error;
+    if (!fake_ip_dns_.configure(config_.dns_fake_ipv4_range,
+                                config_.dns_fake_ipv6_range,
+                                config_.dns_cache_ttl, dns_error)) {
+        TX_ERROR("Failed to configure fake-IP DNS: %s", dns_error.c_str());
+        return false;
+    }
+    dns_resolver_.configure(config_.dns_upstreams, socket_protector_,
+                            config_.tun_bypass_mark, host_resolver_, dns_query_);
 
     // Load router
     if (!router_.load(config.router)) {
@@ -337,6 +338,7 @@ bool ClientApp::init(const ClientConfig& config) {
     TX_INFO("  Outbounds:    %zu", config.outbounds.size());
     TX_INFO("  UDP timeout:  %llu seconds",
             static_cast<unsigned long long>(config_.udp_idle_timeout_ms / 1000));
+    ready_to_run_ = true;
     return true;
 }
 
@@ -345,26 +347,92 @@ int ClientApp::run() {
 }
 
 void ClientApp::stop() {
+    if (stop_requested_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (ready_to_run_) {
+        if (stop_async_initialized_) {
+            uv_async_send(&stop_async_);
+        }
+        return;
+    }
+
+    // Initialization failures never enter uv_run(), so there is no loop
+    // thread to receive the async request. Clean them up synchronously.
+    stop_on_loop();
+    uv_run(loop_, UV_RUN_NOWAIT);
+}
+
+void ClientApp::notify_network_changed() {
+    if (network_async_initialized_) uv_async_send(&network_async_);
+}
+
+void ClientApp::on_network_async(uv_async_t* handle) {
+    auto* app = static_cast<ClientApp*>(handle->data);
+    if (app) app->network_changed_on_loop();
+}
+
+void ClientApp::network_changed_on_loop() {
+    dns_resolver_.cancel_pending();
+    close_udp_tunnel();
+    std::vector<std::string> flows;
+    for (const auto& item : udp_flows_) flows.push_back(item.first);
+    for (const auto& key : flows) remove_udp_flow(key, false);
+    std::vector<ProxyConnPtr> connections;
+    connections.reserve(connections_.size());
+    for (const auto& item : connections_) connections.push_back(item.second);
+    connections_.clear();
+    for (auto& conn : connections) {
+        close_tunnel_session(conn);
+        if (conn->direct_session && !conn->direct_session->is_closed())
+            conn->direct_session->close();
+        if (conn->local_session && !conn->local_session->is_closed())
+            conn->local_session->reset();
+    }
+    TX_INFO("Android underlying network changed; old outbound flows closed");
+}
+
+void ClientApp::on_stop_async(uv_async_t* handle) {
+    auto* app = static_cast<ClientApp*>(handle->data);
+    if (app) {
+        app->stop_on_loop();
+    }
+}
+
+void ClientApp::stop_on_loop() {
+    if (stopping_) {
+        return;
+    }
+    stopping_ = true;
+
     stop_udp_cleanup_timer();
     stop_tun_listener();
     stop_udp_listener();
     close_udp_tunnel();
     http_server_.stop();
     socks5_server_.stop();
-    for (auto& kv : connections_) {
-        auto& conn = kv.second;
+    std::vector<ProxyConnPtr> active_connections;
+    active_connections.reserve(connections_.size());
+    for (const auto& kv : connections_) active_connections.push_back(kv.second);
+    connections_.clear();
+    for (auto& conn : active_connections) {
         close_tunnel_session(conn);
         if (conn->direct_session && !conn->direct_session->is_closed()) {
             conn->direct_session->set_close_callback(nullptr);
             conn->direct_session->close();
         }
         if (conn->local_session && !conn->local_session->is_closed()) {
-            conn->local_session->set_close_callback(nullptr);
             conn->local_session->close();
         }
     }
-    connections_.clear();
-    uv_stop(loop_);
+    if (stop_async_initialized_ &&
+        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&stop_async_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&stop_async_), nullptr);
+    }
+    if (network_async_initialized_ &&
+        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&network_async_)))
+        uv_close(reinterpret_cast<uv_handle_t*>(&network_async_), nullptr);
 }
 
 ClientTrafficStats ClientApp::traffic_stats() const {
@@ -444,7 +512,10 @@ void ClientApp::block_connection(ProxyConnPtr conn) {
         conn->http->build_error_response(403, resp);
         conn->local_session->send(resp);
     }
-    conn->local_session->close();
+    if (std::dynamic_pointer_cast<LwipTcpStream>(conn->local_session))
+        conn->local_session->reset();
+    else
+        conn->local_session->close();
 }
 
 bool ClientApp::start_proxy_listeners() {
@@ -575,6 +646,9 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
     }
 
     close_direct_udp_relay(it->second);
+    if (it->second.kind == UdpFlowKind::Tun && it->second.lwip_flow_id != 0) {
+        lwip_udp_stack_.close_flow(it->second.lwip_flow_id);
+    }
     udp_session_keys_.erase(sid);
     udp_tunnel_.pending.erase(
         std::remove_if(udp_tunnel_.pending.begin(), udp_tunnel_.pending.end(),
@@ -606,6 +680,7 @@ void ClientApp::cleanup_idle_udp_flows(uint64_t now_ms) {
 void ClientApp::on_udp_cleanup_timer(uv_timer_t* timer) {
     auto* app = static_cast<ClientApp*>(timer->data);
     if (app) {
+        app->lwip_udp_stack_.poll_timers();
         app->cleanup_idle_udp_flows(uv_now(app->loop_));
     }
 }
@@ -630,7 +705,15 @@ bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& fl
     }
     relay->handle.data = relay;
 
-    if (socket_protector_) {
+    const bool needs_explicit_socket = static_cast<bool>(socket_protector_)
+#if defined(TX_PLATFORM_LINUX)
+        || (config_.tun_enabled && config_.tun_tcp_stack == "lwip" &&
+            config_.tun_bypass_mark != 0)
+#elif defined(TX_PLATFORM_WINDOWS)
+        || TcpSession::outbound_interface(target_family) != 0
+#endif
+        ;
+    if (needs_explicit_socket) {
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
         int socket_fd = ::socket(target_family, SOCK_DGRAM, 0);
         if (socket_fd < 0) {
@@ -639,17 +722,49 @@ bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& fl
                      ClientApp::on_direct_udp_closed);
             return false;
         }
-        if (!socket_protector_(socket_fd)) {
+        if (socket_protector_ && !socket_protector_(socket_fd)) {
             TX_ERROR("Socket protector rejected UDP fd %d", socket_fd);
             ::close(socket_fd);
             uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
                      ClientApp::on_direct_udp_closed);
             return false;
         }
+#if defined(TX_PLATFORM_LINUX)
+        if (config_.tun_enabled && config_.tun_tcp_stack == "lwip" &&
+            config_.tun_bypass_mark != 0) {
+            uint32_t mark = config_.tun_bypass_mark;
+            if (setsockopt(socket_fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) {
+                TX_ERROR("SO_MARK failed for direct UDP fd %d: %s",
+                         socket_fd, std::strerror(errno));
+                ::close(socket_fd);
+                uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                         ClientApp::on_direct_udp_closed);
+                return false;
+            }
+        }
+#endif
         r = uv_udp_open(&relay->handle, static_cast<uv_os_sock_t>(socket_fd));
         if (r != 0) {
             TX_ERROR("uv_udp_open for protected socket failed: %s", uv_strerror(r));
             ::close(socket_fd);
+            uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                     ClientApp::on_direct_udp_closed);
+            return false;
+        }
+#elif defined(TX_PLATFORM_WINDOWS)
+        SOCKET socket_fd = socket(target_family, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_fd == INVALID_SOCKET) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
+                     ClientApp::on_direct_udp_closed);
+            return false;
+        }
+        DWORD index = htonl(TcpSession::outbound_interface(target_family));
+        int level = target_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+        int option = target_family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
+        if (setsockopt(socket_fd, level, option,
+                       reinterpret_cast<const char*>(&index), sizeof(index)) != 0 ||
+            uv_udp_open(&relay->handle, socket_fd) != 0) {
+            closesocket(socket_fd);
             uv_close(reinterpret_cast<uv_handle_t*>(&relay->handle),
                      ClientApp::on_direct_udp_closed);
             return false;
@@ -720,24 +835,23 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
         return;
     }
 
-    auto* req = new uv_getaddrinfo_t;
-    auto* ctx = new UdpResolveCtx;
-    ctx->app = this;
-    ctx->flow_key = flow_key;
-    ctx->session_id = flow.session_id;
-    ctx->target = target;
-    ctx->payload.assign(data, data + len);
-    req->data = ctx;
-
-    const std::string service = std::to_string(target.port);
-    int r = uv_getaddrinfo(loop_, req, ClientApp::on_direct_udp_resolved,
-                           target.host.c_str(), service.c_str(), nullptr);
-    if (r != 0) {
-        TX_WARN("[Direct][UDP] DNS lookup failed to start for %s:%u: %s",
-                target.host.c_str(), target.port, uv_strerror(r));
-        delete ctx;
-        delete req;
-    }
+    const SessionId session_id = flow.session_id;
+    std::vector<uint8_t> payload(data, data + len);
+    dns_resolver_.resolve_host(target.host, AF_UNSPEC,
+        [this, flow_key, session_id, target, payload](std::vector<std::string> addresses) {
+            auto flow_it = udp_flows_.find(flow_key);
+            if (addresses.empty() || flow_it == udp_flows_.end() ||
+                flow_it->second.session_id != session_id) {
+                TX_WARN("[Direct][UDP] DNS lookup failed for %s", target.host.c_str());
+                return;
+            }
+            TargetAddr resolved = target;
+            resolved.host = addresses.front();
+            resolved.type = resolved.host.find(':') == std::string::npos
+                ? AddrType::IPv4 : AddrType::IPv6;
+            send_direct_udp_packet(flow_key, flow_it->second, resolved,
+                                   payload.data(), payload.size());
+        });
 }
 
 void ClientApp::close_direct_udp_relay(UdpFlow& flow) {
@@ -799,14 +913,38 @@ bool ClientApp::ensure_udp_tunnel() {
         return false;
     }
 
-    auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
-    udp_tunnel_.tunnel_session = tunnel;
     udp_tunnel_.connected = false;
     udp_tunnel_.connecting = true;
     udp_tunnel_.handshake_buf.clear();
     udp_tunnel_.recv_buf.clear();
     TunnelCodec::cleanse_handshake_state(udp_tunnel_.handshake_state);
 
+    dns_resolver_.resolve_host(outbound->server_host, AF_UNSPEC,
+        [this](std::vector<std::string> addresses) {
+            if (!udp_tunnel_.connecting) return;
+            if (addresses.empty()) {
+                TX_ERROR("UDP tunnel DNS resolution failed");
+                close_udp_tunnel();
+                return;
+            }
+            connect_udp_tunnel_candidates(
+                std::make_shared<std::vector<std::string>>(std::move(addresses)), 0);
+        });
+
+    return true;
+}
+
+void ClientApp::connect_udp_tunnel_candidates(
+    std::shared_ptr<std::vector<std::string>> addresses, size_t index) {
+    if (!udp_tunnel_.connecting || !udp_tunnel_.outbound || !addresses ||
+        index >= addresses->size()) {
+        TX_ERROR("UDP tunnel exhausted all resolved server addresses");
+        close_udp_tunnel();
+        return;
+    }
+
+    auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
+    udp_tunnel_.tunnel_session = tunnel;
     tunnel->set_close_callback([this, tunnel](SessionPtr) {
         if (udp_tunnel_.tunnel_session == tunnel) {
             TX_WARN("UDP tunnel disconnected");
@@ -814,37 +952,38 @@ bool ClientApp::ensure_udp_tunnel() {
         }
     });
 
-    tunnel->connect(outbound->server_host, outbound->server_port,
-        [this, tunnel](bool success) {
+    const uint16_t server_port = udp_tunnel_.outbound->server_port;
+    tunnel->connect((*addresses)[index], server_port, kTcpConnectTimeoutMs,
+        [this, tunnel, addresses, index](bool success) {
             if (udp_tunnel_.tunnel_session != tunnel) {
-                if (tunnel && !tunnel->is_closed()) tunnel->close();
+                if (!tunnel->is_closed()) tunnel->close();
                 return;
             }
             if (!success) {
-                TX_ERROR("UDP tunnel connect failed to %s:%u",
-                         udp_tunnel_.outbound ? udp_tunnel_.outbound->server_host.c_str() : "",
-                         udp_tunnel_.outbound ? udp_tunnel_.outbound->server_port : 0);
-                close_udp_tunnel();
+                tunnel->set_close_callback(nullptr);
+                udp_tunnel_.tunnel_session.reset();
+                if (index + 1 < addresses->size()) {
+                    connect_udp_tunnel_candidates(addresses, index + 1);
+                } else {
+                    TX_ERROR("UDP tunnel connect failed for every resolved address");
+                    close_udp_tunnel();
+                }
                 return;
             }
 
             tunnel->start_read([this](SessionPtr, Buffer& data) {
                 on_udp_tunnel_handshake_read(data);
             });
-
             Buffer hello;
             if (!udp_tunnel_.outbound ||
                 !TunnelCodec::build_client_hello(udp_tunnel_.outbound->psk,
                                                   udp_tunnel_.outbound->cipher, hello,
-                                                  udp_tunnel_.handshake_state)) {
-                TX_ERROR("Failed to build UDP tunnel handshake");
+                                                  udp_tunnel_.handshake_state) ||
+                !tunnel->send(hello)) {
+                TX_ERROR("Failed to build or send UDP tunnel handshake");
                 close_udp_tunnel();
-                return;
             }
-            tunnel->send(hello);
         });
-
-    return true;
 }
 
 void ClientApp::send_udp_packet(SessionId sid, const TargetAddr& target,
@@ -1006,16 +1145,7 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
     }
     it->second.last_activity_ms = uv_now(app->loop_);
 
-    RouteDecision decision;
-    if (target.type == AddrType::Domain) {
-        decision = app->router_.decide_by_host(target.host);
-        if (!decision.matched) {
-            decision = app->router_.fallback_decision();
-        }
-    } else {
-        IpAddr ip = IpAddr::from_string(target.host, target.port);
-        decision = app->router_.decide_by_ip(ip);
-    }
+    RouteDecision decision = app->router_.decide_target(target);
 
     const OutboundConfig* outbound = app->find_outbound(decision.outbound_tag);
     if (!outbound) {
@@ -1070,69 +1200,6 @@ void ClientApp::on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf
                                    RouteAction::Direct);
 }
 
-void ClientApp::on_direct_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
-    auto* ctx = static_cast<UdpResolveCtx*>(req->data);
-    ClientApp* app = ctx->app;
-
-    if (status < 0 || !res) {
-        TX_WARN("[Direct][UDP] DNS lookup failed for %s:%u: %s",
-                ctx->target.host.c_str(), ctx->target.port,
-                status < 0 ? uv_strerror(status) : "no results");
-        if (res) uv_freeaddrinfo(res);
-        delete ctx;
-        delete req;
-        return;
-    }
-
-    auto flow_it = app->udp_flows_.find(ctx->flow_key);
-    if (flow_it == app->udp_flows_.end() ||
-        flow_it->second.session_id != ctx->session_id) {
-        uv_freeaddrinfo(res);
-        delete ctx;
-        delete req;
-        return;
-    }
-
-    const sockaddr* target_addr = nullptr;
-    for (auto* ai = res; ai; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET || ai->ai_family == AF_INET6) {
-            target_addr = ai->ai_addr;
-            break;
-        }
-    }
-
-    if (!target_addr ||
-        !app->ensure_direct_udp_relay(ctx->flow_key, flow_it->second, target_addr->sa_family)) {
-        uv_freeaddrinfo(res);
-        delete ctx;
-        delete req;
-        return;
-    }
-
-    auto* send_req = new uv_udp_send_t;
-    auto* data_copy = new char[ctx->payload.size()];
-    memcpy(data_copy, ctx->payload.data(), ctx->payload.size());
-    auto* send_buf = new uv_buf_t;
-    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(ctx->payload.size()));
-    send_req->data = send_buf;
-
-    int r = uv_udp_send(send_req, &flow_it->second.direct_relay->handle, send_buf, 1,
-                        target_addr, ClientApp::on_udp_send_done);
-    if (r != 0) {
-        TX_WARN("[Direct][UDP] send failed to %s:%u: %s",
-                ctx->target.host.c_str(), ctx->target.port, uv_strerror(r));
-        delete[] send_buf->base;
-        delete send_buf;
-        delete send_req;
-    } else {
-        app->record_traffic(RouteAction::Direct, true, ctx->payload.size());
-    }
-
-    uv_freeaddrinfo(res);
-    delete ctx;
-    delete req;
-}
-
 void ClientApp::on_direct_udp_closed(uv_handle_t* handle) {
     auto* relay = static_cast<DirectUdpRelay*>(handle->data);
     delete relay;
@@ -1144,11 +1211,8 @@ bool ClientApp::start_tun_listener() {
     if (config_.tun_fd < 0) {
         TX_INFO("TUN fd not provided; creating platform TUN device");
     }
-    if (config_.tun_mode != "mixed") {
-        TX_ERROR("Unsupported TUN mode: %s", config_.tun_mode.c_str());
-        return false;
-    }
-    if (config_.tun_tcp_stack != "system" || config_.tun_udp_stack != "gvisor") {
+    if ((config_.tun_tcp_stack != "system" && config_.tun_tcp_stack != "lwip") ||
+        config_.tun_udp_stack != "lwip") {
         TX_ERROR("Unsupported TUN stack combination: tcp=%s udp=%s",
                  config_.tun_tcp_stack.c_str(), config_.tun_udp_stack.c_str());
         return false;
@@ -1168,12 +1232,42 @@ bool ClientApp::start_tun_listener() {
     }
 
     tun_fd_ = tun_device_->fd();
+    // PlatformTunDevice now owns the descriptor; clear the config copy so
+    // initialization-failure cleanup cannot close a recycled fd later.
+    config_.tun_fd = -1;
     tun_read_buf_.resize(static_cast<size_t>(config_.tun_mtu > 0 ? config_.tun_mtu : 1500) + 256);
+
+    if (!lwip_udp_stack_.initialize(
+            config_.tun_addresses, config_.tun_mtu,
+            [this](uint64_t flow_id, const IpAddr& source,
+                   const IpAddr& destination, const uint8_t* data, size_t len) {
+                handle_lwip_udp_datagram(flow_id, source, destination, data, len);
+            },
+            [this](const std::shared_ptr<LwipTcpStream>& stream,
+                   const IpAddr& source, const TargetAddr& target) {
+                on_lwip_tcp_accept(stream, source, target);
+            },
+            [this](const uint8_t* packet, size_t len) {
+                if (!tun_device_) return false;
+                std::string write_error;
+                const bool written = tun_device_->write_packet(packet, len, write_error);
+                if (!written && !write_error.empty()) {
+                    TX_WARN("TUN write failed: %s", write_error.c_str());
+                }
+                return written;
+            }, error)) {
+        TX_ERROR("Failed to initialize HEV lwIP UDP stack: %s", error.c_str());
+        tun_device_->close();
+        tun_device_.reset();
+        tun_fd_ = -1;
+        return false;
+    }
 
     if (tun_fd_ >= 0) {
         int r = uv_poll_init(loop_, &tun_poll_, tun_fd_);
         if (r != 0) {
             TX_ERROR("uv_poll_init for TUN fd failed: %s", uv_strerror(r));
+            lwip_udp_stack_.shutdown();
             tun_device_.reset();
             tun_fd_ = -1;
             return false;
@@ -1184,22 +1278,54 @@ bool ClientApp::start_tun_listener() {
         if (r != 0) {
             TX_ERROR("uv_poll_start for TUN fd failed: %s", uv_strerror(r));
             uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+            lwip_udp_stack_.shutdown();
             tun_device_.reset();
             tun_fd_ = -1;
             return false;
         }
+        r = uv_timer_init(loop_, &tun_timer_);
+        if (r != 0) {
+            TX_ERROR("uv_timer_init for lwIP failed: %s", uv_strerror(r));
+            uv_poll_stop(&tun_poll_);
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+            lwip_udp_stack_.shutdown();
+            tun_device_.reset();
+            tun_fd_ = -1;
+            return false;
+        }
+        tun_timer_.data = this;
+        r = uv_timer_start(&tun_timer_, ClientApp::on_tun_timer, 1, 0);
+        if (r != 0) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_timer_), nullptr);
+            uv_poll_stop(&tun_poll_);
+            uv_close(reinterpret_cast<uv_handle_t*>(&tun_poll_), nullptr);
+            lwip_udp_stack_.shutdown();
+            tun_device_.reset();
+            tun_fd_ = -1;
+            return false;
+        }
+        tun_timer_started_ = true;
     } else {
+        if (!tun_device_->start_async_reader(loop_, [this]() { drain_tun_packets(); }, error)) {
+            TX_ERROR("Failed to start platform TUN reader: %s", error.c_str());
+            lwip_udp_stack_.shutdown();
+            tun_device_->close();
+            tun_device_.reset();
+            return false;
+        }
         int r = uv_timer_init(loop_, &tun_timer_);
         if (r != 0) {
             TX_ERROR("uv_timer_init for TUN failed: %s", uv_strerror(r));
+            lwip_udp_stack_.shutdown();
             tun_device_.reset();
             return false;
         }
         tun_timer_.data = this;
-        r = uv_timer_start(&tun_timer_, ClientApp::on_tun_timer, 1, 1);
+        r = uv_timer_start(&tun_timer_, ClientApp::on_tun_timer, 1, 0);
         if (r != 0) {
             TX_ERROR("uv_timer_start for TUN failed: %s", uv_strerror(r));
             uv_close(reinterpret_cast<uv_handle_t*>(&tun_timer_), nullptr);
+            lwip_udp_stack_.shutdown();
             tun_device_.reset();
             return false;
         }
@@ -1221,6 +1347,7 @@ bool ClientApp::start_tun_listener() {
             }
         }
         tun_device_->close();
+        lwip_udp_stack_.shutdown();
         tun_device_.reset();
         tun_fd_ = -1;
         return false;
@@ -1234,6 +1361,7 @@ void ClientApp::stop_tun_listener() {
     if (!tun_started_) return;
     tun_started_ = false;
     stop_tun_tcp_redirect();
+    lwip_udp_stack_.shutdown();
     if (tun_fd_ >= 0) {
         uv_poll_stop(&tun_poll_);
         if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tun_poll_))) {
@@ -1255,6 +1383,10 @@ void ClientApp::stop_tun_listener() {
 }
 
 bool ClientApp::start_tun_tcp_redirect() {
+    if (config_.tun_tcp_stack == "lwip") {
+        TcpSession::set_outbound_mark(config_.tun_bypass_mark);
+        return true;
+    }
     if (!config_.tun_auto_redirect) {
         TcpSession::set_outbound_mark(0);
         return true;
@@ -1289,6 +1421,10 @@ bool ClientApp::start_tun_tcp_redirect() {
 }
 
 void ClientApp::stop_tun_tcp_redirect() {
+    if (config_.tun_tcp_stack == "lwip") {
+        TcpSession::set_outbound_mark(0);
+        return;
+    }
     if (!tun_tcp_redirect_started_) return;
     tun_tcp_redirect_started_ = false;
 #if defined(TX_PLATFORM_LINUX)
@@ -1329,6 +1465,7 @@ void ClientApp::on_tun_tcp_accept(SessionPtr session) {
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
     });
+    session->set_eof_callback([this, conn](SessionPtr) { on_local_eof(conn); });
 
     session->start_read([this, conn](SessionPtr, Buffer& data) {
         conn->proto_buf.append(data);
@@ -1339,7 +1476,8 @@ void ClientApp::on_tun_tcp_accept(SessionPtr session) {
         }
         if (conn->route == RouteAction::Direct && conn->direct_session) {
             size_t bytes = conn->proto_buf.readable();
-            conn->direct_session->send(conn->proto_buf);
+            if (conn->bridge) conn->bridge->forward_from_left(conn->proto_buf);
+            else conn->direct_session->send(conn->proto_buf);
             record_traffic(RouteAction::Direct, true, bytes);
             conn->proto_buf.clear();
         } else if (!conn->proto_buf.empty()) {
@@ -1351,6 +1489,133 @@ void ClientApp::on_tun_tcp_accept(SessionPtr session) {
     TX_DEBUG("[TUN][TCP] accepted transparent flow to %s:%u",
              conn->target.host.c_str(), conn->target.port);
     on_target_resolved(conn);
+}
+
+void ClientApp::on_lwip_tcp_accept(const std::shared_ptr<LwipTcpStream>& stream,
+                                   const IpAddr&, const TargetAddr& target) {
+    if (!stream || config_.tun_tcp_stack != "lwip") {
+        if (stream) stream->reset();
+        return;
+    }
+    if (target.port == 53) {
+        auto pending = std::make_shared<Buffer>();
+        std::weak_ptr<LwipTcpStream> weak_stream = stream;
+        stream->set_data_callback([this, weak_stream, pending](Buffer& data) {
+            auto stream = weak_stream.lock();
+            if (!stream) return;
+            pending->append(data);
+            data.clear();
+            while (pending->readable() >= 2) {
+                const uint16_t query_len = load_be16(pending->data());
+                if (query_len > 4096) { stream->reset(); return; }
+                if (pending->readable() < static_cast<size_t>(query_len) + 2) return;
+                std::vector<uint8_t> query(pending->data() + 2,
+                                           pending->data() + 2 + query_len);
+                pending->consume(static_cast<size_t>(query_len) + 2);
+                std::vector<uint8_t> response;
+                const bool generated = fake_ip_dns_.respond(query.data(), query.size(), response);
+                if (generated) {
+                    static std::atomic<unsigned> tcp_dns_diagnostics{0};
+                    Buffer framed(response.size() + 2);
+                    uint8_t length[2];
+                    store_be16(length, static_cast<uint16_t>(response.size()));
+                    framed.append(length, 2);
+                    if (!response.empty()) framed.append(response.data(), response.size());
+                    const bool written = stream->write(framed);
+                    const unsigned diagnostic = tcp_dns_diagnostics.fetch_add(1);
+                    if (diagnostic < 12) {
+                        TX_WARN("[DNS][TUN][TCP] query=%zu response=%zu written=%d",
+                                query.size(), response.size(), written ? 1 : 0);
+                    }
+                    if (!written) stream->reset();
+                }
+                if (!generated && dns_resolver_.can_query()) {
+                    dns_resolver_.resolve(query.data(), query.size(),
+                        [weak_stream](std::vector<uint8_t> upstream) {
+                            auto current = weak_stream.lock();
+                            if (!current || current->is_closed() || upstream.empty()) return;
+                            Buffer framed(upstream.size() + 2);
+                            uint8_t length[2];
+                            store_be16(length, static_cast<uint16_t>(upstream.size()));
+                            framed.append(length, 2);
+                            framed.append(upstream.data(), upstream.size());
+                            if (!current->write(framed)) current->reset();
+                        });
+                }
+            }
+        });
+        stream->set_eof_callback([weak_stream]() {
+            if (auto stream = weak_stream.lock()) stream->shutdown_write();
+        });
+        return;
+    }
+
+    auto conn = std::make_shared<ProxyConn>();
+    conn->local_session = stream;
+    conn->target = target;
+    std::string domain;
+    if (fake_ip_dns_.reverse_lookup(conn->target.host, domain)) {
+        conn->fake_ip_target = true;
+        conn->target.type = AddrType::Domain;
+        conn->target.host = domain;
+    }
+    const bool sniff_tls_sni = !conn->fake_ip_target && conn->target.port == 443;
+    conn->route = RouteAction::Proxy;
+    conn->outbound = nullptr;
+    conn->connected = false;
+    conn->connect_result_sent = false;
+    conn->target_dispatched = !sniff_tls_sni;
+    conn->tunnel_connected = false;
+    conn->tunnel_connecting = false;
+    conn->tunnel_timer = nullptr;
+    conn->session_id = next_session_id_++;
+
+    stream->set_close_callback([this, conn]() { on_proxy_close(conn); });
+    stream->set_eof_callback([this, conn]() { on_local_eof(conn); });
+    stream->set_error_callback([conn](int) {
+        if (conn->local_session && !conn->local_session->is_closed()) {
+            conn->local_session->reset();
+        }
+    });
+    stream->set_data_callback([this, conn](Buffer& data) {
+        conn->proto_buf.append(data);
+        data.clear();
+        if (!conn->target_dispatched) {
+            std::string sni;
+            const TlsSniResult result = extract_tls_sni(
+                conn->proto_buf.data(), conn->proto_buf.readable(), sni);
+            if (result == TlsSniResult::NeedMore && conn->proto_buf.readable() <= 65540)
+                return;
+            conn->target_dispatched = true;
+            if (result == TlsSniResult::Found) {
+                TX_INFO("[TUN][TLS] recovered domain %s for %s:%u",
+                        sni.c_str(), conn->target.host.c_str(), conn->target.port);
+                conn->target.type = AddrType::Domain;
+                conn->target.host = std::move(sni);
+            } else {
+                TX_WARN("[TUN][TLS] no SNI for %s:%u; using original IP",
+                        conn->target.host.c_str(), conn->target.port);
+            }
+            on_target_resolved(conn);
+        }
+        if (!conn->connected) return;
+        if (conn->route == RouteAction::Direct && conn->direct_session) {
+            const size_t bytes = conn->proto_buf.readable();
+            bool sent = conn->bridge ? conn->bridge->forward_from_left(conn->proto_buf)
+                                     : conn->direct_session->send(conn->proto_buf);
+            if (!sent) {
+                conn->local_session->reset();
+                return;
+            }
+            record_traffic(RouteAction::Direct, true, bytes);
+        } else if (!conn->proto_buf.empty()) {
+            tunnel_send(conn, conn->proto_buf.data(), conn->proto_buf.readable());
+            conn->proto_buf.clear();
+        }
+    });
+    TX_DEBUG("[TUN][lwIP][TCP] accepted flow to %s:%u",
+             target.host.c_str(), target.port);
+    if (conn->target_dispatched) on_target_resolved(conn);
 }
 
 void ClientApp::on_tun_poll(uv_poll_t* handle, int status, int events) {
@@ -1367,7 +1632,12 @@ void ClientApp::on_tun_poll(uv_poll_t* handle, int status, int events) {
 void ClientApp::on_tun_timer(uv_timer_t* timer) {
     auto* app = static_cast<ClientApp*>(timer->data);
     if (!app || !app->tun_started_) return;
+    app->lwip_udp_stack_.poll_timers();
     app->drain_tun_packets();
+    if (app->tun_started_) {
+        uv_timer_start(timer, ClientApp::on_tun_timer,
+                       app->lwip_udp_stack_.next_timeout_ms(), 0);
+    }
 }
 
 void ClientApp::drain_tun_packets() {
@@ -1378,6 +1648,14 @@ void ClientApp::drain_tun_packets() {
                                                         tun_read_buf_.size(),
                                                         error);
         if (nread > 0) {
+            static std::atomic<unsigned> tun_packet_diagnostics{0};
+            const unsigned diagnostic = tun_packet_diagnostics.fetch_add(1,
+                                                                          std::memory_order_relaxed);
+            if (diagnostic < 6) {
+                const unsigned version = static_cast<unsigned>(tun_read_buf_[0] >> 4);
+                TX_INFO("[TUN] input packet=%zu bytes version=%u", static_cast<size_t>(nread),
+                        version);
+            }
             handle_tun_packet(tun_read_buf_.data(), static_cast<size_t>(nread));
             continue;
         }
@@ -1389,26 +1667,57 @@ void ClientApp::drain_tun_packets() {
 }
 
 void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
-    TunPacketView packet;
-    if (!parse_tun_packet(data, len, packet)) {
-        return;
-    }
+    lwip_udp_stack_.input(data, len);
+}
 
-    if (packet.protocol == TunL4Protocol::Tcp) {
-        TX_DEBUG("[TUN][TCP] system stack packet %s:%u -> %s:%u ignored by UDP path",
-                 packet.src_ip.to_string().c_str(), packet.src_port,
-                 packet.dst_ip.to_string().c_str(), packet.dst_port);
-        return;
-    }
-
+void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
+                                         const IpAddr& source,
+                                         const IpAddr& destination,
+                                         const uint8_t* data, size_t len) {
     TargetAddr target;
-    target.type = packet.dst_ip.family == IpAddr::IPv4 ? AddrType::IPv4 : AddrType::IPv6;
-    target.host = ipaddr_host_string(packet.dst_ip);
-    target.port = packet.dst_port;
+    target.type = destination.family == IpAddr::IPv4 ? AddrType::IPv4 : AddrType::IPv6;
+    target.host = ipaddr_host_string(destination);
+    target.port = destination.port;
 
-    const std::string flow_key =
-        std::string("tun:") + packet.src_ip.to_string() + ">" +
-        packet.dst_ip.to_string() + "/" + std::to_string(static_cast<int>(packet.protocol));
+    if (destination.port == 53) {
+        static std::atomic<unsigned> dns_diagnostics{0};
+        std::vector<uint8_t> query(data, data + len);
+        std::vector<uint8_t> response;
+        const bool generated = fake_ip_dns_.respond(query.data(), query.size(), response);
+        const bool sent = generated && lwip_udp_stack_.send_response(
+            lwip_flow_id, destination, response.data(), response.size());
+        const unsigned diagnostic = dns_diagnostics.fetch_add(1);
+        if (diagnostic < 12) {
+            TX_WARN("[DNS][TUN] query=%zu response=%zu generated=%d sent=%d dst=%s",
+                    query.size(), response.size(), generated ? 1 : 0, sent ? 1 : 0,
+                    ipaddr_host_string(destination).c_str());
+        }
+        if (generated) {
+            // DNS is a one-request/one-response flow here. It is intentionally
+            // not inserted into udp_flows_, so release its lwIP PCB now.
+            lwip_udp_stack_.close_flow(lwip_flow_id);
+        } else if (dns_resolver_.can_query()) {
+            dns_resolver_.resolve(query.data(), query.size(),
+                [this, lwip_flow_id, destination](std::vector<uint8_t> upstream) {
+                    if (!upstream.empty())
+                        lwip_udp_stack_.send_response(lwip_flow_id, destination,
+                                                      upstream.data(), upstream.size());
+                    lwip_udp_stack_.close_flow(lwip_flow_id);
+                });
+        } else {
+            lwip_udp_stack_.close_flow(lwip_flow_id);
+        }
+        return;
+    }
+
+    std::string domain;
+    const bool fake_ip = fake_ip_dns_.reverse_lookup(target.host, domain);
+    if (fake_ip) {
+        target.type = AddrType::Domain;
+        target.host = domain;
+    }
+
+    const std::string flow_key = "tun:lwip:" + std::to_string(lwip_flow_id);
 
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end()) {
@@ -1417,14 +1726,15 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
         flow.kind = UdpFlowKind::Tun;
         flow.last_activity_ms = uv_now(loop_);
         flow.client_addr_len = 0;
-        flow.tun_src_ip = packet.src_ip;
-        flow.tun_dst_ip = packet.dst_ip;
+        flow.tun_src_ip = source;
+        flow.tun_dst_ip = destination;
+        flow.lwip_flow_id = lwip_flow_id;
         it = udp_flows_.emplace(flow_key, flow).first;
         udp_session_keys_[flow.session_id] = flow_key;
     }
     it->second.last_activity_ms = uv_now(loop_);
 
-    RouteDecision decision = router_.decide_by_ip(packet.dst_ip);
+    RouteDecision decision = router_.decide_target(target);
     const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
     if (!outbound) {
         TX_ERROR("TUN UDP route selected unknown outboundTag: %s",
@@ -1437,8 +1747,22 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
     }
     if (outbound->type == OutboundType::Direct) {
         TX_DEBUG("[TUN][Direct][UDP] %s:%u", target.host.c_str(), target.port);
-        send_direct_udp_packet(flow_key, it->second, target,
-                               packet.payload, packet.payload_len);
+        send_direct_udp_packet(flow_key, it->second, target, data, len);
+        return;
+    }
+
+    // A non-fake UDP/443 destination has lost its domain (typically because an
+    // app used DoH or a cached address). Forwarding that potentially poisoned
+    // IP through TX cannot be repaired by the server. Dropping the QUIC path
+    // makes Chromium/YouTube retry over TCP, where ClientHello SNI restores the
+    // domain and the TX server performs clean remote resolution.
+    if (!fake_ip && destination.port == 443) {
+        static std::atomic<unsigned> quic_fallback_diagnostics{0};
+        const unsigned diagnostic = quic_fallback_diagnostics.fetch_add(1);
+        if (diagnostic < 12) {
+            TX_WARN("[TUN][UDP] dropping non-domain QUIC target %s to force TCP/SNI fallback",
+                    destination.to_string().c_str());
+        }
         return;
     }
 
@@ -1447,33 +1771,19 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
     }
     udp_tunnel_.outbound = outbound;
     it->second.proxied = true;
-    send_udp_packet(it->second.session_id, target, packet.payload, packet.payload_len);
+    send_udp_packet(it->second.session_id, target, data, len);
 }
 
 bool ClientApp::write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
                                      const uint8_t* data, size_t len) {
     if (!tun_started_ || !tun_device_) return false;
 
-    IpAddr src = IpAddr::from_string(source.host);
+    IpAddr src = IpAddr::from_string(source.host, source.port);
     if (src.family != flow.tun_src_ip.family) {
         return false;
     }
 
-    Buffer packet;
-    if (!build_udp_tun_packet(src, source.port,
-                              flow.tun_src_ip, flow.tun_src_ip.port,
-                              data, len, packet)) {
-        return false;
-    }
-
-    std::string error;
-    if (!tun_device_->write_packet(packet.data(), packet.readable(), error)) {
-        if (!error.empty()) {
-            TX_WARN("TUN write failed: %s", error.c_str());
-        }
-        return false;
-    }
-    return true;
+    return lwip_udp_stack_.send_response(flow.lwip_flow_id, src, data, len);
 }
 
 void ClientApp::on_http_accept(SessionPtr session) {
@@ -1491,13 +1801,14 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
 
-    conn->http->set_target_callback([this, conn](const TargetAddr& target) {
+    conn->http->set_target_callback([conn](const TargetAddr& target) {
         conn->target = target;
     });
 
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
     });
+    session->set_eof_callback([this, conn](SessionPtr) { on_local_eof(conn); });
 
     session->start_read([this, conn](SessionPtr, Buffer& data) {
         // Accumulate into persistent buffer
@@ -1509,7 +1820,8 @@ void ClientApp::on_http_accept(SessionPtr session) {
             if (!conn->proto_buf.empty()) {
                 if (conn->route == RouteAction::Direct && conn->direct_session) {
                     size_t bytes = conn->proto_buf.readable();
-                    conn->direct_session->send(conn->proto_buf);
+                    if (conn->bridge) conn->bridge->forward_from_left(conn->proto_buf);
+                    else conn->direct_session->send(conn->proto_buf);
                     record_traffic(RouteAction::Direct, true, bytes);
                     conn->proto_buf.clear();
                 } else {
@@ -1560,13 +1872,14 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->tunnel_timer = nullptr;
     conn->session_id = next_session_id_++;
 
-    conn->socks5->set_target_callback([this, conn](const TargetAddr& target) {
+    conn->socks5->set_target_callback([conn](const TargetAddr& target) {
         conn->target = target;
     });
 
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
     });
+    session->set_eof_callback([this, conn](SessionPtr) { on_local_eof(conn); });
 
     session->start_read([this, conn](SessionPtr, Buffer& data) {
         // Accumulate into persistent buffer
@@ -1578,7 +1891,8 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
             if (!conn->proto_buf.empty()) {
                 if (conn->route == RouteAction::Direct && conn->direct_session) {
                     size_t bytes = conn->proto_buf.readable();
-                    conn->direct_session->send(conn->proto_buf);
+                    if (conn->bridge) conn->bridge->forward_from_left(conn->proto_buf);
+                    else conn->direct_session->send(conn->proto_buf);
                     record_traffic(RouteAction::Direct, true, bytes);
                     conn->proto_buf.clear();
                 } else {
@@ -1643,163 +1957,96 @@ void ClientApp::resolve_and_route(ProxyConnPtr conn) {
         return;
     }
 
-    RouteDecision host_decision = router_.decide_by_host(conn->target.host);
-    bool host_rule_matched = host_decision.matched;
-
-    if (host_rule_matched && apply_route_decision(conn, host_decision)) {
-        if (conn->route == RouteAction::Direct) {
-            TX_INFO("[Direct] %s:%u (domain rule -> %s)",
-                    conn->target.host.c_str(), conn->target.port,
-                    conn->outbound ? conn->outbound->tag.c_str() : "");
-            connect_direct(conn);
-        } else if (conn->route == RouteAction::Proxy) {
-            TX_INFO("[Proxy] %s:%u (domain rule -> %s)",
-                    conn->target.host.c_str(), conn->target.port,
-                    conn->outbound ? conn->outbound->tag.c_str() : "");
-            connect_via_tunnel(conn);
-        }
-        return;
-    }
-
-    if (conn->target.type == AddrType::Domain) {
-        resolve_domain_and_route(conn);
-        return;
-    }
-
-    IpAddr ip = IpAddr::from_string(conn->target.host, conn->target.port);
-    if (conn->target.type == AddrType::Domain && ip.is_lan() && !is_ip_literal(conn->target.host)) {
-        TX_WARN("[Proxy] %s:%u resolved to private/local address %s, forcing proxy",
-                conn->target.host.c_str(), conn->target.port, ip.to_string().c_str());
-        RouteDecision decision = router_.decide_by_ip(ip);
-        if (apply_route_decision(conn, decision)) {
-            if (conn->route == RouteAction::Direct) {
-                connect_direct(conn);
-            } else if (conn->route == RouteAction::Proxy) {
-                connect_via_tunnel(conn);
-            }
-        }
-        return;
-    }
-
-    RouteDecision ip_decision = router_.decide_by_ip(ip);
-    if (!apply_route_decision(conn, ip_decision)) {
-        return;
-    }
+    const RouteDecision decision = router_.decide_target(conn->target);
+    // A decision is terminal even when its outbound blocks the connection or
+    // is invalid. In particular, never continue to the fallback after a block.
+    if (!apply_route_decision(conn, decision)) return;
 
     if (conn->route == RouteAction::Direct) {
-        TX_INFO("[Direct] %s:%u (ip rule -> %s)",
+        TX_INFO("[AsIs][Direct] %s:%u (%s -> %s)",
                 conn->target.host.c_str(), conn->target.port,
+                decision.matched ? "rule" : "fallback",
                 conn->outbound ? conn->outbound->tag.c_str() : "");
         connect_direct(conn);
     } else {
-        TX_INFO("[Proxy] %s:%u (ip/default rule -> %s)",
+        TX_INFO("[AsIs][Proxy] %s:%u (%s -> %s)",
                 conn->target.host.c_str(), conn->target.port,
+                decision.matched ? "rule" : "fallback",
                 conn->outbound ? conn->outbound->tag.c_str() : "");
         connect_via_tunnel(conn);
     }
-}
-
-void ClientApp::resolve_domain_and_route(ProxyConnPtr conn) {
-    auto* req = new uv_getaddrinfo_t;
-    auto* ctx = new RouteDnsCtx{this, conn};
-    req->data = ctx;
-
-    int r = uv_getaddrinfo(loop_, req, ClientApp::on_route_dns_resolved,
-                           conn->target.host.c_str(), nullptr, nullptr);
-    if (r != 0) {
-        TX_WARN("[Proxy] %s:%u DNS route lookup failed: %s",
-                conn->target.host.c_str(), conn->target.port, uv_strerror(r));
-        conn->route = RouteAction::Proxy;
-        connect_via_tunnel(conn);
-        delete ctx;
-        delete req;
-    }
-}
-
-void ClientApp::on_route_dns_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
-    auto* ctx = static_cast<RouteDnsCtx*>(req->data);
-    auto conn = ctx->conn;
-    ClientApp* app = ctx->app;
-
-    if (!conn || !conn->local_session || conn->local_session->is_closed()) {
-        if (res) uv_freeaddrinfo(res);
-        delete ctx;
-        delete req;
-        return;
-    }
-
-    IpAddr selected;
-    bool have_ip = false;
-
-    if (status == 0 && res) {
-        for (auto* ai = res; ai; ai = ai->ai_next) {
-            if (ai->ai_family == AF_INET) {
-                have_ip = sockaddr_to_ipaddr(ai->ai_addr, conn->target.port, selected);
-                break;
-            }
-            if (!have_ip && ai->ai_family == AF_INET6) {
-                have_ip = sockaddr_to_ipaddr(ai->ai_addr, conn->target.port, selected);
-            }
-        }
-    }
-
-    bool private_domain_result = have_ip && selected.is_lan() && conn->target.type == AddrType::Domain;
-
-    if (private_domain_result) {
-        TX_WARN("%s:%u resolved to private/local address %s; applying route rules",
-                conn->target.host.c_str(), conn->target.port,
-                selected.to_string().c_str());
-    }
-
-    RouteDecision decision;
-    if (have_ip) {
-        decision = app->router_.decide(conn->target.host, selected);
-    } else {
-        decision = app->router_.fallback_decision();
-    }
-
-    if (!app->apply_route_decision(conn, decision)) {
-        // block_connection already handled failure response when needed.
-    } else if (conn->route == RouteAction::Direct) {
-        TX_INFO("[Direct] %s:%u resolved to %s (rule -> %s)",
-                conn->target.host.c_str(), conn->target.port,
-                have_ip ? selected.to_string().c_str() : "none",
-                conn->outbound ? conn->outbound->tag.c_str() : "");
-        app->connect_direct(conn);
-    } else {
-        if (status < 0 || !res) {
-            TX_WARN("[Proxy] %s:%u DNS route lookup failed: %s",
-                    conn->target.host.c_str(), conn->target.port,
-                    status < 0 ? uv_strerror(status) : "no results");
-        } else {
-            TX_INFO("[Proxy] %s:%u resolved to %s (rule -> %s)",
-                    conn->target.host.c_str(), conn->target.port,
-                    selected.to_string().c_str(),
-                    conn->outbound ? conn->outbound->tag.c_str() : "");
-        }
-        app->connect_via_tunnel(conn);
-    }
-
-    if (res) uv_freeaddrinfo(res);
-    delete ctx;
-    delete req;
 }
 
 void ClientApp::connect_direct(ProxyConnPtr conn) {
     TX_INFO("[Direct] Connecting to %s:%u", conn->target.host.c_str(), conn->target.port);
 
+    // Track direct flows as well as tunnel flows so Android network changes
+    // can retire every socket bound to the previous physical Network.
+    connections_[conn->session_id] = conn;
+
+    dns_resolver_.resolve_host(conn->target.host, AF_UNSPEC,
+        [this, conn](std::vector<std::string> result) {
+            if (!conn || !conn->local_session || conn->local_session->is_closed()) return;
+            if (result.empty()) {
+                TX_ERROR("Direct DNS failed for %s", conn->target.host.c_str());
+                block_connection(conn);
+                return;
+            }
+            connect_direct_candidates(conn,
+                std::make_shared<std::vector<std::string>>(std::move(result)), 0);
+        });
+}
+
+void ClientApp::connect_direct_candidates(
+    ProxyConnPtr conn, std::shared_ptr<std::vector<std::string>> addresses, size_t index) {
+    if (!conn || !conn->local_session || conn->local_session->is_closed() ||
+        connections_.find(conn->session_id) == connections_.end()) {
+        return;
+    }
+    if (!addresses || index >= addresses->size()) {
+        block_connection(conn);
+        return;
+    }
+
     auto direct = std::make_shared<TcpSession>(loop_, socket_protector_);
     conn->direct_session = direct;
 
-    direct->set_close_callback([this, conn](SessionPtr) {
+    direct->set_close_callback([conn](SessionPtr) {
         if (conn->local_session && !conn->local_session->is_closed()) {
-            conn->local_session->close();
+            // A graceful two-way EOF lets TcpSession close itself only after
+            // its queued response writes and shutdown have completed.
+            if (!(conn->local_eof && conn->remote_eof &&
+                  std::dynamic_pointer_cast<TcpSession>(conn->local_session))) {
+                conn->local_session->close();
+            }
         }
     });
+    direct->set_eof_callback([conn](SessionPtr) {
+        conn->remote_eof = true;
+        if (conn->local_session && !conn->local_session->is_closed()) {
+            conn->local_session->shutdown_write();
+        }
+    });
+    direct->set_error_callback([conn](SessionPtr, int) {
+        if (conn->local_session && !conn->local_session->is_closed())
+            conn->local_session->reset();
+    });
 
-    direct->connect(conn->target.host, conn->target.port,
-        [this, conn, direct](bool success) {
+    direct->connect((*addresses)[index], conn->target.port, kTcpConnectTimeoutMs,
+        [this, conn, direct, addresses, index](bool success) {
+            if (!conn->local_session || conn->local_session->is_closed() ||
+                conn->direct_session != direct ||
+                connections_.find(conn->session_id) == connections_.end()) {
+                direct->set_close_callback(nullptr);
+                if (!direct->is_closed()) direct->close();
+                return;
+            }
             if (!success) {
+                direct->set_close_callback(nullptr);
+                if (index + 1 < addresses->size()) {
+                    connect_direct_candidates(conn, addresses, index + 1);
+                    return;
+                }
                 TX_ERROR("Direct connect failed to %s:%u",
                          conn->target.host.c_str(), conn->target.port);
                 if (conn->socks5) {
@@ -1811,10 +2058,29 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
                     conn->http->build_error_response(502, resp);
                     conn->local_session->send(resp);
                 }
+                if (!conn->socks5 && !conn->http && conn->local_session &&
+                    !conn->local_session->is_closed()) {
+                    conn->local_session->reset();
+                }
                 return;
             }
 
             conn->connected = true;
+            conn->bridge = std::make_shared<TcpFlowBridge>(conn->local_session, direct);
+            std::weak_ptr<TcpFlowBridge> weak_bridge = conn->bridge;
+            direct->set_write_drain_callback([weak_bridge](SessionPtr) {
+                if (auto bridge = weak_bridge.lock()) bridge->on_right_writable();
+            });
+            if (auto local_tcp = std::dynamic_pointer_cast<TcpSession>(conn->local_session)) {
+                local_tcp->set_write_drain_callback([weak_bridge](SessionPtr) {
+                    if (auto bridge = weak_bridge.lock()) bridge->on_left_writable();
+                });
+            } else if (auto local_lwip =
+                       std::dynamic_pointer_cast<LwipTcpStream>(conn->local_session)) {
+                local_lwip->set_writable_callback([weak_bridge]() {
+                    if (auto bridge = weak_bridge.lock()) bridge->on_left_writable();
+                });
+            }
 
             // Send success response to local client
             if (conn->socks5) {
@@ -1831,7 +2097,7 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
             // Flush any data buffered while waiting for connection
             if (!conn->proto_buf.empty()) {
                 size_t bytes = conn->proto_buf.readable();
-                direct->send(conn->proto_buf);
+                conn->bridge->forward_from_left(conn->proto_buf);
                 record_traffic(RouteAction::Direct, true, bytes);
                 conn->proto_buf.clear();
             }
@@ -1840,9 +2106,17 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
             direct->start_read([this, conn](SessionPtr, Buffer& data) {
                 if (conn->local_session && !conn->local_session->is_closed()) {
                     record_traffic(RouteAction::Direct, false, data.readable());
-                    conn->local_session->send(data);
+                    if (conn->bridge) conn->bridge->forward_from_right(data);
                 }
             });
+
+            // EOF can arrive while DNS resolution or connect is pending.
+            // Queue all buffered request bytes before propagating the FIN.
+            if (conn->local_eof && !conn->local_half_close_sent &&
+                !direct->is_closed()) {
+                conn->local_half_close_sent = true;
+                direct->shutdown_write();
+            }
         });
 }
 
@@ -1871,6 +2145,28 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
         return true;
     }
 
+    const std::string server_host = conn->outbound->server_host;
+    dns_resolver_.resolve_host(server_host, AF_UNSPEC,
+        [this, conn](std::vector<std::string> addresses) {
+            if (!conn || !conn->local_session || conn->local_session->is_closed()) return;
+            if (addresses.empty()) {
+                fail_tunnel_connection(conn);
+                return;
+            }
+            connect_tunnel_candidates(conn,
+                std::make_shared<std::vector<std::string>>(std::move(addresses)), 0);
+        });
+    conn->tunnel_connecting = true;
+    return true;
+}
+
+void ClientApp::connect_tunnel_candidates(
+    ProxyConnPtr conn, std::shared_ptr<std::vector<std::string>> addresses, size_t index) {
+    if (!conn || !addresses || index >= addresses->size() || !conn->outbound ||
+        !conn->local_session || conn->local_session->is_closed()) {
+        if (conn) fail_tunnel_connection(conn);
+        return;
+    }
     auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
     conn->tunnel_session = tunnel;
     conn->tunnel_connected = false;
@@ -1878,8 +2174,6 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
     conn->tunnel_handshake_buf.clear();
     conn->tunnel_recv_buf.clear();
     TunnelCodec::cleanse_handshake_state(conn->tunnel_handshake_state);
-    start_tunnel_timer(conn, kTunnelHandshakeTimeoutMs, "handshake");
-
     tunnel->set_close_callback([this, conn, tunnel](SessionPtr) {
         TX_WARN("Tunnel disconnected for session %u", conn->session_id);
         if (conn->tunnel_session == tunnel) {
@@ -1889,9 +2183,15 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
             fail_tunnel_connection(conn);
         }
     });
+    tunnel->set_write_drain_callback([conn](SessionPtr tunnel_session) {
+        if (conn->local_paused_for_tunnel && conn->local_session &&
+            tunnel_session->pending_write_bytes() <= TcpFlowBridge::kLowWatermark) {
+            conn->local_paused_for_tunnel = false;
+            conn->local_session->resume_read();
+        }
+    });
 
-    tunnel->connect(conn->outbound->server_host, conn->outbound->server_port,
-        [this, conn, tunnel](bool success) {
+    auto on_connected = [this, conn, tunnel, addresses, index](bool success) {
             if (!conn || conn->tunnel_session != tunnel ||
                 !conn->local_session || conn->local_session->is_closed()) {
                 if (tunnel && !tunnel->is_closed()) {
@@ -1922,8 +2222,20 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                     fail_tunnel_connection(conn);
                     return;
                 }
-                tunnel->send(hello);
+                if (!tunnel->send(hello)) {
+                    TX_ERROR("Failed to send tunnel ClientHello for session %u",
+                             conn->session_id);
+                    fail_tunnel_connection(conn);
+                    return;
+                }
+                start_tunnel_timer(conn, kTunnelHandshakeTimeoutMs, "handshake");
             } else {
+                tunnel->set_close_callback(nullptr);
+                if (index + 1 < addresses->size()) {
+                    conn->tunnel_session.reset();
+                    connect_tunnel_candidates(conn, addresses, index + 1);
+                    return;
+                }
                 conn->tunnel_connecting = false;
                 conn->tunnel_connected = false;
                 TX_ERROR("Tunnel connect failed to %s:%u for session %u",
@@ -1932,9 +2244,10 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
                          conn->session_id);
                 fail_tunnel_connection(conn);
             }
-        });
-
-    return true;
+        };
+    const uint16_t server_port = conn->outbound->server_port;
+    tunnel->connect((*addresses)[index], server_port, kTcpConnectTimeoutMs,
+                    on_connected);
 }
 
 void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
@@ -2020,6 +2333,24 @@ void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
     TX_INFO("[Proxy] CONNECT established for session %u: %s:%u",
             conn->session_id, conn->target.host.c_str(), conn->target.port);
 
+    std::weak_ptr<ProxyConn> weak_conn = conn;
+    auto resume_tunnel = [weak_conn]() {
+        auto current = weak_conn.lock();
+        if (!current || !current->tunnel_paused_for_local ||
+            !current->local_session || !current->tunnel_session) return;
+        if (current->local_session->pending_write_bytes() <=
+            TcpFlowBridge::kLowWatermark) {
+            current->tunnel_paused_for_local = false;
+            current->tunnel_session->resume_read();
+        }
+    };
+    if (auto local_tcp = std::dynamic_pointer_cast<TcpSession>(conn->local_session)) {
+        local_tcp->set_write_drain_callback([resume_tunnel](SessionPtr) { resume_tunnel(); });
+    } else if (auto local_lwip =
+               std::dynamic_pointer_cast<LwipTcpStream>(conn->local_session)) {
+        local_lwip->set_writable_callback(std::move(resume_tunnel));
+    }
+
     if (conn->socks5) {
         Buffer resp;
         conn->socks5->build_connect_response(true, resp);
@@ -2039,6 +2370,12 @@ void ClientApp::complete_tunnel_connection(ProxyConnPtr conn) {
     if (!conn->proto_buf.empty()) {
         tunnel_send(conn, conn->proto_buf.data(), conn->proto_buf.readable());
         conn->proto_buf.clear();
+    }
+
+    // Preserve a FIN received while the tunnel or remote target was still
+    // connecting. It must follow all buffered application data.
+    if (conn->local_eof && !conn->local_half_close_sent) {
+        tunnel_send_half_close(conn);
     }
 }
 
@@ -2064,12 +2401,15 @@ void ClientApp::fail_tunnel_connection(ProxyConnPtr conn) {
             conn->local_session->send(resp);
         }
         if (!conn->socks5 && !conn->http) {
-            conn->local_session->close();
+            conn->local_session->reset();
         }
         return;
     }
 
-    conn->local_session->close();
+    if (std::dynamic_pointer_cast<LwipTcpStream>(conn->local_session))
+        conn->local_session->reset();
+    else
+        conn->local_session->close();
 }
 
 void ClientApp::close_tunnel_session(ProxyConnPtr conn) {
@@ -2178,7 +2518,19 @@ void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) 
         return;
     }
 
+    if (conn->tunnel_session->pending_write_bytes() + encoded.readable() >
+        TcpFlowBridge::kHardLimit) {
+        if (conn->local_session) conn->local_session->reset();
+        fail_tunnel_connection(conn);
+        return;
+    }
     conn->tunnel_session->send(encoded);
+    if (!conn->local_paused_for_tunnel && conn->local_session &&
+        conn->tunnel_session->pending_write_bytes() >=
+            TcpFlowBridge::kHighWatermark) {
+        conn->local_paused_for_tunnel = true;
+        conn->local_session->pause_read();
+    }
     record_traffic(RouteAction::Proxy, true, len);
 }
 
@@ -2191,6 +2543,32 @@ void ClientApp::tunnel_send_disconnect(ProxyConnPtr conn) {
     Buffer encoded;
     if (conn->tunnel_codec.encode_disconnect(conn->session_id, encoded)) {
         conn->tunnel_session->send(encoded);
+    }
+}
+
+void ClientApp::tunnel_send_half_close(ProxyConnPtr conn) {
+    if (!conn || conn->local_half_close_sent || !conn->connect_result_sent ||
+        !conn->tunnel_connected || !conn->tunnel_session ||
+        conn->tunnel_session->is_closed()) return;
+    Buffer encoded;
+    if (conn->tunnel_codec.encode_half_close(conn->session_id, encoded)) {
+        if (conn->tunnel_session->send(encoded)) {
+            conn->local_half_close_sent = true;
+        }
+    }
+}
+
+void ClientApp::on_local_eof(ProxyConnPtr conn) {
+    if (!conn || conn->local_eof) return;
+    conn->local_eof = true;
+    if (conn->route == RouteAction::Direct) {
+        if (conn->connected && !conn->local_half_close_sent &&
+            conn->direct_session && !conn->direct_session->is_closed()) {
+            conn->local_half_close_sent = true;
+            conn->direct_session->shutdown_write();
+        }
+    } else if (conn->route == RouteAction::Proxy) {
+        tunnel_send_half_close(conn);
     }
 }
 
@@ -2217,7 +2595,18 @@ void ClientApp::on_tunnel_read(ProxyConnPtr conn, Buffer& data) {
                 if (!payload.empty() && conn->local_session &&
                     !conn->local_session->is_closed()) {
                     record_traffic(RouteAction::Proxy, false, payload.readable());
-                    conn->local_session->send(payload);
+                    if (conn->local_session->pending_write_bytes() + payload.readable() >
+                        TcpFlowBridge::kHardLimit || !conn->local_session->send(payload)) {
+                        conn->local_session->reset();
+                        fail_tunnel_connection(conn);
+                        return;
+                    }
+                    if (!conn->tunnel_paused_for_local && conn->tunnel_session &&
+                        conn->local_session->pending_write_bytes() >=
+                            TcpFlowBridge::kHighWatermark) {
+                        conn->tunnel_paused_for_local = true;
+                        conn->tunnel_session->pause_read();
+                    }
                 }
                 break;
 
@@ -2236,6 +2625,13 @@ void ClientApp::on_tunnel_read(ProxyConnPtr conn, Buffer& data) {
             case TunnelCmd::Disconnect:
                 TX_DEBUG("Tunnel disconnect for session %u", session_id);
                 fail_tunnel_connection(conn);
+                break;
+
+            case TunnelCmd::HalfClose:
+                conn->remote_eof = true;
+                if (conn->local_session && !conn->local_session->is_closed()) {
+                    conn->local_session->shutdown_write();
+                }
                 break;
 
             default:
@@ -2260,9 +2656,10 @@ void ClientApp::on_proxy_close(ProxyConnPtr conn) {
         conn->direct_session->close();
     }
 
+    connections_.erase(conn->session_id);
+
     if (conn->route == RouteAction::Proxy) {
         tunnel_send_disconnect(conn);
-        connections_.erase(conn->session_id);
         close_tunnel_session(conn);
     }
 }

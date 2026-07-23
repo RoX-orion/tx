@@ -21,9 +21,39 @@ extern "C" {
 typedef void* tx_handle_t;
 
 // Called synchronously on the client network thread after an outbound socket
-// is created and before it is used. Do not close the fd or retain ownership of
-// it. Return non-zero when the socket was successfully protected.
+// is created and before it is used. The hook must bind the socket to the
+// selected physical Android Network and exempt it from the VPN. Do not close
+// the fd or retain ownership of it. Return non-zero only when both operations
+// succeeded and the selected Network remained current.
 typedef int (*tx_socket_protect_fn)(int socket_fd, void* user_data);
+
+#define TX_ANDROID_NETWORK_HOOKS_VERSION 1u
+#define TX_ANDROID_MAX_RESOLVED_ADDRESSES 16u
+
+typedef struct {
+    int family;                 // AF_INET or AF_INET6
+    char address[46];           // Numeric address, NUL terminated
+} tx_android_address_t;
+
+typedef int (*tx_android_resolve_host_fn)(const char* host, int family,
+                                          tx_android_address_t* addresses,
+                                          unsigned int capacity,
+                                          void* user_data);
+typedef int (*tx_android_query_dns_fn)(const unsigned char* query,
+                                       unsigned int query_length,
+                                       unsigned char* response,
+                                       unsigned int response_capacity,
+                                       unsigned int* response_length,
+                                       void* user_data);
+
+typedef struct {
+    unsigned int struct_size;
+    unsigned int version;
+    tx_socket_protect_fn protect_socket;
+    tx_android_resolve_host_fn resolve_host;
+    tx_android_query_dns_fn query_dns;
+    void* user_data;
+} tx_android_network_hooks_t;
 
 // Client configuration
 typedef struct {
@@ -47,15 +77,25 @@ typedef struct {
 // Start the client. Returns handle or NULL on failure.
 TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
 
-// Start the client with a VpnService TUN fd. The fd must remain valid for the
-// lifetime of the client.
+// Start the client with a VpnService TUN fd. Native code takes ownership even
+// when startup fails and closes it before this client is stopped.
 TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd);
 
-// Start the Android client with a VpnService socket-protection callback.
+// Start the Android client with a physical-network bind + VPN-exemption callback.
+// Native code takes ownership of tun_fd, including startup-failure paths.
 // protect_user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
                                            tx_socket_protect_fn protect_fn,
                                            void* protect_user_data);
+
+// Versioned Android network integration. Hooks are copied during startup, but
+// hooks->user_data must remain valid until tx_client_stop() returns.
+TX_API tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
+                                              const tx_android_network_hooks_t* hooks);
+
+// Cancel work tied to the previous Android Network and close existing outbound
+// sockets. Applications reconnect while fake-IP mappings remain intact.
+TX_API void tx_client_notify_network_changed(tx_handle_t handle);
 
 // Stop the client.
 TX_API void tx_client_stop(tx_handle_t handle);

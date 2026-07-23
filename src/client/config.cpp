@@ -6,6 +6,8 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <algorithm>
+#include <cstdlib>
+#include "tx/common/network.h"
 #include <sys/stat.h>
 
 using json = nlohmann::json;
@@ -46,6 +48,19 @@ static std::string join_path(const std::string& base, const std::string& leaf) {
 
 static std::string parent_dir(const std::string& path) {
     return dirname_of(path);
+}
+
+static bool has_valid_ip_cidr(const std::string& cidr) {
+    const size_t slash = cidr.find('/');
+    if (slash == std::string::npos) return false;
+    char* end = nullptr;
+    long prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
+    if (!end || *end) return false;
+    uint8_t bytes[16];
+    const std::string host = cidr.substr(0, slash);
+    if (inet_pton(AF_INET, host.c_str(), bytes) == 1) return prefix >= 0 && prefix <= 32;
+    if (inet_pton(AF_INET6, host.c_str(), bytes) == 1) return prefix >= 0 && prefix <= 128;
+    return false;
 }
 
 static std::string resolve_config_path(const std::string& config_path,
@@ -97,15 +112,45 @@ bool ClientConfig::validate() const {
         return false;
     }
 
+    if (router.domain_strategy != "AsIs") {
+        TX_ERROR("routing.domainStrategy must be AsIs (unsupported value: %s)",
+                 router.domain_strategy.c_str());
+        return false;
+    }
+
     if (tun_enabled) {
         if (tun_mtu <= 0) {
             TX_ERROR("tun.mtu must be positive");
             return false;
         }
-        if (tun_prefix < 0 || tun_prefix > 32) {
-            TX_ERROR("tun.prefix must be between 0 and 32");
+        if (tun_addresses.empty()) {
+            TX_ERROR("tun.addresses must contain at least one CIDR");
             return false;
         }
+        for (const auto& address : tun_addresses) {
+            if (!has_valid_ip_cidr(address)) {
+                TX_ERROR("Invalid TUN address CIDR: %s", address.c_str());
+                return false;
+            }
+        }
+        if (tun_tcp_stack != "lwip" && tun_tcp_stack != "system") {
+            TX_ERROR("tun.tcp_stack must be lwip or system");
+            return false;
+        }
+        if (tun_udp_stack != "lwip") {
+            TX_ERROR("tun.udp_stack must be lwip");
+            return false;
+        }
+        if (tun_tcp_stack == "lwip" && tun_auto_redirect) {
+            TX_ERROR("tun.auto_redirect cannot be enabled with tcp_stack=lwip");
+            return false;
+        }
+#if !defined(TX_PLATFORM_LINUX)
+        if (tun_tcp_stack == "system") {
+            TX_ERROR("tun.tcp_stack=system is only supported on Linux");
+            return false;
+        }
+#endif
         if (tun_auto_redirect) {
             if (tun_redirect_port == 0) {
                 TX_ERROR("tun.redirect_port must be non-zero when auto_redirect is enabled");
@@ -116,6 +161,14 @@ bool ClientConfig::validate() const {
                 return false;
             }
         }
+    }
+    if (dns_mode != "fake-ip") {
+        TX_ERROR("dns.mode must be fake-ip");
+        return false;
+    }
+    if (dns_cache_ttl == 0 || dns_cache_ttl > 86400) {
+        TX_ERROR("dns.cache_ttl must be between 1 and 86400 seconds");
+        return false;
     }
 
     for (const auto& outbound : outbounds) {
@@ -232,6 +285,8 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
         // Routing config
         if (j.contains("routing")) {
             auto& routing = j["routing"];
+            config.router.domain_strategy =
+                routing.value("domainStrategy", config.router.domain_strategy);
             if (routing.contains("geoip_path")) {
                 config.router.geoip_path =
                     resolve_config_path(path, routing["geoip_path"].get<std::string>());
@@ -280,21 +335,52 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             config.tun_mtu = tun.value("mtu", config.tun_mtu);
             config.tun_name = tun.value("name", config.tun_name);
             config.tun_address = tun.value("address", config.tun_address);
-            config.tun_prefix = tun.value("prefix", config.tun_prefix);
+            if (tun.contains("addresses")) {
+                config.tun_addresses.clear();
+                for (const auto& address : tun["addresses"])
+                    config.tun_addresses.push_back(address.get<std::string>());
+                for (const auto& address : config.tun_addresses) {
+                    if (address.find(':') == std::string::npos) {
+                        config.tun_address = address;
+                        break;
+                    }
+                }
+            } else if (tun.contains("address")) {
+                config.tun_addresses[0] = config.tun_address;
+            }
             config.tun_auto_config = tun.value("auto_config", config.tun_auto_config);
             config.tun_auto_route = tun.value("auto_route", config.tun_auto_route);
             config.tun_auto_redirect = tun.value("auto_redirect", config.tun_auto_redirect);
             config.tun_redirect_port = tun.value("redirect_port", config.tun_redirect_port);
             config.tun_redirect_mark = tun.value("redirect_mark", config.tun_redirect_mark);
+            config.tun_bypass_mark = tun.value("bypass_mark", config.tun_bypass_mark);
+            config.tun_route_table = tun.value("route_table", config.tun_route_table);
+            config.tun_rule_priority = tun.value("rule_priority", config.tun_rule_priority);
             if (tun.contains("routes")) {
                 config.tun_routes.clear();
                 for (auto& route : tun["routes"]) {
                     config.tun_routes.push_back(route.get<std::string>());
                 }
             }
-            config.tun_mode = to_lower(tun.value("mode", config.tun_mode));
+            if (tun.contains("mode")) {
+                config.tun_mode = to_lower(tun.value("mode", config.tun_mode));
+                TX_WARN("tun.mode is deprecated and no longer selects the data plane");
+            }
             config.tun_tcp_stack = to_lower(tun.value("tcp_stack", config.tun_tcp_stack));
             config.tun_udp_stack = to_lower(tun.value("udp_stack", config.tun_udp_stack));
+        }
+
+        if (j.contains("dns")) {
+            const auto& dns = j["dns"];
+            config.dns_mode = to_lower(dns.value("mode", config.dns_mode));
+            config.dns_fake_ipv4_range = dns.value("fake_ipv4_range", config.dns_fake_ipv4_range);
+            config.dns_fake_ipv6_range = dns.value("fake_ipv6_range", config.dns_fake_ipv6_range);
+            config.dns_cache_ttl = dns.value("cache_ttl", config.dns_cache_ttl);
+            if (dns.contains("upstreams")) {
+                config.dns_upstreams.clear();
+                for (const auto& upstream : dns["upstreams"])
+                    config.dns_upstreams.push_back(upstream.get<std::string>());
+            }
         }
 
         if (j.contains("geo") || j.contains("server")) {

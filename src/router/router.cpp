@@ -31,6 +31,11 @@ Router::Router() : loaded_(false) {}
 Router::~Router() = default;
 
 bool Router::load(const RouterConfig& config) {
+    if (config.domain_strategy != "AsIs") {
+        TX_ERROR("Router only supports domainStrategy=AsIs (got: %s)",
+                 config.domain_strategy.c_str());
+        return false;
+    }
     config_ = config;
     for (auto& rule : config_.rules) {
         for (auto& domain : rule.domains) {
@@ -56,34 +61,45 @@ bool Router::load(const RouterConfig& config) {
     }
 
     loaded_ = true;
-    TX_INFO("Router loaded: %zu rules", config_.rules.size());
+    TX_INFO("Router loaded: %zu rules, domainStrategy=%s", config_.rules.size(),
+            config_.domain_strategy.c_str());
     return true;
 }
 
 RouteDecision Router::decide(const std::string& host, const IpAddr& ip) const {
-    const std::string lower_host = to_lower_ascii(host);
-    for (const auto& rule : config_.rules) {
-        if (!lower_host.empty() && match_domain_rule(lower_host, rule)) {
-            TX_DEBUG("Route domain match: %s -> %s",
-                     lower_host.c_str(), rule.outbound_tag.c_str());
-            return RouteDecision{rule.outbound_tag, true};
-        }
-        if (match_ip_rule(ip, rule)) {
-            TX_DEBUG("Route IP match: %s -> %s",
-                     ip.to_string().c_str(), rule.outbound_tag.c_str());
-            return RouteDecision{rule.outbound_tag, true};
-        }
+    // Keep this compatibility overload AsIs: a supplied domain is authoritative
+    // and must not fall through to the resolved IP.
+    if (!host.empty()) {
+        RouteDecision decision = decide_by_host(host);
+        return decision.matched ? decision : fallback_decision();
+    }
+    return decide_by_ip(ip);
+}
+
+RouteDecision Router::decide_target(const TargetAddr& target) const {
+    if (target.type == AddrType::Domain) {
+        RouteDecision decision = decide_by_host(target.host);
+        if (!decision.matched) decision = fallback_decision();
+        TX_DEBUG("[AsIs] target=domain value=%s rule=%s outboundTag=%s",
+                 target.host.c_str(), decision.matched ? "matched" : "fallback",
+                 decision.outbound_tag.c_str());
+        return decision;
     }
 
-    TX_DEBUG("No match for %s (%s) -> fallback",
-             host.c_str(), ip.to_string().c_str());
-    return fallback_decision();
+    const IpAddr ip = IpAddr::from_string(target.host, target.port);
+    RouteDecision decision = decide_by_ip(ip);
+    TX_DEBUG("[AsIs] target=%s value=%s rule=%s outboundTag=%s",
+             target.type == AddrType::IPv6 ? "ipv6" : "ipv4", target.host.c_str(),
+             decision.matched ? "matched" : "fallback", decision.outbound_tag.c_str());
+    return decision;
 }
 
 RouteDecision Router::decide_by_host(const std::string& host) const {
     const std::string lower_host = to_lower_ascii(host);
     for (const auto& rule : config_.rules) {
         if (match_domain_rule(lower_host, rule)) {
+            TX_DEBUG("[AsIs] domain rule matched: %s -> outboundTag=%s",
+                     lower_host.c_str(), rule.outbound_tag.c_str());
             return RouteDecision{rule.outbound_tag, true};
         }
     }
@@ -94,6 +110,8 @@ RouteDecision Router::decide_by_host(const std::string& host) const {
 RouteDecision Router::decide_by_ip(const IpAddr& ip) const {
     for (const auto& rule : config_.rules) {
         if (match_ip_rule(ip, rule)) {
+            TX_DEBUG("[AsIs] IP rule matched: %s -> outboundTag=%s",
+                     ip.to_string().c_str(), rule.outbound_tag.c_str());
             return RouteDecision{rule.outbound_tag, true};
         }
     }

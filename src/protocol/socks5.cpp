@@ -2,7 +2,7 @@
 #include "tx/common/endian.h"
 #include "tx/common/log.h"
 #include <cstring>
-#include <arpa/inet.h>
+#include "tx/common/network.h"
 
 namespace tx {
 

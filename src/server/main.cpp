@@ -38,6 +38,11 @@ static void on_fatal_signal(int signum) {
 }
 
 static void install_crash_handlers() {
+#ifdef SIGPIPE
+    // A peer can disappear while data is queued. Surface that through the
+    // socket error path instead of terminating every tunnel client.
+    signal(SIGPIPE, SIG_IGN);
+#endif
     signal(SIGSEGV, on_fatal_signal);
     signal(SIGABRT, on_fatal_signal);
 #ifdef SIGBUS
@@ -116,6 +121,8 @@ int main(int argc, char* argv[]) {
     }, SIGTERM);
     sigint.data = &app;
     sigterm.data = &app;
+    uv_unref(reinterpret_cast<uv_handle_t*>(&sigint));
+    uv_unref(reinterpret_cast<uv_handle_t*>(&sigterm));
 
     TX_INFO("TX Server running. Press Ctrl+C to stop.");
     int ret = app.run();

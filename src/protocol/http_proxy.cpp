@@ -3,7 +3,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
-#include <arpa/inet.h>
+#include "tx/common/network.h"
 
 namespace tx {
 

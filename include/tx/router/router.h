@@ -22,6 +22,8 @@ struct RouteDecision {
 
 // Routing configuration
 struct RouterConfig {
+    // Domain names are matched as-is and never resolved for a second IP-rule pass.
+    std::string domain_strategy = "AsIs";
     std::string geoip_path;
     std::string geosite_path;
     std::vector<RouteRule> rules;
@@ -38,6 +40,11 @@ public:
 
     // Make routing decision
     RouteDecision decide(const std::string& host, const IpAddr& resolved_ip) const;
+
+    // Apply the configured AsIs policy to a protocol target. Domains only use
+    // domain rules and then the explicit last-rule fallback; IP literals only
+    // use IP rules.
+    RouteDecision decide_target(const TargetAddr& target) const;
 
     // Overload: when we only have hostname (no IP yet)
     RouteDecision decide_by_host(const std::string& host) const;

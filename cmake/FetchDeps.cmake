@@ -124,5 +124,44 @@ function(tx_find_nlohmann_json)
         "NLOHMANN_JSON_INCLUDE_DIR to CMake, or configure with TX_FETCH_DEPS=ON.")
 endfunction()
 
+function(tx_find_hev_lwip)
+    if(TARGET tx::hev_lwip)
+        return()
+    endif()
+
+    FetchContent_Declare(
+        hev_lwip
+        URL https://github.com/heiher/lwip/archive/cd3007df7047555399a04e6e40214accfae0d324.tar.gz
+        URL_HASH SHA256=83a7154efaf0a441d79bf208613943bc9f013c5250dcd3794a043dd76de5b8fe
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(hev_lwip)
+
+    file(GLOB HEV_LWIP_CORE_SOURCES
+        "${hev_lwip_SOURCE_DIR}/src/core/*.c"
+        "${hev_lwip_SOURCE_DIR}/src/core/ipv4/*.c"
+        "${hev_lwip_SOURCE_DIR}/src/core/ipv6/*.c"
+    )
+    # altcp is not used; raw tcp*.c is required by the unified TUN frontend.
+    list(FILTER HEV_LWIP_CORE_SOURCES EXCLUDE REGEX "/altcp.*\\.c$")
+    add_library(tx_hev_lwip STATIC ${HEV_LWIP_CORE_SOURCES})
+    add_library(tx::hev_lwip ALIAS tx_hev_lwip)
+    target_include_directories(tx_hev_lwip
+        PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/net/lwip/port"
+            "${hev_lwip_SOURCE_DIR}/src/include"
+            "${hev_lwip_SOURCE_DIR}/src/ports/include"
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(tx_hev_lwip PRIVATE -w)
+    endif()
+    if(ANDROID)
+        # Match HEV lwIP's Android.mk and avoid NDK libc type redefinitions.
+        target_compile_definitions(tx_hev_lwip PUBLIC
+            FD_SET_DEFINED SOCKLEN_T_DEFINED)
+    endif()
+endfunction()
+
 tx_find_libuv()
 tx_find_nlohmann_json()
+tx_find_hev_lwip()

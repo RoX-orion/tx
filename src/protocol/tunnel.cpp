@@ -7,7 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
-#include <arpa/inet.h>
+#include "tx/common/network.h"
 #include <algorithm>
 #include <cstring>
 
@@ -27,7 +27,9 @@ constexpr size_t TunnelCodec::kHandshakeSize;
 
 namespace {
 
-static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'H', '2'};
+// v2 uses a distinct handshake marker so a v1 peer is rejected before keys
+// are established rather than after the first encrypted frame.
+static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'V', '2'};
 static constexpr uint8_t kClientHello = 0x01;
 static constexpr uint8_t kServerHello = 0x02;
 static constexpr size_t kNoncePrefixLen = 4;
@@ -389,6 +391,11 @@ bool TunnelCodec::encode_disconnect(SessionId session_id, Buffer& out) {
     return encode(TunnelCmd::Disconnect, session_id, dummy, nullptr, 0, out);
 }
 
+bool TunnelCodec::encode_half_close(SessionId session_id, Buffer& out) {
+    TargetAddr dummy;
+    return encode(TunnelCmd::HalfClose, session_id, dummy, nullptr, 0, out);
+}
+
 bool TunnelCodec::encode_connect_result(SessionId session_id, bool success, Buffer& out) {
     uint8_t result = success ? 1 : 0;
     TargetAddr dummy;
@@ -471,6 +478,7 @@ bool TunnelCodec::decode(Buffer& in,
     if (cmd != TunnelCmd::Connect &&
         cmd != TunnelCmd::Data &&
         cmd != TunnelCmd::Disconnect &&
+        cmd != TunnelCmd::HalfClose &&
         cmd != TunnelCmd::ConnectResult &&
         cmd != TunnelCmd::UdpPacket) {
         TX_ERROR("Unknown tunnel command: %u", static_cast<unsigned>(cmd));
@@ -590,6 +598,7 @@ bool TunnelCodec::parse_client_hello(const std::vector<uint8_t>& psk,
     if (len != kHandshakeSize ||
         memcmp(data, kHandshakeMagic, sizeof(kHandshakeMagic)) != 0 ||
         data[sizeof(kHandshakeMagic)] != kClientHello) {
+        TX_ERROR("Rejected tunnel client hello with unsupported protocol version");
         return false;
     }
 
@@ -675,6 +684,7 @@ bool TunnelCodec::parse_server_hello(const std::vector<uint8_t>& psk,
         len != kHandshakeSize ||
         memcmp(data, kHandshakeMagic, sizeof(kHandshakeMagic)) != 0 ||
         data[sizeof(kHandshakeMagic)] != kServerHello) {
+        TX_ERROR("Rejected tunnel server hello with unsupported protocol version");
         return false;
     }
 

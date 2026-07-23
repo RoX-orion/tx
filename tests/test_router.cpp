@@ -62,16 +62,61 @@ static void test_host_routing() {
     printf("  test_host_routing... ");
     tx::Router router;
     tx::RouterConfig config;
+    tx::RouteRule direct_domain;
+    direct_domain.domains.push_back("example.cn");
+    direct_domain.outbound_tag = "direct-out";
+    tx::RouteRule blocked_domain;
+    blocked_domain.domains.push_back("blocked.example");
+    blocked_domain.outbound_tag = "block";
+    tx::RouteRule private_ip;
+    private_ip.ips.push_back("geoip:private");
+    private_ip.outbound_tag = "direct-out";
+    tx::RouteRule fallback;
+    fallback.outbound_tag = "proxy-out";
+    config.rules.push_back(direct_domain);
+    config.rules.push_back(blocked_domain);
+    config.rules.push_back(private_ip);
+    config.rules.push_back(fallback);
+    assert(router.load(config));
+
+    assert(router.decide_by_host("www.example.cn").outbound_tag == "direct-out");
+    assert(router.decide_by_host("blocked.example").outbound_tag == "block");
+    assert(!router.decide_by_host("example.com").matched);
+
+    // AsIs must not re-route an unmatched domain through its resolved private IP.
+    assert(router.decide("example.com", tx::IpAddr::from_ipv4(192, 168, 1, 2)).outbound_tag == "proxy-out");
+
+    tx::TargetAddr domain;
+    domain.type = tx::AddrType::Domain;
+    domain.host = "unmatched.example";
+    domain.port = 443;
+    const tx::RouteDecision domain_decision = router.decide_target(domain);
+    assert(domain_decision.outbound_tag == "proxy-out");
+    assert(!domain_decision.matched);
+
+    domain.host = "blocked.example";
+    const tx::RouteDecision block_decision = router.decide_target(domain);
+    assert(block_decision.outbound_tag == "block");
+    assert(block_decision.matched);
+
+    tx::TargetAddr literal;
+    literal.type = tx::AddrType::IPv4;
+    literal.host = "192.168.1.2";
+    literal.port = 443;
+    assert(router.decide_target(literal).outbound_tag == "direct-out");
+
+    printf("OK\n");
+}
+
+static void test_rejects_non_asis_strategy() {
+    printf("  test_rejects_non_asis_strategy... ");
+    tx::Router router;
+    tx::RouterConfig config;
+    config.domain_strategy = "IPIfNonMatch";
     tx::RouteRule fallback;
     fallback.outbound_tag = "proxy-out";
     config.rules.push_back(fallback);
-    router.load(config);
-
-    // Host-only decisions only report domain-rule matches; fallback is applied
-    // after IP routing or by full host+IP decisions.
-    assert(!router.decide_by_host("example.com").matched);
-    assert(router.decide("example.com", tx::IpAddr::from_ipv4(8, 8, 8, 8)).outbound_tag == "proxy-out");
-
+    assert(!router.load(config));
     printf("OK\n");
 }
 
@@ -80,6 +125,7 @@ int main() {
     test_lan_detection();
     test_public_ip();
     test_host_routing();
+    test_rejects_non_asis_strategy();
     printf("All router tests passed!\n");
     return 0;
 }

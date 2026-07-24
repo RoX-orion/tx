@@ -2,6 +2,7 @@
 #include "tx/common/log.h"
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 #include <algorithm>
 #include "tx/common/network.h"
 
@@ -31,6 +32,18 @@ static void set_addr_type(TargetAddr& target) {
     } else {
         target.type = AddrType::Domain;
     }
+}
+
+static bool parse_port(const std::string& text, uint16_t& port) {
+    if (text.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != '\0' || value == 0 || value > 65535) {
+        return false;
+    }
+    port = static_cast<uint16_t>(value);
+    return true;
 }
 
 } // namespace
@@ -131,7 +144,10 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
                 }
                 target_.host = host_port.substr(1, close - 1);
                 if (close + 1 < host_port.size() && host_port[close + 1] == ':') {
-                    target_.port = static_cast<uint16_t>(atoi(host_port.substr(close + 2).c_str()));
+                    if (!parse_port(host_port.substr(close + 2), target_.port)) {
+                        state_ = State::Error;
+                        return true;
+                    }
                 } else {
                     target_.port = method == "CONNECT" ? 443 : 80;
                 }
@@ -139,7 +155,10 @@ bool HttpProxyHandler::try_parse_request(const uint8_t* data, size_t len) {
                 size_t colon_pos = host_port.rfind(':');
                 if (colon_pos != std::string::npos) {
                     target_.host = host_port.substr(0, colon_pos);
-                    target_.port = static_cast<uint16_t>(atoi(host_port.substr(colon_pos + 1).c_str()));
+                    if (!parse_port(host_port.substr(colon_pos + 1), target_.port)) {
+                        state_ = State::Error;
+                        return true;
+                    }
                 } else {
                     target_.host = host_port;
                     target_.port = method == "CONNECT" ? 443 : 80;

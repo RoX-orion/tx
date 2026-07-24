@@ -107,8 +107,8 @@ int main(int argc, char* argv[]) {
 
     // Use libuv signal watchers
     uv_signal_t sigint, sigterm;
-    uv_signal_init(uv_default_loop(), &sigint);
-    uv_signal_init(uv_default_loop(), &sigterm);
+    uv_signal_init(app.loop(), &sigint);
+    uv_signal_init(app.loop(), &sigterm);
     uv_signal_start(&sigint, [](uv_signal_t* handle, int signum) {
         TX_INFO("Caught signal %d, shutting down...", signum);
         static_cast<tx::ServerApp*>(handle->data)->stop();
@@ -131,6 +131,7 @@ int main(int argc, char* argv[]) {
     uv_signal_stop(&sigterm);
     uv_close(reinterpret_cast<uv_handle_t*>(&sigint), nullptr);
     uv_close(reinterpret_cast<uv_handle_t*>(&sigterm), nullptr);
+    uv_run(app.loop(), UV_RUN_NOWAIT);
 
     TX_INFO("TX Server stopped.");
     return ret;

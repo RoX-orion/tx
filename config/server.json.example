@@ -6,6 +6,16 @@
     "udp": {
         "idle_timeout": 300
     },
+    "limits": {
+        "max_clients": 1024,
+        "max_unauthenticated_per_ip": 32,
+        "max_new_clients_per_second": 128,
+        "max_tcp_outbounds_per_client": 1024,
+        "max_udp_flows_per_client": 4096,
+        "handshake_timeout": 8,
+        "connect_timeout": 10,
+        "max_client_rate_mbps": 64
+    },
     "secret": "uuid-v4:your-uuid-v4",
     "cipher": "aes-256-gcm",
     "log_level": "info"

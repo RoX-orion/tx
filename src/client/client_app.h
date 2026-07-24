@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <deque>
 #include <atomic>
@@ -42,6 +43,10 @@ public:
 
     // Run the event loop (blocks)
     int run();
+
+    // The application owns this loop. Command-line signal watchers must use
+    // it instead of uv_default_loop().
+    uv_loop_t* loop() const { return loop_; }
 
     // Stop the event loop
     void stop();
@@ -85,6 +90,7 @@ private:
         bool                 remote_eof = false;
         bool                 local_paused_for_tunnel = false;
         bool                 tunnel_paused_for_local = false;
+        bool                 admitted = false;
     };
     using ProxyConnPtr = std::shared_ptr<ProxyConn>;
 
@@ -109,6 +115,8 @@ private:
         uint64_t lwip_flow_id = 0;
         DirectUdpRelay* direct_relay = nullptr;
         uint64_t last_activity_ms = 0;
+        const OutboundConfig* outbound = nullptr;
+        size_t pending_proxy_bytes = 0;
         bool proxied = false;
     };
 
@@ -122,13 +130,18 @@ private:
         bool connected = false;
         bool connecting = false;
         std::deque<PendingUdpPacket> pending;
+        size_t pending_bytes = 0;
     };
+    using UdpTunnelPtr = std::shared_ptr<UdpTunnel>;
 
     // Accept handlers for HTTP and SOCKS5 listeners
     void on_http_accept(SessionPtr session);
     void on_socks5_accept(SessionPtr session);
     void on_proxy_read(ProxyConnPtr conn, Buffer& data);
     void on_proxy_close(ProxyConnPtr conn);
+    bool admit_proxy_connection(ProxyConnPtr conn);
+    SessionId allocate_session_id();
+    void release_session_id(SessionId session_id);
 
     // Target resolved callback (from SOCKS5/HTTP CONNECT parsing)
     void on_target_resolved(ProxyConnPtr conn);
@@ -176,10 +189,12 @@ private:
     bool start_proxy_listeners();
     bool start_udp_listener();
     void stop_udp_listener();
-    bool ensure_udp_tunnel();
+    UdpTunnelPtr get_udp_tunnel(const OutboundConfig* outbound);
+    bool ensure_udp_tunnel(const UdpTunnelPtr& tunnel);
     void connect_udp_tunnel_candidates(
+        const UdpTunnelPtr& tunnel,
         std::shared_ptr<std::vector<std::string>> addresses, size_t index);
-    void send_udp_packet(SessionId sid, const TargetAddr& target,
+    void send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid, const TargetAddr& target,
                          const uint8_t* data, size_t len);
     bool ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
                                  int target_family);
@@ -194,10 +209,11 @@ private:
     void send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr& source,
                                    const uint8_t* data, size_t len,
                                    RouteAction route);
-    void flush_pending_udp_packets();
-    void on_udp_tunnel_handshake_read(Buffer& data);
-    void on_udp_tunnel_read(Buffer& data);
-    void close_udp_tunnel();
+    void flush_pending_udp_packets(const UdpTunnelPtr& tunnel);
+    void on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer& data);
+    void on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data);
+    void close_udp_tunnel(const UdpTunnelPtr& tunnel);
+    void close_all_udp_tunnels();
     static void on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
     static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
                             const struct sockaddr* addr, unsigned flags);
@@ -234,7 +250,12 @@ private:
     static void on_network_async(uv_async_t* handle);
 
     // ---- Members ----
+    // Keep the storage before every loop-bound member so it outlives their
+    // destructors. Each app instance needs a private loop: libuv handles
+    // cannot be driven concurrently from a shared default loop.
+    std::unique_ptr<uv_loop_t> owned_loop_;
     uv_loop_t*         loop_;
+    bool               loop_closed_;
     uv_async_t         stop_async_;
     uv_async_t         network_async_;
     bool               stop_async_initialized_;
@@ -262,7 +283,7 @@ private:
     std::unique_ptr<PlatformTunDevice> tun_device_;
     LwipUdpStack       lwip_udp_stack_;
     std::vector<uint8_t> tun_read_buf_;
-    UdpTunnel          udp_tunnel_;
+    std::unordered_map<std::string, UdpTunnelPtr> udp_tunnels_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;
     uv_timer_t         udp_cleanup_timer_;
@@ -271,6 +292,8 @@ private:
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;
     SessionId          next_session_id_;
+    std::unordered_set<SessionId> active_session_ids_;
+    size_t             active_proxy_connections_ = 0;
 
     std::atomic<uint64_t> direct_upload_bytes_;
     std::atomic<uint64_t> direct_download_bytes_;

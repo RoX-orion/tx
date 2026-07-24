@@ -2,6 +2,7 @@
 #include "tx/common/endian.h"
 
 #include <algorithm>
+#include <chrono>
 #include "tx/common/network.h"
 #include <cctype>
 #include <cstring>
@@ -30,6 +31,12 @@ std::string lower(std::string value) {
     return value;
 }
 
+uint64_t now_seconds() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<seconds>(
+        steady_clock::now().time_since_epoch()).count());
+}
+
 } // namespace
 
 FakeIpDns::FakeIpDns() {
@@ -40,13 +47,13 @@ FakeIpDns::FakeIpDns() {
 bool FakeIpDns::configure(const std::string& ipv4_range,
                           const std::string& ipv6_range,
                           uint32_t ttl_seconds,
-                          std::string& error) {
+                          std::string& error, size_t capacity) {
     std::string host;
     long prefix = 0;
     in_addr address4;
-    if (!parse_prefix(ipv4_range, host, prefix) || prefix < 8 || prefix > 30 ||
+    if (!parse_prefix(ipv4_range, host, prefix) || prefix < 8 || prefix > 29 ||
         inet_pton(AF_INET, host.c_str(), &address4) != 1) {
-        error = "dns.fake_ipv4_range must be an IPv4 CIDR with prefix /8 through /30";
+        error = "dns.fake_ipv4_range must be an IPv4 CIDR with prefix /8 through /29";
         return false;
     }
     in6_addr address6;
@@ -56,39 +63,116 @@ bool FakeIpDns::configure(const std::string& ipv4_range,
         error = "dns.fake_ipv6_range must be an IPv6 CIDR with prefix /32 through /96";
         return false;
     }
+    if (capacity == 0) {
+        error = "fake-IP DNS cache capacity must be positive";
+        return false;
+    }
     ipv4_prefix_ = static_cast<uint8_t>(prefix);
     const uint32_t mask = prefix == 0 ? 0 : 0xffffffffu << (32 - prefix);
     ipv4_network_ = ntohl(address4.s_addr) & mask;
     std::memcpy(ipv6_prefix_, &address6, 16);
     ipv6_prefix_bits_ = static_cast<uint8_t>(prefix6);
     ttl_ = ttl_seconds ? ttl_seconds : 60;
+    capacity_ = capacity;
     // The network address, TUN gateway (.1), DNS (.2), and .3 are reserved.
     next_ipv4_ = 4;
     next_ipv6_ = 4;
     forward_.clear();
     reverse_.clear();
+    lru_.clear();
     return true;
 }
 
 std::string FakeIpDns::allocate_ipv4() {
-    const uint32_t capacity = (1u << (32 - ipv4_prefix_)) - 1;
-    if (next_ipv4_ >= capacity) return std::string();
-    in_addr address;
-    address.s_addr = htonl(ipv4_network_ + next_ipv4_++);
-    char text[INET_ADDRSTRLEN] = {};
-    return inet_ntop(AF_INET, &address, text, sizeof(text)) ? text : std::string();
+    const uint64_t host_count = 1ULL << (32 - ipv4_prefix_);
+    // Reserve network, gateway, DNS and .3; do not use the broadcast address.
+    const uint64_t first = 4;
+    const uint64_t limit = host_count - 1;
+    if (limit <= first) return std::string();
+    for (uint64_t attempts = 0; attempts < limit - first; ++attempts) {
+        if (next_ipv4_ < first || next_ipv4_ >= limit) next_ipv4_ = static_cast<uint32_t>(first);
+        const uint32_t host = next_ipv4_++;
+        in_addr address;
+        address.s_addr = htonl(ipv4_network_ + host);
+        char text[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &address, text, sizeof(text)) &&
+            reverse_.find(text) == reverse_.end()) {
+            return text;
+        }
+    }
+    return std::string();
 }
 
 std::string FakeIpDns::allocate_ipv6() {
-    uint8_t bytes[16];
-    std::memcpy(bytes, ipv6_prefix_, 16);
-    const uint32_t value = next_ipv6_++;
-    bytes[12] = static_cast<uint8_t>(value >> 24);
-    bytes[13] = static_cast<uint8_t>(value >> 16);
-    bytes[14] = static_cast<uint8_t>(value >> 8);
-    bytes[15] = static_cast<uint8_t>(value);
-    char text[INET6_ADDRSTRLEN] = {};
-    return inet_ntop(AF_INET6, bytes, text, sizeof(text)) ? text : std::string();
+    // The configured ranges retain at least 32 host bits. The cache cap makes
+    // a bounded probe sufficient even after address reuse following expiry.
+    for (size_t attempts = 0; attempts <= capacity_; ++attempts) {
+        uint8_t bytes[16];
+        std::memcpy(bytes, ipv6_prefix_, 16);
+        const uint32_t value = next_ipv6_++;
+        bytes[12] = static_cast<uint8_t>(value >> 24);
+        bytes[13] = static_cast<uint8_t>(value >> 16);
+        bytes[14] = static_cast<uint8_t>(value >> 8);
+        bytes[15] = static_cast<uint8_t>(value);
+        char text[INET6_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET6, bytes, text, sizeof(text)) &&
+            reverse_.find(text) == reverse_.end()) {
+            return text;
+        }
+    }
+    return std::string();
+}
+
+void FakeIpDns::erase_mapping(std::unordered_map<std::string, Mapping>::iterator mapping) {
+    if (mapping == forward_.end()) return;
+    if (!mapping->second.ipv4.empty()) {
+        auto reverse = reverse_.find(mapping->second.ipv4);
+        if (reverse != reverse_.end() && reverse->second.domain == mapping->first)
+            reverse_.erase(reverse);
+    }
+    if (!mapping->second.ipv6.empty()) {
+        auto reverse = reverse_.find(mapping->second.ipv6);
+        if (reverse != reverse_.end() && reverse->second.domain == mapping->first)
+            reverse_.erase(reverse);
+    }
+    lru_.erase(mapping->second.lru_position);
+    forward_.erase(mapping);
+}
+
+void FakeIpDns::expire_mappings(uint64_t now) {
+    for (auto mapping = forward_.begin(); mapping != forward_.end();) {
+        if (mapping->second.expires_at > now) {
+            ++mapping;
+            continue;
+        }
+        auto expired = mapping++;
+        erase_mapping(expired);
+    }
+}
+
+void FakeIpDns::touch_mapping(std::unordered_map<std::string, Mapping>::iterator mapping,
+                              uint64_t now) {
+    mapping->second.expires_at = now + ttl_;
+    lru_.splice(lru_.end(), lru_, mapping->second.lru_position);
+    mapping->second.lru_position = std::prev(lru_.end());
+    if (!mapping->second.ipv4.empty())
+        reverse_[mapping->second.ipv4] = ReverseMapping{mapping->first, mapping->second.expires_at};
+    if (!mapping->second.ipv6.empty())
+        reverse_[mapping->second.ipv6] = ReverseMapping{mapping->first, mapping->second.expires_at};
+}
+
+bool FakeIpDns::ensure_mapping_capacity(uint64_t now) {
+    expire_mappings(now);
+    while (forward_.size() >= capacity_) {
+        if (lru_.empty()) return false;
+        auto mapping = forward_.find(lru_.front());
+        if (mapping == forward_.end()) {
+            lru_.pop_front();
+            continue;
+        }
+        erase_mapping(mapping);
+    }
+    return true;
 }
 
 bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
@@ -149,14 +233,36 @@ bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
     bool answer = klass == 1 && (type == 1 || type == 28);
     std::string address;
     if (answer) {
-        Mapping& mapping = forward_[domain];
+        const uint64_t now = now_seconds();
+        expire_mappings(now);
+        auto mapping_it = forward_.find(domain);
+        if (mapping_it == forward_.end()) {
+            if (!ensure_mapping_capacity(now)) {
+                answer = false;
+            } else {
+                lru_.push_back(domain);
+                Mapping mapping;
+                mapping.expires_at = now + ttl_;
+                mapping.lru_position = std::prev(lru_.end());
+                mapping_it = forward_.emplace(domain, std::move(mapping)).first;
+            }
+        } else {
+            touch_mapping(mapping_it, now);
+        }
+        if (!answer) {
+            // Cache capacity is exhausted; return a valid empty DNS answer.
+        } else {
+        Mapping& mapping = mapping_it->second;
         address = type == 1 ? mapping.ipv4 : mapping.ipv6;
         if (address.empty()) {
             address = type == 1 ? allocate_ipv4() : allocate_ipv6();
             if (type == 1) mapping.ipv4 = address; else mapping.ipv6 = address;
-            if (!address.empty()) reverse_[address] = domain;
+            if (!address.empty()) {
+                reverse_[address] = ReverseMapping{domain, mapping.expires_at};
+            }
         }
         answer = !address.empty();
+        }
     }
     store_be16(response.data() + 2, flags);
     store_be16(response.data() + 4, 1);
@@ -178,10 +284,15 @@ bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
     return true;
 }
 
-bool FakeIpDns::reverse_lookup(const std::string& address, std::string& domain) const {
+bool FakeIpDns::reverse_lookup(const std::string& address, std::string& domain) {
+    const uint64_t now = now_seconds();
+    expire_mappings(now);
     auto it = reverse_.find(address);
     if (it == reverse_.end()) return false;
-    domain = it->second;
+    auto mapping = forward_.find(it->second.domain);
+    if (mapping == forward_.end()) return false;
+    touch_mapping(mapping, now);
+    domain = mapping->first;
     return true;
 }
 

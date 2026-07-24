@@ -5,6 +5,7 @@
 #include "tx/common/network.h"
 #include <cstring>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace tx {
 
@@ -14,6 +15,35 @@ constexpr size_t kTunnelPauseWriteBacklog = 4 * 1024 * 1024;
 constexpr size_t kTunnelResumeWriteBacklog = 1024 * 1024;
 constexpr size_t kMaxTunnelWriteBacklog = 16 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
+
+std::unique_ptr<uv_loop_t> create_server_loop() {
+    std::unique_ptr<uv_loop_t> loop(new uv_loop_t);
+    const int status = uv_loop_init(loop.get());
+    if (status != 0) {
+        throw std::runtime_error(std::string("Failed to initialize server libuv loop: ") +
+                                 uv_strerror(status));
+    }
+    return loop;
+}
+
+void close_remaining_handle(uv_handle_t* handle, void*) {
+    if (!uv_is_closing(handle)) uv_close(handle, nullptr);
+}
+
+void drain_and_close_loop(uv_loop_t* loop) {
+    if (!loop) return;
+    while (uv_loop_alive(loop)) uv_run(loop, UV_RUN_DEFAULT);
+    int status = uv_loop_close(loop);
+    if (status == 0) return;
+
+    TX_WARN("Server loop still had handles during shutdown: %s", uv_strerror(status));
+    uv_walk(loop, close_remaining_handle, nullptr);
+    while (uv_loop_alive(loop)) uv_run(loop, UV_RUN_DEFAULT);
+    status = uv_loop_close(loop);
+    if (status != 0) {
+        TX_ERROR("Failed to close server libuv loop: %s", uv_strerror(status));
+    }
+}
 
 struct UdpSendReq {
     uv_udp_send_t req;
@@ -56,15 +86,34 @@ bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
 } // namespace
 
 ServerApp::ServerApp()
-    : loop_(uv_default_loop()),
+    : owned_loop_(create_server_loop()),
+      loop_(owned_loop_.get()),
+      loop_closed_(false),
       server_(loop_),
-      udp_cleanup_timer_started_(false) {}
+      udp_cleanup_timer_started_(false),
+      stop_async_initialized_(false),
+      ready_to_run_(false),
+      stop_requested_(false),
+      stopping_(false) {}
 
 ServerApp::~ServerApp() {
     stop();
+    if (!loop_closed_) {
+        drain_and_close_loop(loop_);
+        loop_closed_ = true;
+    }
 }
 
 bool ServerApp::init(const ServerConfig& config) {
+    if (!stop_async_initialized_) {
+        const int status = uv_async_init(loop_, &stop_async_, ServerApp::on_stop_async);
+        if (status != 0) {
+            TX_ERROR("Failed to initialize server stop handle: %s", uv_strerror(status));
+            return false;
+        }
+        stop_async_.data = this;
+        stop_async_initialized_ = true;
+    }
     config_ = config;
 
     server_.set_accept_callback([this](SessionPtr s) { on_tunnel_accept(s); });
@@ -81,6 +130,7 @@ bool ServerApp::init(const ServerConfig& config) {
     TX_INFO("TX Server started on %s:%u (UDP timeout: %llu seconds)",
             config.listen_host.c_str(), config.listen_port,
             static_cast<unsigned long long>(config_.udp_idle_timeout_ms / 1000));
+    ready_to_run_ = true;
     return true;
 }
 
@@ -89,15 +139,45 @@ int ServerApp::run() {
 }
 
 void ServerApp::stop() {
+    if (stop_requested_.exchange(true, std::memory_order_acq_rel)) return;
+
+    if (ready_to_run_ && stop_async_initialized_) {
+        uv_async_send(&stop_async_);
+        return;
+    }
+
+    // Initialization failures never enter uv_run(), so perform the same
+    // cleanup synchronously on the constructing thread.
+    stop_on_loop();
+    uv_run(loop_, UV_RUN_NOWAIT);
+}
+
+void ServerApp::on_stop_async(uv_async_t* handle) {
+    auto* app = static_cast<ServerApp*>(handle->data);
+    if (app) app->stop_on_loop();
+}
+
+void ServerApp::stop_on_loop() {
+    if (stopping_) return;
+    stopping_ = true;
+
     stop_udp_cleanup_timer();
     server_.stop();
-    for (auto& kv : clients_) {
-        if (kv.second->session && !kv.second->session->is_closed()) {
-            kv.second->session->close();
+
+    std::vector<TunnelClientPtr> clients;
+    clients.reserve(clients_.size());
+    for (const auto& kv : clients_) clients.push_back(kv.second);
+    for (const auto& client : clients) {
+        if (client->session && !client->session->is_closed()) {
+            client->session->close();
+        } else {
+            on_tunnel_close(client);
         }
     }
-    clients_.clear();
-    uv_stop(loop_);
+    if (stop_async_initialized_ &&
+        !uv_is_closing(reinterpret_cast<uv_handle_t*>(&stop_async_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&stop_async_), nullptr);
+    }
 }
 
 bool ServerApp::start_udp_cleanup_timer() {
@@ -129,6 +209,77 @@ void ServerApp::stop_udp_cleanup_timer() {
     if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_))) {
         uv_close(reinterpret_cast<uv_handle_t*>(&udp_cleanup_timer_), nullptr);
     }
+}
+
+bool ServerApp::consume_client_rate(TunnelClientPtr client, size_t bytes) {
+    if (!client || client->closed || bytes == 0) return !client || !client->closed;
+    const uint64_t now = uv_now(loop_);
+    if (client->rate_window_started_ms == 0 ||
+        now - client->rate_window_started_ms >= 1000) {
+        client->rate_window_started_ms = now;
+        client->rate_window_bytes = 0;
+    }
+    if (bytes > config_.max_client_rate_bytes_per_sec -
+                    std::min(client->rate_window_bytes,
+                             config_.max_client_rate_bytes_per_sec)) {
+        TX_WARN("Closing tunnel client that exceeded the configured %llu B/s input rate",
+                static_cast<unsigned long long>(config_.max_client_rate_bytes_per_sec));
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return false;
+    }
+    client->rate_window_bytes += bytes;
+    return true;
+}
+
+void ServerApp::start_handshake_timer(TunnelClientPtr client) {
+    if (!client || client->handshake_timer) return;
+    auto* timer = new uv_timer_t;
+    auto* ctx = new HandshakeTimerCtx{this, client};
+    timer->data = ctx;
+    const int initialized = uv_timer_init(loop_, timer);
+    if (initialized != 0 ||
+        (initialized == 0 && uv_timer_start(timer, ServerApp::on_handshake_timer,
+                                             config_.handshake_timeout_ms, 0) != 0)) {
+        if (initialized == 0) {
+            uv_close(reinterpret_cast<uv_handle_t*>(timer), ServerApp::on_handshake_timer_closed);
+        } else {
+            delete ctx;
+            delete timer;
+        }
+        TX_WARN("Could not start tunnel handshake timeout timer");
+        return;
+    }
+    client->handshake_timer = timer;
+}
+
+void ServerApp::stop_handshake_timer(TunnelClientPtr client) {
+    if (!client || !client->handshake_timer) return;
+    uv_timer_t* timer = client->handshake_timer;
+    client->handshake_timer = nullptr;
+    uv_timer_stop(timer);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ServerApp::on_handshake_timer_closed);
+    }
+}
+
+void ServerApp::on_handshake_timer(uv_timer_t* timer) {
+    auto* ctx = static_cast<HandshakeTimerCtx*>(timer->data);
+    if (!ctx || !ctx->app || !ctx->client || ctx->client->closed ||
+        ctx->client->handshake_timer != timer) return;
+    ctx->client->handshake_timer = nullptr;
+    TX_WARN("Closing tunnel client after handshake timeout");
+    if (ctx->client->session && !ctx->client->session->is_closed()) {
+        ctx->client->session->close();
+    }
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ServerApp::on_handshake_timer_closed);
+    }
+}
+
+void ServerApp::on_handshake_timer_closed(uv_handle_t* handle) {
+    auto* ctx = static_cast<HandshakeTimerCtx*>(handle->data);
+    delete ctx;
+    delete reinterpret_cast<uv_timer_t*>(handle);
 }
 
 void ServerApp::cleanup_idle_udp_outbounds(uint64_t now_ms) {
@@ -170,10 +321,38 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
     TX_INFO("Tunnel client connected from %s:%u",
             session->remote_addr().c_str(), session->remote_port());
 
+    if (clients_.size() >= config_.max_clients) {
+        TX_WARN("Rejecting tunnel client: configured client limit reached");
+        session->close();
+        return;
+    }
+    const uint64_t now = uv_now(loop_);
+    if (new_client_window_started_ms_ == 0 || now - new_client_window_started_ms_ >= 1000) {
+        new_client_window_started_ms_ = now;
+        new_client_window_count_ = 0;
+    }
+    if (new_client_window_count_ >= config_.max_new_clients_per_second) {
+        TX_WARN("Rejecting tunnel client: new-client rate limit reached");
+        session->close();
+        return;
+    }
+    ++new_client_window_count_;
+    const std::string source_ip = session->remote_addr();
+    uint32_t& pending_from_ip = unauthenticated_by_ip_[source_ip];
+    if (pending_from_ip >= config_.max_unauthenticated_per_ip) {
+        TX_WARN("Rejecting tunnel client from %s: unauthenticated client limit reached",
+                source_ip.c_str());
+        session->close();
+        return;
+    }
+    ++pending_from_ip;
+
     auto client = std::make_shared<TunnelClient>();
     client->session = session;
+    client->source_ip = source_ip;
 
     clients_[session->handle()] = client;
+    start_handshake_timer(client);
 
     session->set_close_callback([this, client](SessionPtr) {
         on_tunnel_close(client);
@@ -183,6 +362,10 @@ void ServerApp::on_tunnel_accept(SessionPtr session) {
     });
 
     session->start_read([this, client](SessionPtr, Buffer& data) {
+        if (!consume_client_rate(client, data.readable())) {
+            data.clear();
+            return;
+        }
         on_tunnel_handshake_read(client, data);
     });
 }
@@ -218,6 +401,15 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
     }
 
     client->codec = TunnelCodec(keys, false);
+    stop_handshake_timer(client);
+    if (!client->authenticated) {
+        client->authenticated = true;
+        auto pending = unauthenticated_by_ip_.find(client->source_ip);
+        if (pending != unauthenticated_by_ip_.end()) {
+            if (pending->second > 1) --pending->second;
+            else unauthenticated_by_ip_.erase(pending);
+        }
+    }
 
     client->session->send(hello);
     client->handshake_buf.consume(TunnelCodec::kHandshakeSize);
@@ -225,6 +417,10 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
             client->session->remote_addr().c_str(), client->session->remote_port());
 
     client->session->start_read([this, client](SessionPtr, Buffer& more) {
+        if (!consume_client_rate(client, more.readable())) {
+            more.clear();
+            return;
+        }
         client->recv_buf.append(more);
         more.clear();
         on_tunnel_read(client, client->recv_buf);
@@ -277,35 +473,59 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
 
 void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
                                  const TargetAddr& target) {
+    if (!client || client->closed) return;
+    if (sid == 0) {
+        TX_ERROR("Rejecting invalid TCP session ID 0 from tunnel client");
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+    if (client->outbounds.find(sid) != client->outbounds.end() ||
+        client->udp_outbounds.find(sid) != client->udp_outbounds.end()) {
+        TX_ERROR("Duplicate or cross-protocol session ID %u from tunnel client", sid);
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+    if (client->outbounds.size() >= config_.max_tcp_outbounds_per_client) {
+        TX_WARN("Rejecting TCP session %u: per-client outbound limit reached", sid);
+        tunnel_send_connect_result(client, sid, false);
+        return;
+    }
     TX_INFO("CONNECT session %u → %s:%u", sid, target.host.c_str(), target.port);
 
     auto remote = std::make_shared<TcpSession>(loop_);
     TunnelClient::Outbound ob;
     ob.remote_session = remote;
     ob.session_id = sid;
+    ob.generation = client->next_tcp_generation++;
     ob.connected = false;
-    client->outbounds[sid] = ob;
+    const uint64_t generation = ob.generation;
+    client->outbounds.emplace(sid, std::move(ob));
 
     // Use weak_ptr to avoid capturing remote in its own close callback
     std::weak_ptr<TcpSession> weak_remote = remote;
 
-    remote->set_close_callback([this, client, sid, weak_remote](SessionPtr) {
+    remote->set_close_callback([this, client, sid, generation, weak_remote](SessionPtr) {
         TX_DEBUG("Remote closed for session %u", sid);
         // Only act if the outbound still exists and matches
         auto it = client->outbounds.find(sid);
         if (it != client->outbounds.end() &&
+            it->second.generation == generation &&
             it->second.remote_session.get() == weak_remote.lock().get()) {
             tunnel_send_disconnect(client, sid);
             client->outbounds.erase(it);
         }
     });
-    remote->set_eof_callback([this, client, sid](SessionPtr) {
+    remote->set_eof_callback([this, client, sid, generation, weak_remote](SessionPtr) {
         auto it = client->outbounds.find(sid);
-        if (it == client->outbounds.end()) return;
+        if (it == client->outbounds.end() || it->second.generation != generation ||
+            it->second.remote_session.get() != weak_remote.lock().get()) return;
         it->second.remote_eof = true;
         tunnel_send_half_close(client, sid);
     });
-    remote->set_write_drain_callback([client](SessionPtr remote_session) {
+    remote->set_write_drain_callback([client, sid, generation, weak_remote](SessionPtr remote_session) {
+        auto it = client->outbounds.find(sid);
+        if (it == client->outbounds.end() || it->second.generation != generation ||
+            it->second.remote_session.get() != weak_remote.lock().get()) return;
         if (client->inbound_paused && client->session &&
             !client->session->is_closed() &&
             remote_session->pending_write_bytes() <= kTunnelResumeWriteBacklog) {
@@ -314,27 +534,25 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
         }
     });
 
-    remote->connect(target.host, target.port,
-        [this, client, sid, remote, target](bool success) {
+    remote->connect(target.host, target.port, config_.connect_timeout_ms,
+        [this, client, sid, generation, remote, target, weak_remote](bool success) {
+            auto it = client->outbounds.find(sid);
+            const bool current = it != client->outbounds.end() &&
+                it->second.generation == generation && it->second.remote_session == remote;
+            if (!current) {
+                if (!remote->is_closed()) remote->close();
+                return;
+            }
             if (!success) {
                 TX_ERROR("Failed to connect to target for session %u: %s:%u",
                          sid, target.host.c_str(), target.port);
                 tunnel_send_connect_result(client, sid, false);
-                client->outbounds.erase(sid);
+                client->outbounds.erase(it);
                 return;
             }
 
             TX_INFO("Connected to target for session %u: %s:%u",
                     sid, target.host.c_str(), target.port);
-
-            auto it = client->outbounds.find(sid);
-            if (it == client->outbounds.end()) {
-                TX_WARN("Outbound disappeared before target connected for session %u", sid);
-                if (remote && !remote->is_closed()) {
-                    remote->close();
-                }
-                return;
-            }
 
             // Mark as connected and flush pending data
             it->second.connected = true;
@@ -356,7 +574,14 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
 
             if (!client->outbounds_paused) {
                 // Start reading from remote → forward back through tunnel.
-                remote->start_read([this, client, sid](SessionPtr, Buffer& data) {
+                remote->start_read([this, client, sid, generation, weak_remote](SessionPtr, Buffer& data) {
+                    auto current = client->outbounds.find(sid);
+                    if (current == client->outbounds.end() ||
+                        current->second.generation != generation ||
+                        current->second.remote_session.get() != weak_remote.lock().get()) {
+                        data.clear();
+                        return;
+                    }
                     tunnel_send_data(client, sid, data.data(), data.readable());
                     data.clear();
                 });
@@ -409,9 +634,31 @@ void ServerApp::handle_data(TunnelClientPtr client, SessionId sid, Buffer& paylo
 void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
                                   const TargetAddr& target, Buffer& payload) {
     if (payload.empty()) return;
+    if (!client || client->closed) {
+        payload.clear();
+        return;
+    }
+    if (sid == 0) {
+        TX_ERROR("Rejecting invalid UDP session ID 0 from tunnel client");
+        payload.clear();
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+    if (client->outbounds.find(sid) != client->outbounds.end()) {
+        TX_ERROR("UDP packet reuses TCP session ID %u", sid);
+        payload.clear();
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
 
     auto it = client->udp_outbounds.find(sid);
     if (it == client->udp_outbounds.end()) {
+        if (client->udp_outbounds.size() >= config_.max_udp_flows_per_client) {
+            TX_WARN("Dropping UDP session %u: per-client flow limit reached", sid);
+            tunnel_send_disconnect(client, sid);
+            payload.clear();
+            return;
+        }
         auto* udp = new uv_udp_t;
         if (uv_udp_init(loop_, udp) != 0) {
             delete udp;
@@ -618,7 +865,17 @@ void ServerApp::resume_outbound_reads(TunnelClientPtr client) {
             continue;
         }
 
-        outbound.remote_session->start_read([this, client, sid](SessionPtr, Buffer& data) {
+        const uint64_t generation = outbound.generation;
+        std::weak_ptr<TcpSession> weak_remote = outbound.remote_session;
+        outbound.remote_session->start_read([this, client, sid, generation, weak_remote]
+                                            (SessionPtr, Buffer& data) {
+            auto current = client->outbounds.find(sid);
+            if (current == client->outbounds.end() ||
+                current->second.generation != generation ||
+                current->second.remote_session.get() != weak_remote.lock().get()) {
+                data.clear();
+                return;
+            }
             tunnel_send_data(client, sid, data.data(), data.readable());
             data.clear();
         });
@@ -639,7 +896,7 @@ void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
     if (nread <= 0 || !addr) return;
 
     auto* ctx = static_cast<UdpCtx*>(handle->data);
-    if (!ctx || !ctx->app) return;
+    if (!ctx || !ctx->app || !ctx->client || ctx->client->closed) return;
 
     auto it = ctx->client->udp_outbounds.find(ctx->sid);
     if (it == ctx->client->udp_outbounds.end() ||
@@ -656,7 +913,7 @@ void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
 
 void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
     auto* ctx = static_cast<UdpResolveCtx*>(req->data);
-    if (status == 0 && res && ctx && ctx->client) {
+    if (status == 0 && res && ctx && ctx->app && ctx->client && !ctx->client->closed) {
         auto it = ctx->client->udp_outbounds.find(ctx->sid);
         if (it != ctx->client->udp_outbounds.end() &&
             it->second.generation == ctx->generation) {
@@ -720,6 +977,16 @@ void ServerApp::on_udp_closed(uv_handle_t* handle) {
 }
 
 void ServerApp::on_tunnel_close(TunnelClientPtr client) {
+    if (!client || client->closed) return;
+    client->closed = true;
+    stop_handshake_timer(client);
+    if (!client->authenticated) {
+        auto pending = unauthenticated_by_ip_.find(client->source_ip);
+        if (pending != unauthenticated_by_ip_.end()) {
+            if (pending->second > 1) --pending->second;
+            else unauthenticated_by_ip_.erase(pending);
+        }
+    }
     TX_INFO("Tunnel client disconnected");
 
     // Copy outbounds to avoid iterator invalidation

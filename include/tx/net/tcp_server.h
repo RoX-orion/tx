@@ -30,7 +30,9 @@ public:
     ~TcpSession();
 
     // Initialize from an accepted handle
-    void init(uv_tcp_t* server_handle);
+    // Returns false when libuv rejected the accepted connection. The session
+    // still closes its initialized handle asynchronously in that case.
+    bool init(uv_tcp_t* server_handle);
 
     // Connect to remote
     using ConnectCb = std::function<void(bool success)>;
@@ -143,6 +145,7 @@ private:
     uv_tcp_t       tcp_;
     bool           listening_;
     bool           transparent_;
+    bool           stopped_;
     AcceptCallback accept_cb_;
 };
 

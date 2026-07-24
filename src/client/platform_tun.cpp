@@ -30,6 +30,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <ws2ipdef.h>
 #include <iphlpapi.h>
@@ -425,6 +426,27 @@ bool parse_ipv4_cidr_win(const std::string& cidr, IN_ADDR& addr, UINT8& prefix) 
     return true;
 }
 
+bool parse_ip_cidr_win(const std::string& cidr, SOCKADDR_INET& address, UINT8& prefix) {
+    const size_t slash = cidr.find('/');
+    if (slash == std::string::npos) return false;
+    const std::string host = cidr.substr(0, slash);
+    char* end = nullptr;
+    const long parsed_prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
+    if (!end || *end != '\0') return false;
+    std::memset(&address, 0, sizeof(address));
+    if (host.find(':') == std::string::npos) {
+        if (parsed_prefix < 0 || parsed_prefix > 32) return false;
+        address.Ipv4.sin_family = AF_INET;
+        if (InetPtonA(AF_INET, host.c_str(), &address.Ipv4.sin_addr) != 1) return false;
+    } else {
+        if (parsed_prefix < 0 || parsed_prefix > 128) return false;
+        address.Ipv6.sin6_family = AF_INET6;
+        if (InetPtonA(AF_INET6, host.c_str(), &address.Ipv6.sin6_addr) != 1) return false;
+    }
+    prefix = static_cast<UINT8>(parsed_prefix);
+    return true;
+}
+
 class WintunDevice final : public PlatformTunDevice {
 public:
     ~WintunDevice() override { close(); }
@@ -485,6 +507,14 @@ public:
     void close() override {
         stop_reader();
         TcpSession::set_outbound_interfaces(0, 0);
+        for (const auto& route : installed_routes_) {
+            DeleteIpForwardEntry2(&route);
+        }
+        installed_routes_.clear();
+        for (const auto& address : installed_addresses_) {
+            DeleteUnicastIpAddressEntry(&address);
+        }
+        installed_addresses_.clear();
         if (session_ && end_session_) {
             end_session_(session_);
         }
@@ -642,48 +672,50 @@ private:
     }
 
     bool configure_interface(const ClientConfig& config, std::string& error) {
-        if (!config.tun_address.empty()) {
-            IN_ADDR interface_addr;
+        for (const auto& cidr : config.tun_addresses) {
+            SOCKADDR_INET interface_addr{};
             UINT8 interface_prefix = 0;
-            if (!parse_ipv4_cidr_win(config.tun_address, interface_addr,
-                                     interface_prefix)) {
-                error = "tun.address must be an IPv4 CIDR on Windows";
+            if (!parse_ip_cidr_win(cidr, interface_addr, interface_prefix)) {
+                error = "invalid tun.addresses CIDR on Windows: " + cidr;
                 return false;
             }
             MIB_UNICASTIPADDRESS_ROW row;
             InitializeUnicastIpAddressEntry(&row);
             row.InterfaceLuid = luid_;
-            row.Address.si_family = AF_INET;
-            sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(&row.Address);
-            addr->sin_addr = interface_addr;
+            row.Address = interface_addr;
             row.OnLinkPrefixLength = interface_prefix;
             DWORD r = CreateUnicastIpAddressEntry(&row);
             if (r != NO_ERROR && r != ERROR_OBJECT_ALREADY_EXISTS) {
-                error = "CreateUnicastIpAddressEntry failed";
+                error = "CreateUnicastIpAddressEntry failed for " + cidr;
                 return false;
             }
+            if (r == NO_ERROR) installed_addresses_.push_back(row);
         }
 
-        for (const auto& route : config.tun_routes) {
-            IN_ADDR dst;
+        std::vector<std::string> routes = config.tun_routes;
+        if (config.tun_auto_route && routes.empty()) {
+            routes = {"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"};
+        }
+        for (const auto& route : routes) {
+            SOCKADDR_INET dst{};
             UINT8 prefix = 0;
-            if (!parse_ipv4_cidr_win(route, dst, prefix)) {
-                error = "tun.routes only supports IPv4 CIDR on Windows: " + route;
+            if (!parse_ip_cidr_win(route, dst, prefix)) {
+                error = "invalid tun.routes CIDR on Windows: " + route;
                 return false;
             }
             MIB_IPFORWARD_ROW2 row;
             InitializeIpForwardEntry(&row);
             row.InterfaceLuid = luid_;
-            row.DestinationPrefix.Prefix.si_family = AF_INET;
-            reinterpret_cast<sockaddr_in*>(&row.DestinationPrefix.Prefix)->sin_addr = dst;
+            row.DestinationPrefix.Prefix = dst;
             row.DestinationPrefix.PrefixLength = prefix;
-            row.NextHop.si_family = AF_INET;
+            row.NextHop.si_family = dst.si_family;
             row.Metric = 0;
             DWORD r = CreateIpForwardEntry2(&row);
             if (r != NO_ERROR && r != ERROR_OBJECT_ALREADY_EXISTS) {
                 error = "CreateIpForwardEntry2 failed for " + route;
                 return false;
             }
+            if (r == NO_ERROR) installed_routes_.push_back(row);
         }
         return true;
     }
@@ -711,6 +743,8 @@ private:
     std::atomic<bool> reader_stop_{false};
     std::mutex queue_mutex_;
     std::deque<std::vector<uint8_t>> packet_queue_;
+    std::vector<MIB_UNICASTIPADDRESS_ROW> installed_addresses_;
+    std::vector<MIB_IPFORWARD_ROW2> installed_routes_;
 };
 
 #endif

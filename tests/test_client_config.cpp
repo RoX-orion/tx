@@ -51,6 +51,15 @@ int main() {
     tx::ClientConfig unknown;
     assert(!load_text("unknown", config_json("surprise"), unknown));
 
+    // A failed reload must not leave callers with a partially parsed config.
+    const std::string retained_tag = default_config.outbounds.front().tag;
+    const std::string retained_rule = default_config.router.rules.front().outbound_tag;
+    assert(!load_text("retain_on_error", config_json("surprise"), default_config));
+    assert(default_config.outbounds.size() == 1);
+    assert(default_config.outbounds.front().tag == retained_tag);
+    assert(default_config.router.rules.size() == 1);
+    assert(default_config.router.rules.front().outbound_tag == retained_rule);
+
     std::printf("client config domainStrategy tests passed\n");
     return 0;
 }

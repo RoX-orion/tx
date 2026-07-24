@@ -93,6 +93,16 @@ static void test_half_close_flushes_pending_response() {
     session.reset();
     assert(uv_loop_close(&loop) == 0);
 }
+
+static void test_unlistened_server_closes_its_handle() {
+    uv_loop_t loop;
+    assert(uv_loop_init(&loop) == 0);
+    {
+        TcpServer server(&loop);
+    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    assert(uv_loop_close(&loop) == 0);
+}
 #endif
 
 int main() {
@@ -123,6 +133,7 @@ int main() {
     context.accepted.reset();
     assert(uv_loop_close(&loop) == 0);
     test_half_close_flushes_pending_response();
+    test_unlistened_server_closes_its_handle();
 #endif
 
     std::printf("tcp session callback lifecycle tests passed\n");

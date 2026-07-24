@@ -5,7 +5,9 @@
 
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <utility>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include "tx/common/network.h"
 #include <sys/stat.h>
@@ -15,7 +17,9 @@ using json = nlohmann::json;
 namespace tx {
 
 static std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
     return s;
 }
 
@@ -101,6 +105,14 @@ bool ClientConfig::validate() const {
         TX_ERROR("udp.idle_timeout must be between 1 and 86400 seconds");
         return false;
     }
+    if (udp_max_flows == 0 || udp_max_flows > 1000000) {
+        TX_ERROR("udp.max_flows must be between 1 and 1000000");
+        return false;
+    }
+    if (max_proxy_connections == 0 || max_proxy_connections > 1000000) {
+        TX_ERROR("limits.max_proxy_connections must be between 1 and 1000000");
+        return false;
+    }
 
     if (outbounds.empty()) {
         TX_ERROR("No outbounds configured");
@@ -120,7 +132,11 @@ bool ClientConfig::validate() const {
 
     if (tun_enabled) {
         if (tun_mtu <= 0) {
-            TX_ERROR("tun.mtu must be positive");
+            TX_ERROR("tun.mtu must be between 1 and 65535");
+            return false;
+        }
+        if (tun_mtu > 65535) {
+            TX_ERROR("tun.mtu must be between 1 and 65535");
             return false;
         }
         if (tun_addresses.empty()) {
@@ -143,6 +159,14 @@ bool ClientConfig::validate() const {
         }
         if (tun_tcp_stack == "lwip" && tun_auto_redirect) {
             TX_ERROR("tun.auto_redirect cannot be enabled with tcp_stack=lwip");
+            return false;
+        }
+        if (tun_tcp_stack == "lwip" && tun_auto_route && tun_bypass_mark == 0) {
+            TX_ERROR("tun.bypass_mark must be non-zero with lwip auto_route");
+            return false;
+        }
+        if (tun_auto_route && (tun_route_table == 0 || tun_rule_priority == 0)) {
+            TX_ERROR("tun.route_table and tun.rule_priority must be non-zero with auto_route");
             return false;
         }
 #if !defined(TX_PLATFORM_LINUX)
@@ -168,6 +192,10 @@ bool ClientConfig::validate() const {
     }
     if (dns_cache_ttl == 0 || dns_cache_ttl > 86400) {
         TX_ERROR("dns.cache_ttl must be between 1 and 86400 seconds");
+        return false;
+    }
+    if (dns_cache_capacity == 0 || dns_cache_capacity > 1000000) {
+        TX_ERROR("dns.cache_capacity must be between 1 and 1000000");
         return false;
     }
 
@@ -207,7 +235,8 @@ bool ClientConfig::validate() const {
     return true;
 }
 
-bool load_client_config(const std::string& path, ClientConfig& config) {
+bool load_client_config(const std::string& path, ClientConfig& output_config) {
+    ClientConfig config;
     std::ifstream file(path);
     if (!file.is_open()) {
         TX_ERROR("Failed to open config file: %s", path.c_str());
@@ -326,6 +355,13 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
                 return false;
             }
             config.udp_idle_timeout_ms = static_cast<uint64_t>(idle_timeout) * 1000;
+            config.udp_max_flows = udp.value("max_flows", config.udp_max_flows);
+        }
+
+        if (j.contains("limits")) {
+            const auto& limits = j["limits"];
+            config.max_proxy_connections = limits.value(
+                "max_proxy_connections", config.max_proxy_connections);
         }
 
         if (j.contains("tun")) {
@@ -346,7 +382,11 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
                     }
                 }
             } else if (tun.contains("address")) {
-                config.tun_addresses[0] = config.tun_address;
+                if (config.tun_addresses.empty()) {
+                    config.tun_addresses.push_back(config.tun_address);
+                } else {
+                    config.tun_addresses[0] = config.tun_address;
+                }
             }
             config.tun_auto_config = tun.value("auto_config", config.tun_auto_config);
             config.tun_auto_route = tun.value("auto_route", config.tun_auto_route);
@@ -376,6 +416,7 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
             config.dns_fake_ipv4_range = dns.value("fake_ipv4_range", config.dns_fake_ipv4_range);
             config.dns_fake_ipv6_range = dns.value("fake_ipv6_range", config.dns_fake_ipv6_range);
             config.dns_cache_ttl = dns.value("cache_ttl", config.dns_cache_ttl);
+            config.dns_cache_capacity = dns.value("cache_capacity", config.dns_cache_capacity);
             if (dns.contains("upstreams")) {
                 config.dns_upstreams.clear();
                 for (const auto& upstream : dns["upstreams"])
@@ -398,7 +439,9 @@ bool load_client_config(const std::string& path, ClientConfig& config) {
         return false;
     }
 
-    return config.validate();
+    if (!config.validate()) return false;
+    output_config = std::move(config);
+    return true;
 }
 
 } // namespace tx

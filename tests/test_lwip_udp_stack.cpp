@@ -32,6 +32,14 @@ int main() {
             return true;
         }, error));
 
+    tx::LwipUdpStack competing_stack;
+    std::string competing_error;
+    assert(!competing_stack.initialize(
+        "10.11.0.1/24", 1500,
+        [](uint64_t, const tx::IpAddr&, const tx::IpAddr&, const uint8_t*, size_t) {},
+        [](const uint8_t*, size_t) { return true; }, competing_error));
+    assert(!competing_error.empty());
+
     // Exercise the timer callback directly. On 64-bit platforms this aborts
     // unless lwIP preserves the IPv6 fragment header during reassembly.
     ip6_reass_tmr();
@@ -95,6 +103,11 @@ int main() {
     assert(!stack.send_response(flow_id, received_destination,
                                 response, sizeof(response)));
     stack.shutdown();
+    assert(competing_stack.initialize(
+        "10.11.0.1/24", 1500,
+        [](uint64_t, const tx::IpAddr&, const tx::IpAddr&, const uint8_t*, size_t) {},
+        [](const uint8_t*, size_t) { return true; }, competing_error));
+    competing_stack.shutdown();
     std::printf("HEV lwIP UDP stack tests passed\n");
     return 0;
 }

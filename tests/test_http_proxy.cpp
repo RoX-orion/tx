@@ -141,6 +141,15 @@ static void test_invalid_port() {
     assert(consumed > 0);
     assert(handler.state() == tx::HttpProxyHandler::State::Error);
 
+    tx::HttpProxyHandler overflow_handler;
+    const char* overflow_request =
+        "CONNECT example.com:70000 HTTP/1.1\r\n"
+        "Host: example.com:70000\r\n"
+        "\r\n";
+    assert(overflow_handler.feed(reinterpret_cast<const uint8_t*>(overflow_request),
+                                 strlen(overflow_request)) > 0);
+    assert(overflow_handler.state() == tx::HttpProxyHandler::State::Error);
+
     printf("OK\n");
 }
 

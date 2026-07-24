@@ -10,7 +10,9 @@
 #include <cstring>
 #include <random>
 #include <cstdlib>
+#include <array>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
@@ -30,6 +32,51 @@ namespace {
 constexpr uint64_t kTunnelHandshakeTimeoutMs = 8000;
 constexpr uint64_t kTunnelConnectResultTimeoutMs = 15000;
 constexpr uint64_t kTcpConnectTimeoutMs = 5000;
+constexpr size_t kMaxUdpPendingPackets = 1024;
+constexpr size_t kMaxUdpPendingBytes = 4 * 1024 * 1024;
+constexpr size_t kMaxUdpPendingBytesPerFlow = 512 * 1024;
+constexpr size_t kMaxUdpTunnelWriteBacklog = 8 * 1024 * 1024;
+
+std::unique_ptr<uv_loop_t> create_app_loop(const char* app_name) {
+    std::unique_ptr<uv_loop_t> loop(new uv_loop_t);
+    const int status = uv_loop_init(loop.get());
+    if (status != 0) {
+        throw std::runtime_error(std::string("Failed to initialize ") + app_name +
+                                 " libuv loop: " + uv_strerror(status));
+    }
+    return loop;
+}
+
+void close_remaining_handle(uv_handle_t* handle, void*) {
+    if (!uv_is_closing(handle)) {
+        uv_close(handle, nullptr);
+    }
+}
+
+void drain_and_close_loop(uv_loop_t* loop, const char* app_name) {
+    if (!loop) return;
+
+    while (uv_loop_alive(loop)) {
+        uv_run(loop, UV_RUN_DEFAULT);
+    }
+    int status = uv_loop_close(loop);
+    if (status == 0) return;
+
+    // A failed initialization or a future shutdown path must not leave an
+    // inactive handle behind. Close every remaining handle on its own loop,
+    // then drain close callbacks before giving up the loop storage.
+    TX_WARN("%s loop still had handles during shutdown: %s", app_name,
+            uv_strerror(status));
+    uv_walk(loop, close_remaining_handle, nullptr);
+    while (uv_loop_alive(loop)) {
+        uv_run(loop, UV_RUN_DEFAULT);
+    }
+    status = uv_loop_close(loop);
+    if (status != 0) {
+        TX_ERROR("Failed to close %s libuv loop: %s", app_name,
+                 uv_strerror(status));
+    }
+}
 
 std::string ipaddr_host_string(const IpAddr& ip) {
     char host[INET6_ADDRSTRLEN] = {0};
@@ -120,7 +167,11 @@ bool original_tcp_destination(SessionPtr session, TargetAddr& target) {
 bool install_linux_auto_redirect(uint16_t port, uint32_t mark) {
     run_auto_redirect_cmd("nft delete table inet tx_auto_redirect >/dev/null 2>&1");
 
-    const std::vector<std::string> commands = {
+    // Keep this a fixed-size array. Apart from avoiding a needless heap
+    // allocation during startup, this sidesteps a false-positive
+    // -Wfree-nonheap-object warning emitted by newer GCC versions for the
+    // equivalent vector initializer.
+    const std::array<std::string, 5> commands = {{
         "nft add table inet tx_auto_redirect",
         "nft 'add chain inet tx_auto_redirect output { type nat hook output priority dstnat; policy accept; }'",
         "nft add rule inet tx_auto_redirect output meta mark 0x" +
@@ -128,7 +179,7 @@ bool install_linux_auto_redirect(uint16_t port, uint32_t mark) {
         "nft 'add rule inet tx_auto_redirect output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return'",
         "nft add rule inet tx_auto_redirect output ip protocol tcp redirect to :" +
             std::to_string(port),
-    };
+    }};
     for (const auto& command : commands) {
         if (!run_auto_redirect_cmd(command)) {
             run_auto_redirect_cmd(
@@ -247,7 +298,9 @@ struct ClientApp::DirectUdpRelay {
 ClientApp::ClientApp(SocketProtectCallback socket_protector,
                      DnsResolver::HostResolveHook host_resolver,
                      DnsResolver::QueryHook dns_query)
-    : loop_(uv_default_loop()),
+    : owned_loop_(create_app_loop("client")),
+      loop_(owned_loop_.get()),
+      loop_closed_(false),
       stop_async_initialized_(false),
       network_async_initialized_(false),
       ready_to_run_(false),
@@ -270,6 +323,10 @@ ClientApp::ClientApp(SocketProtectCallback socket_protector,
 
 ClientApp::~ClientApp() {
     stop();
+    if (!loop_closed_) {
+        drain_and_close_loop(loop_, "client");
+        loop_closed_ = true;
+    }
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
     if (config_.tun_fd >= 0) {
         ::close(config_.tun_fd);
@@ -300,7 +357,8 @@ bool ClientApp::init(const ClientConfig& config) {
     std::string dns_error;
     if (!fake_ip_dns_.configure(config_.dns_fake_ipv4_range,
                                 config_.dns_fake_ipv6_range,
-                                config_.dns_cache_ttl, dns_error)) {
+                                config_.dns_cache_ttl, dns_error,
+                                config_.dns_cache_capacity)) {
         TX_ERROR("Failed to configure fake-IP DNS: %s", dns_error.c_str());
         return false;
     }
@@ -375,7 +433,7 @@ void ClientApp::on_network_async(uv_async_t* handle) {
 
 void ClientApp::network_changed_on_loop() {
     dns_resolver_.cancel_pending();
-    close_udp_tunnel();
+    close_all_udp_tunnels();
     std::vector<std::string> flows;
     for (const auto& item : udp_flows_) flows.push_back(item.first);
     for (const auto& key : flows) remove_udp_flow(key, false);
@@ -409,7 +467,7 @@ void ClientApp::stop_on_loop() {
     stop_udp_cleanup_timer();
     stop_tun_listener();
     stop_udp_listener();
-    close_udp_tunnel();
+    close_all_udp_tunnels();
     http_server_.stop();
     socks5_server_.stop();
     std::vector<ProxyConnPtr> active_connections;
@@ -596,6 +654,7 @@ void ClientApp::stop_udp_listener() {
     }
     for (auto& kv : udp_flows_) {
         close_direct_udp_relay(kv.second);
+        release_session_id(kv.second.session_id);
     }
     udp_flows_.clear();
     udp_session_keys_.clear();
@@ -636,26 +695,41 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end()) return;
 
-    SessionId sid = it->second.session_id;
-    if (notify_peer && it->second.proxied && udp_tunnel_.connected &&
-        udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
+    UdpFlow& flow = it->second;
+    SessionId sid = flow.session_id;
+    UdpTunnelPtr tunnel;
+    if (flow.outbound) {
+        auto tunnel_it = udp_tunnels_.find(flow.outbound->tag);
+        if (tunnel_it != udp_tunnels_.end() &&
+            tunnel_it->second->outbound == flow.outbound) {
+            tunnel = tunnel_it->second;
+        }
+    }
+    if (notify_peer && flow.proxied && tunnel && tunnel->connected &&
+        tunnel->tunnel_session && !tunnel->tunnel_session->is_closed()) {
         Buffer encoded;
-        if (udp_tunnel_.codec.encode_disconnect(sid, encoded)) {
-            udp_tunnel_.tunnel_session->send(encoded);
+        if (tunnel->codec.encode_disconnect(sid, encoded)) {
+            tunnel->tunnel_session->send(encoded);
         }
     }
 
-    close_direct_udp_relay(it->second);
-    if (it->second.kind == UdpFlowKind::Tun && it->second.lwip_flow_id != 0) {
-        lwip_udp_stack_.close_flow(it->second.lwip_flow_id);
+    close_direct_udp_relay(flow);
+    if (flow.kind == UdpFlowKind::Tun && flow.lwip_flow_id != 0) {
+        lwip_udp_stack_.close_flow(flow.lwip_flow_id);
     }
     udp_session_keys_.erase(sid);
-    udp_tunnel_.pending.erase(
-        std::remove_if(udp_tunnel_.pending.begin(), udp_tunnel_.pending.end(),
-                       [sid](const PendingUdpPacket& pkt) {
-                           return pkt.session_id == sid;
-                       }),
-        udp_tunnel_.pending.end());
+    release_session_id(sid);
+    if (tunnel) {
+        for (auto pending = tunnel->pending.begin(); pending != tunnel->pending.end();) {
+            if (pending->session_id == sid) {
+                tunnel->pending_bytes -= std::min(tunnel->pending_bytes,
+                                                  pending->payload.size());
+                pending = tunnel->pending.erase(pending);
+            } else {
+                ++pending;
+            }
+        }
+    }
     udp_flows_.erase(it);
 }
 
@@ -903,206 +977,283 @@ void ClientApp::send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr&
     record_traffic(route, false, len);
 }
 
-bool ClientApp::ensure_udp_tunnel() {
-    if (udp_tunnel_.connected) return true;
-    if (udp_tunnel_.connecting) return true;
+ClientApp::UdpTunnelPtr ClientApp::get_udp_tunnel(const OutboundConfig* outbound) {
+    if (!outbound || outbound->type != OutboundType::Tx) return UdpTunnelPtr();
+    auto it = udp_tunnels_.find(outbound->tag);
+    if (it != udp_tunnels_.end() && it->second->outbound == outbound) return it->second;
 
-    const OutboundConfig* outbound = udp_tunnel_.outbound;
-    if (!outbound || outbound->type != OutboundType::Tx) {
+    UdpTunnelPtr tunnel = std::make_shared<UdpTunnel>();
+    tunnel->outbound = outbound;
+    udp_tunnels_[outbound->tag] = tunnel;
+    return tunnel;
+}
+
+bool ClientApp::ensure_udp_tunnel(const UdpTunnelPtr& tunnel) {
+    if (!tunnel || !tunnel->outbound || tunnel->outbound->type != OutboundType::Tx) {
         TX_ERROR("UDP proxy tunnel has no TX outbound selected");
         return false;
     }
+    if (tunnel->connected || tunnel->connecting) return true;
 
-    udp_tunnel_.connected = false;
-    udp_tunnel_.connecting = true;
-    udp_tunnel_.handshake_buf.clear();
-    udp_tunnel_.recv_buf.clear();
-    TunnelCodec::cleanse_handshake_state(udp_tunnel_.handshake_state);
-
-    dns_resolver_.resolve_host(outbound->server_host, AF_UNSPEC,
-        [this](std::vector<std::string> addresses) {
-            if (!udp_tunnel_.connecting) return;
+    tunnel->connecting = true;
+    tunnel->handshake_buf.clear();
+    tunnel->recv_buf.clear();
+    TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
+    std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
+    dns_resolver_.resolve_host(tunnel->outbound->server_host, AF_UNSPEC,
+        [this, weak_tunnel](std::vector<std::string> addresses) {
+            UdpTunnelPtr current = weak_tunnel.lock();
+            if (!current || !current->connecting) return;
             if (addresses.empty()) {
                 TX_ERROR("UDP tunnel DNS resolution failed");
-                close_udp_tunnel();
+                close_udp_tunnel(current);
                 return;
             }
             connect_udp_tunnel_candidates(
-                std::make_shared<std::vector<std::string>>(std::move(addresses)), 0);
+                current, std::make_shared<std::vector<std::string>>(std::move(addresses)), 0);
         });
-
     return true;
 }
 
 void ClientApp::connect_udp_tunnel_candidates(
-    std::shared_ptr<std::vector<std::string>> addresses, size_t index) {
-    if (!udp_tunnel_.connecting || !udp_tunnel_.outbound || !addresses ||
+    const UdpTunnelPtr& tunnel, std::shared_ptr<std::vector<std::string>> addresses,
+    size_t index) {
+    if (!tunnel || !tunnel->connecting || !tunnel->outbound || !addresses ||
         index >= addresses->size()) {
         TX_ERROR("UDP tunnel exhausted all resolved server addresses");
-        close_udp_tunnel();
+        close_udp_tunnel(tunnel);
         return;
     }
 
-    auto tunnel = std::make_shared<TcpSession>(loop_, socket_protector_);
-    udp_tunnel_.tunnel_session = tunnel;
-    tunnel->set_close_callback([this, tunnel](SessionPtr) {
-        if (udp_tunnel_.tunnel_session == tunnel) {
+    auto session = std::make_shared<TcpSession>(loop_, socket_protector_);
+    tunnel->tunnel_session = session;
+    std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
+    TcpSession* const session_identity = session.get();
+    session->set_close_callback([this, weak_tunnel, session_identity](SessionPtr) {
+        UdpTunnelPtr current = weak_tunnel.lock();
+        if (current && current->tunnel_session.get() == session_identity) {
             TX_WARN("UDP tunnel disconnected");
-            close_udp_tunnel();
+            close_udp_tunnel(current);
         }
     });
 
-    const uint16_t server_port = udp_tunnel_.outbound->server_port;
-    tunnel->connect((*addresses)[index], server_port, kTcpConnectTimeoutMs,
-        [this, tunnel, addresses, index](bool success) {
-            if (udp_tunnel_.tunnel_session != tunnel) {
-                if (!tunnel->is_closed()) tunnel->close();
+    const uint16_t server_port = tunnel->outbound->server_port;
+    session->connect((*addresses)[index], server_port, kTcpConnectTimeoutMs,
+        [this, tunnel, session, addresses, index](bool success) {
+            if (tunnel->tunnel_session != session) {
+                if (!session->is_closed()) session->close();
                 return;
             }
             if (!success) {
-                tunnel->set_close_callback(nullptr);
-                udp_tunnel_.tunnel_session.reset();
+                session->set_close_callback(nullptr);
+                tunnel->tunnel_session.reset();
                 if (index + 1 < addresses->size()) {
-                    connect_udp_tunnel_candidates(addresses, index + 1);
+                    connect_udp_tunnel_candidates(tunnel, addresses, index + 1);
                 } else {
                     TX_ERROR("UDP tunnel connect failed for every resolved address");
-                    close_udp_tunnel();
+                    close_udp_tunnel(tunnel);
                 }
                 return;
             }
 
-            tunnel->start_read([this](SessionPtr, Buffer& data) {
-                on_udp_tunnel_handshake_read(data);
+            std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
+            session->start_read([this, weak_tunnel](SessionPtr, Buffer& data) {
+                if (UdpTunnelPtr current = weak_tunnel.lock())
+                    on_udp_tunnel_handshake_read(current, data);
+                else
+                    data.clear();
             });
             Buffer hello;
-            if (!udp_tunnel_.outbound ||
-                !TunnelCodec::build_client_hello(udp_tunnel_.outbound->psk,
-                                                  udp_tunnel_.outbound->cipher, hello,
-                                                  udp_tunnel_.handshake_state) ||
-                !tunnel->send(hello)) {
+            if (!tunnel->outbound ||
+                !TunnelCodec::build_client_hello(tunnel->outbound->psk,
+                                                  tunnel->outbound->cipher, hello,
+                                                  tunnel->handshake_state) ||
+                !session->send(hello)) {
                 TX_ERROR("Failed to build or send UDP tunnel handshake");
-                close_udp_tunnel();
+                close_udp_tunnel(tunnel);
             }
         });
 }
 
-void ClientApp::send_udp_packet(SessionId sid, const TargetAddr& target,
-                                const uint8_t* data, size_t len) {
-    if (!ensure_udp_tunnel()) return;
+void ClientApp::send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid,
+                                const TargetAddr& target, const uint8_t* data, size_t len) {
+    if (!tunnel || !data || len == 0 || !ensure_udp_tunnel(tunnel)) return;
 
-    if (!udp_tunnel_.connected) {
+    if (!tunnel->connected) {
+        auto key = udp_session_keys_.find(sid);
+        auto flow = key == udp_session_keys_.end() ? udp_flows_.end()
+                                                    : udp_flows_.find(key->second);
+        if (flow == udp_flows_.end() || flow->second.outbound != tunnel->outbound) {
+            return;
+        }
+        if (tunnel->pending.size() >= kMaxUdpPendingPackets ||
+            len > kMaxUdpPendingBytes || tunnel->pending_bytes > kMaxUdpPendingBytes - len) {
+            TX_WARN("Dropping UDP packet while %s tunnel is connecting: queue limit reached",
+                    tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
+            return;
+        }
+        if (len > kMaxUdpPendingBytesPerFlow ||
+            flow->second.pending_proxy_bytes > kMaxUdpPendingBytesPerFlow - len) {
+            TX_WARN("Dropping UDP packet while %s tunnel is connecting: per-flow queue limit reached",
+                    tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
+            return;
+        }
         PendingUdpPacket pkt;
         pkt.session_id = sid;
         pkt.target = target;
         pkt.payload.assign(data, data + len);
-        if (udp_tunnel_.pending.size() < 1024) {
-            udp_tunnel_.pending.push_back(std::move(pkt));
-        }
+        tunnel->pending_bytes += pkt.payload.size();
+        flow->second.pending_proxy_bytes += pkt.payload.size();
+        tunnel->pending.push_back(std::move(pkt));
         return;
     }
 
     Buffer encoded;
-    if (udp_tunnel_.codec.encode_udp_packet(sid, target, data, len, encoded) &&
-        udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
-        udp_tunnel_.tunnel_session->send(encoded);
+    if (!tunnel->codec.encode_udp_packet(sid, target, data, len, encoded) ||
+        !tunnel->tunnel_session || tunnel->tunnel_session->is_closed()) return;
+    if (tunnel->tunnel_session->pending_write_bytes() + encoded.readable() >
+        kMaxUdpTunnelWriteBacklog) {
+        TX_WARN("Dropping UDP packet for %s: tunnel write backlog limit reached",
+                tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
+        return;
+    }
+    if (tunnel->tunnel_session->send(encoded)) {
         record_traffic(RouteAction::Proxy, true, len);
     }
 }
 
-void ClientApp::flush_pending_udp_packets() {
-    while (udp_tunnel_.connected && !udp_tunnel_.pending.empty()) {
-        PendingUdpPacket pkt = std::move(udp_tunnel_.pending.front());
-        udp_tunnel_.pending.pop_front();
-        send_udp_packet(pkt.session_id, pkt.target, pkt.payload.data(), pkt.payload.size());
+void ClientApp::flush_pending_udp_packets(const UdpTunnelPtr& tunnel) {
+    while (tunnel && tunnel->connected && !tunnel->pending.empty()) {
+        PendingUdpPacket pkt = std::move(tunnel->pending.front());
+        tunnel->pending.pop_front();
+        tunnel->pending_bytes -= std::min(tunnel->pending_bytes, pkt.payload.size());
+        auto key = udp_session_keys_.find(pkt.session_id);
+        if (key != udp_session_keys_.end()) {
+            auto flow = udp_flows_.find(key->second);
+            if (flow != udp_flows_.end()) {
+                flow->second.pending_proxy_bytes -= std::min(
+                    flow->second.pending_proxy_bytes, pkt.payload.size());
+            }
+        }
+        send_udp_packet(tunnel, pkt.session_id, pkt.target, pkt.payload.data(), pkt.payload.size());
     }
 }
 
-void ClientApp::on_udp_tunnel_handshake_read(Buffer& data) {
-    udp_tunnel_.handshake_buf.append(data);
+void ClientApp::on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer& data) {
+    if (!tunnel || !tunnel->connecting) {
+        data.clear();
+        return;
+    }
+    tunnel->handshake_buf.append(data);
     data.clear();
-    if (udp_tunnel_.handshake_buf.readable() < TunnelCodec::kHandshakeSize) return;
+    if (tunnel->handshake_buf.readable() < TunnelCodec::kHandshakeSize) return;
 
     TunnelTrafficKeys keys;
-    if (!udp_tunnel_.outbound ||
-        !TunnelCodec::parse_server_hello(udp_tunnel_.outbound->psk,
-                                          udp_tunnel_.handshake_state,
-                                          udp_tunnel_.handshake_buf.data(),
-                                          TunnelCodec::kHandshakeSize,
-                                          keys)) {
+    if (!tunnel->outbound ||
+        !TunnelCodec::parse_server_hello(tunnel->outbound->psk, tunnel->handshake_state,
+                                          tunnel->handshake_buf.data(),
+                                          TunnelCodec::kHandshakeSize, keys)) {
         TX_ERROR("UDP tunnel handshake failed");
-        close_udp_tunnel();
+        close_udp_tunnel(tunnel);
         return;
     }
 
-    udp_tunnel_.handshake_buf.consume(TunnelCodec::kHandshakeSize);
-    udp_tunnel_.codec = TunnelCodec(keys, true);
-    TunnelCodec::cleanse_handshake_state(udp_tunnel_.handshake_state);
-    udp_tunnel_.connecting = false;
-    udp_tunnel_.connected = true;
-    TX_INFO("UDP tunnel handshake complete");
+    tunnel->handshake_buf.consume(TunnelCodec::kHandshakeSize);
+    tunnel->codec = TunnelCodec(keys, true);
+    TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
+    tunnel->connecting = false;
+    tunnel->connected = true;
+    TX_INFO("UDP tunnel handshake complete for outbound %s", tunnel->outbound->tag.c_str());
 
-    if (udp_tunnel_.tunnel_session && !udp_tunnel_.tunnel_session->is_closed()) {
-        udp_tunnel_.tunnel_session->start_read([this](SessionPtr, Buffer& more) {
-            udp_tunnel_.recv_buf.append(more);
-            more.clear();
-            on_udp_tunnel_read(udp_tunnel_.recv_buf);
+    if (tunnel->tunnel_session && !tunnel->tunnel_session->is_closed()) {
+        std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
+        tunnel->tunnel_session->start_read([this, weak_tunnel](SessionPtr, Buffer& more) {
+            if (UdpTunnelPtr current = weak_tunnel.lock()) {
+                current->recv_buf.append(more);
+                more.clear();
+                on_udp_tunnel_read(current, current->recv_buf);
+            } else {
+                more.clear();
+            }
         });
     }
 
-    if (!udp_tunnel_.handshake_buf.empty()) {
-        udp_tunnel_.recv_buf.append(udp_tunnel_.handshake_buf);
-        udp_tunnel_.handshake_buf.clear();
-        on_udp_tunnel_read(udp_tunnel_.recv_buf);
+    if (!tunnel->handshake_buf.empty()) {
+        tunnel->recv_buf.append(tunnel->handshake_buf);
+        tunnel->handshake_buf.clear();
+        on_udp_tunnel_read(tunnel, tunnel->recv_buf);
     }
-    flush_pending_udp_packets();
+    flush_pending_udp_packets(tunnel);
 }
 
-void ClientApp::on_udp_tunnel_read(Buffer& data) {
+void ClientApp::on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data) {
+    if (!tunnel || !tunnel->connected) {
+        data.clear();
+        return;
+    }
     TunnelCmd cmd;
     SessionId sid;
     TargetAddr target;
     Buffer payload;
 
-    while (udp_tunnel_.codec.decode(data, cmd, sid, target, payload)) {
-        if (cmd == TunnelCmd::UdpPacket) {
-            auto key_it = udp_session_keys_.find(sid);
-            if (key_it == udp_session_keys_.end()) {
-                payload.clear();
-                continue;
-            }
-            auto flow_it = udp_flows_.find(key_it->second);
-            if (flow_it == udp_flows_.end()) {
-                payload.clear();
-                continue;
-            }
+    while (tunnel->codec.decode(data, cmd, sid, target, payload)) {
+        auto key_it = udp_session_keys_.find(sid);
+        auto flow_it = key_it == udp_session_keys_.end() ? udp_flows_.end()
+                                                         : udp_flows_.find(key_it->second);
+        if (flow_it == udp_flows_.end() || !flow_it->second.proxied ||
+            flow_it->second.outbound != tunnel->outbound) {
+            payload.clear();
+            continue;
+        }
 
+        if (cmd == TunnelCmd::UdpPacket) {
             flow_it->second.last_activity_ms = uv_now(loop_);
-            send_udp_response_to_flow(flow_it->second, target,
-                                      payload.data(), payload.readable(),
-                                      RouteAction::Proxy);
+            send_udp_response_to_flow(flow_it->second, target, payload.data(),
+                                      payload.readable(), RouteAction::Proxy);
         } else if (cmd == TunnelCmd::Disconnect) {
-            auto key_it = udp_session_keys_.find(sid);
-            if (key_it != udp_session_keys_.end()) {
-                std::string flow_key = key_it->second;
-                remove_udp_flow(flow_key, false);
-            }
+            remove_udp_flow(key_it->second, false);
         }
         payload.clear();
     }
 
-    if (udp_tunnel_.codec.has_protocol_error()) {
-        udp_tunnel_.codec.clear_protocol_error();
-        close_udp_tunnel();
+    if (tunnel->codec.has_protocol_error()) {
+        tunnel->codec.clear_protocol_error();
+        close_udp_tunnel(tunnel);
     }
 }
 
-void ClientApp::close_udp_tunnel() {
-    auto tunnel = udp_tunnel_.tunnel_session;
-    udp_tunnel_ = UdpTunnel();
-    if (tunnel && !tunnel->is_closed()) {
-        tunnel->set_close_callback(nullptr);
-        tunnel->close();
+void ClientApp::close_udp_tunnel(const UdpTunnelPtr& tunnel) {
+    if (!tunnel) return;
+    auto session = std::move(tunnel->tunnel_session);
+    tunnel->connected = false;
+    tunnel->connecting = false;
+    tunnel->handshake_buf.clear();
+    tunnel->recv_buf.clear();
+    for (const auto& packet : tunnel->pending) {
+        auto key = udp_session_keys_.find(packet.session_id);
+        if (key == udp_session_keys_.end()) continue;
+        auto flow = udp_flows_.find(key->second);
+        if (flow != udp_flows_.end()) {
+            flow->second.pending_proxy_bytes -= std::min(
+                flow->second.pending_proxy_bytes, packet.payload.size());
+        }
     }
+    tunnel->pending.clear();
+    tunnel->pending_bytes = 0;
+    tunnel->codec = TunnelCodec();
+    TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
+    if (session && !session->is_closed()) {
+        session->set_close_callback(nullptr);
+        session->close();
+    }
+}
+
+void ClientApp::close_all_udp_tunnels() {
+    std::vector<UdpTunnelPtr> tunnels;
+    tunnels.reserve(udp_tunnels_.size());
+    for (const auto& item : udp_tunnels_) tunnels.push_back(item.second);
+    udp_tunnels_.clear();
+    for (const auto& tunnel : tunnels) close_udp_tunnel(tunnel);
 }
 
 void ClientApp::on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
@@ -1128,8 +1279,16 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
     const std::string flow_key = sockaddr_key(addr) + ">" + target.host + ":" + std::to_string(target.port);
     auto it = app->udp_flows_.find(flow_key);
     if (it == app->udp_flows_.end()) {
+        if (app->udp_flows_.size() >= app->config_.udp_max_flows) {
+            TX_WARN("Dropping SOCKS5 UDP flow: configured flow limit reached");
+            return;
+        }
         UdpFlow flow;
-        flow.session_id = app->next_session_id_++;
+        flow.session_id = app->allocate_session_id();
+        if (flow.session_id == 0) {
+            TX_ERROR("UDP session ID space exhausted");
+            return;
+        }
         flow.kind = UdpFlowKind::Socks5;
         flow.last_activity_ms = uv_now(app->loop_);
         memset(&flow.client_addr, 0, sizeof(flow.client_addr));
@@ -1162,12 +1321,10 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         return;
     }
 
-    if (app->udp_tunnel_.outbound && app->udp_tunnel_.outbound != outbound) {
-        app->close_udp_tunnel();
-    }
-    app->udp_tunnel_.outbound = outbound;
     it->second.proxied = true;
-    app->send_udp_packet(it->second.session_id, target, payload, payload_len);
+    it->second.outbound = outbound;
+    app->send_udp_packet(app->get_udp_tunnel(outbound), it->second.session_id,
+                         target, payload, payload_len);
 }
 
 void ClientApp::on_udp_send_done(uv_udp_send_t* req, int status) {
@@ -1460,7 +1617,17 @@ void ClientApp::on_tun_tcp_accept(SessionPtr session) {
     conn->tunnel_connected = false;
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
-    conn->session_id = next_session_id_++;
+    conn->session_id = allocate_session_id();
+    if (conn->session_id == 0) {
+        TX_ERROR("TCP session ID space exhausted");
+        session->close();
+        return;
+    }
+    if (!admit_proxy_connection(conn)) {
+        release_session_id(conn->session_id);
+        session->close();
+        return;
+    }
 
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
@@ -1568,7 +1735,17 @@ void ClientApp::on_lwip_tcp_accept(const std::shared_ptr<LwipTcpStream>& stream,
     conn->tunnel_connected = false;
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
-    conn->session_id = next_session_id_++;
+    conn->session_id = allocate_session_id();
+    if (conn->session_id == 0) {
+        TX_ERROR("TCP session ID space exhausted");
+        stream->reset();
+        return;
+    }
+    if (!admit_proxy_connection(conn)) {
+        release_session_id(conn->session_id);
+        stream->reset();
+        return;
+    }
 
     stream->set_close_callback([this, conn]() { on_proxy_close(conn); });
     stream->set_eof_callback([this, conn]() { on_local_eof(conn); });
@@ -1721,8 +1898,18 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
 
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end()) {
+        if (udp_flows_.size() >= config_.udp_max_flows) {
+            TX_WARN("Dropping TUN UDP flow: configured flow limit reached");
+            lwip_udp_stack_.close_flow(lwip_flow_id);
+            return;
+        }
         UdpFlow flow;
-        flow.session_id = next_session_id_++;
+        flow.session_id = allocate_session_id();
+        if (flow.session_id == 0) {
+            TX_ERROR("TUN UDP session ID space exhausted");
+            lwip_udp_stack_.close_flow(lwip_flow_id);
+            return;
+        }
         flow.kind = UdpFlowKind::Tun;
         flow.last_activity_ms = uv_now(loop_);
         flow.client_addr_len = 0;
@@ -1766,12 +1953,9 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         return;
     }
 
-    if (udp_tunnel_.outbound && udp_tunnel_.outbound != outbound) {
-        close_udp_tunnel();
-    }
-    udp_tunnel_.outbound = outbound;
     it->second.proxied = true;
-    send_udp_packet(it->second.session_id, target, data, len);
+    it->second.outbound = outbound;
+    send_udp_packet(get_udp_tunnel(outbound), it->second.session_id, target, data, len);
 }
 
 bool ClientApp::write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
@@ -1799,7 +1983,17 @@ void ClientApp::on_http_accept(SessionPtr session) {
     conn->tunnel_connected = false;
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
-    conn->session_id = next_session_id_++;
+    conn->session_id = allocate_session_id();
+    if (conn->session_id == 0) {
+        TX_ERROR("HTTP session ID space exhausted");
+        session->close();
+        return;
+    }
+    if (!admit_proxy_connection(conn)) {
+        release_session_id(conn->session_id);
+        session->close();
+        return;
+    }
 
     conn->http->set_target_callback([conn](const TargetAddr& target) {
         conn->target = target;
@@ -1870,7 +2064,17 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
     conn->tunnel_connected = false;
     conn->tunnel_connecting = false;
     conn->tunnel_timer = nullptr;
-    conn->session_id = next_session_id_++;
+    conn->session_id = allocate_session_id();
+    if (conn->session_id == 0) {
+        TX_ERROR("SOCKS5 session ID space exhausted");
+        session->close();
+        return;
+    }
+    if (!admit_proxy_connection(conn)) {
+        release_session_id(conn->session_id);
+        session->close();
+        return;
+    }
 
     conn->socks5->set_target_callback([conn](const TargetAddr& target) {
         conn->target = target;
@@ -2657,11 +2861,42 @@ void ClientApp::on_proxy_close(ProxyConnPtr conn) {
     }
 
     connections_.erase(conn->session_id);
+    release_session_id(conn->session_id);
+    if (conn->admitted) {
+        conn->admitted = false;
+        if (active_proxy_connections_ > 0) --active_proxy_connections_;
+    }
 
     if (conn->route == RouteAction::Proxy) {
         tunnel_send_disconnect(conn);
         close_tunnel_session(conn);
     }
+}
+
+bool ClientApp::admit_proxy_connection(ProxyConnPtr conn) {
+    if (!conn) return false;
+    if (active_proxy_connections_ >= config_.max_proxy_connections) {
+        TX_WARN("Rejecting proxy connection: configured connection limit reached");
+        return false;
+    }
+    ++active_proxy_connections_;
+    conn->admitted = true;
+    return true;
+}
+
+SessionId ClientApp::allocate_session_id() {
+    const SessionId first = next_session_id_;
+    do {
+        const SessionId candidate = next_session_id_++;
+        if (candidate != 0 && active_session_ids_.insert(candidate).second) {
+            return candidate;
+        }
+    } while (next_session_id_ != first);
+    return 0;
+}
+
+void ClientApp::release_session_id(SessionId session_id) {
+    if (session_id != 0) active_session_ids_.erase(session_id);
 }
 
 } // namespace tx

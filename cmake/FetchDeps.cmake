@@ -55,6 +55,7 @@ function(tx_find_libuv)
         FetchContent_Declare(
             libuv
             URL https://github.com/libuv/libuv/archive/refs/tags/v1.48.0.tar.gz
+            URL_HASH SHA256=8c253adb0f800926a6cbd1c6576abae0bc8eb86a4f891049b72f9e5b7dc58f33
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
         FetchContent_MakeAvailable(libuv)
@@ -112,6 +113,7 @@ function(tx_find_nlohmann_json)
         FetchContent_Declare(
             nlohmann_json
             URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz
+            URL_HASH SHA256=0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
         FetchContent_MakeAvailable(nlohmann_json)

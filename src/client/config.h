@@ -60,9 +60,14 @@ struct ClientConfig {
     std::string dns_fake_ipv6_range = "fd00:198:18::/96";
     std::vector<std::string> dns_upstreams;
     uint32_t dns_cache_ttl = 60;
+    uint32_t dns_cache_capacity = 4096;
 
     // UDP flows are removed after this much inactivity.
     uint64_t    udp_idle_timeout_ms = 300000;
+    uint32_t    udp_max_flows = 4096;
+
+    // Bound unauthenticated/local proxy state in long-running clients.
+    uint32_t    max_proxy_connections = 4096;
 
     // Outbound connections
     std::vector<OutboundConfig> outbounds;

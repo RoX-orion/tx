@@ -187,14 +187,14 @@ TcpSession::~TcpSession() {
     }
 }
 
-void TcpSession::init(uv_tcp_t* server_handle) {
+bool TcpSession::init(uv_tcp_t* server_handle) {
     tcp_.data = this;
 
     uv_stream_t* server_stream = reinterpret_cast<uv_stream_t*>(server_handle);
     if (uv_accept(server_stream, reinterpret_cast<uv_stream_t*>(&tcp_)) != 0) {
         TX_ERROR("uv_accept failed");
-        closed_ = true;
-        return;
+        close();
+        return false;
     }
 
     // Extract remote address
@@ -215,6 +215,7 @@ void TcpSession::init(uv_tcp_t* server_handle) {
     }
 
     TX_DEBUG("Session accepted from %s:%u", remote_addr_.c_str(), remote_port_);
+    return true;
 }
 
 void TcpSession::connect(const std::string& host, uint16_t port, ConnectCb cb) {
@@ -446,7 +447,9 @@ void TcpSession::close() {
         // TcpSession is expected to be owned by shared_ptr. If it is not,
         // keep the old behavior rather than throwing during shutdown.
     }
-    uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), on_close);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), on_close);
+    }
 }
 
 void TcpSession::shutdown_write() {
@@ -745,7 +748,7 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
 // ==================== TcpServer ====================
 
 TcpServer::TcpServer(uv_loop_t* loop)
-    : loop_(loop), listening_(false), transparent_(false) {
+    : loop_(loop), listening_(false), transparent_(false), stopped_(false) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
 }
@@ -755,6 +758,10 @@ TcpServer::~TcpServer() {
 }
 
 bool TcpServer::listen(const std::string& host, uint16_t port) {
+    if (stopped_ || uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
+        TX_ERROR("Cannot listen on a stopped TCP server");
+        return false;
+    }
     transparent_ = false;
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
@@ -787,6 +794,10 @@ bool TcpServer::listen(const std::string& host, uint16_t port) {
 }
 
 bool TcpServer::listen_transparent(const std::string& host, uint16_t port) {
+    if (stopped_ || uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
+        TX_ERROR("Cannot listen on a stopped TCP server");
+        return false;
+    }
     transparent_ = true;
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
@@ -830,8 +841,10 @@ bool TcpServer::listen_transparent(const std::string& host, uint16_t port) {
 }
 
 void TcpServer::stop() {
-    if (listening_) {
-        listening_ = false;
+    if (stopped_) return;
+    stopped_ = true;
+    listening_ = false;
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
         uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);
     }
 }
@@ -843,10 +856,10 @@ void TcpServer::on_connection(uv_stream_t* server, int status) {
     }
 
     auto* self = static_cast<TcpServer*>(server->data);
-    if (!self->accept_cb_) return;
+    if (!self || self->stopped_ || !self->accept_cb_) return;
 
     auto session = std::make_shared<TcpSession>(self->loop_);
-    session->init(reinterpret_cast<uv_tcp_t*>(&self->tcp_));
+    if (!session->init(reinterpret_cast<uv_tcp_t*>(&self->tcp_))) return;
     self->accept_cb_(session);
 }
 

@@ -1,5 +1,9 @@
 #include "tx/net/lwip_udp_stack.h"
 
+#include <atomic>
+#include <chrono>
+#include <openssl/rand.h>
+
 extern "C" {
 #include "lwip/init.h"
 #include "lwip/ip.h"
@@ -13,7 +17,6 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -29,11 +32,26 @@ extern "C" u32_t sys_now(void) {
 }
 
 extern "C" unsigned int lwip_port_rand(void) {
-    static unsigned int state = 0x6d2b79f5u;
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
+    unsigned int value = 0;
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&value), sizeof(value)) == 1) {
+        return value;
+    }
+    // OpenSSL entropy failure is exceptional. Keep a thread-safe fallback so
+    // lwIP never reuses the old fixed process-wide seed.
+    static std::atomic<unsigned int> state{
+        static_cast<unsigned int>(std::chrono::steady_clock::now()
+                                      .time_since_epoch().count())};
+    unsigned int previous = state.load(std::memory_order_relaxed);
+    unsigned int next = 0;
+    do {
+        next = previous;
+        next ^= next << 13;
+        next ^= next >> 17;
+        next ^= next << 5;
+    } while (!state.compare_exchange_weak(previous, next,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed));
+    return next;
 }
 
 namespace tx {
@@ -42,6 +60,10 @@ namespace {
 constexpr size_t kMaxTcpPendingWrite = 16 * 1024 * 1024;
 constexpr size_t kMaxTcpPendingRead = 4 * 1024 * 1024;
 std::once_flag g_lwip_init_once;
+// HEV lwIP keeps global protocol state and is not safe to drive from two
+// independent ClientApp loops. Fail initialization explicitly instead of
+// allowing a second TUN instance to corrupt the first one's state.
+std::atomic<LwipUdpStack*> g_active_lwip_stack{nullptr};
 
 uint8_t ip_protocol(const uint8_t* data, size_t len) {
     if (!data || len == 0) return 0;
@@ -275,6 +297,7 @@ struct LwipUdpStack::Impl {
     tcp_pcb* tcp_listener = nullptr;
     uint64_t next_flow_id = 1;
     bool initialized = false;
+    bool owns_global_stack = false;
     DatagramCallback datagram_callback;
     TcpAcceptCallback tcp_accept_callback;
     PacketOutputCallback output_callback;
@@ -381,6 +404,13 @@ bool LwipUdpStack::initialize(const std::vector<std::string>& addresses, int mtu
         error = "lwIP TUN requires addresses and an MTU between 1 and 65535";
         return false;
     }
+    LwipUdpStack* expected = nullptr;
+    if (!g_active_lwip_stack.compare_exchange_strong(
+            expected, this, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        error = "only one native lwIP TUN instance can run in this process";
+        return false;
+    }
+    impl_->owns_global_stack = true;
     ip4_addr_t address;
     ip4_addr_set_zero(&address);
     ip4_addr_t netmask;
@@ -468,6 +498,12 @@ void LwipUdpStack::shutdown() {
     impl_->datagram_callback = DatagramCallback();
     impl_->tcp_accept_callback = TcpAcceptCallback();
     impl_->output_callback = PacketOutputCallback();
+    if (impl_->owns_global_stack) {
+        LwipUdpStack* expected = this;
+        g_active_lwip_stack.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+        impl_->owns_global_stack = false;
+    }
 }
 
 bool LwipUdpStack::input(const uint8_t* packet, size_t packet_len) {

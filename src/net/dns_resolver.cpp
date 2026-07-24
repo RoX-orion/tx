@@ -1,6 +1,7 @@
 #include "tx/net/dns_resolver.h"
 #include "tx/common/endian.h"
 #include "tx/common/log.h"
+#include "tx/common/network.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9,9 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <sstream>
-#include <thread>
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 #include <arpa/inet.h>
@@ -49,6 +48,99 @@ struct DnsResolver::HostRequest {
     uint64_t generation = 0;
     DnsResolver* owner = nullptr;
 };
+
+namespace {
+
+std::atomic<uint16_t> g_dns_query_id{1};
+
+bool append_dns_name(const std::string& host, std::vector<uint8_t>& query) {
+    if (host.empty() || host.size() > 253) return false;
+    size_t begin = 0;
+    while (begin < host.size()) {
+        const size_t end = host.find('.', begin);
+        const size_t length = (end == std::string::npos ? host.size() : end) - begin;
+        if (length == 0 || length > 63) return false;
+        query.push_back(static_cast<uint8_t>(length));
+        for (size_t i = 0; i < length; ++i) {
+            const unsigned char value = static_cast<unsigned char>(host[begin + i]);
+            if (value <= 0x20 || value >= 0x7f) return false;
+            query.push_back(static_cast<uint8_t>(std::tolower(value)));
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    query.push_back(0);
+    return true;
+}
+
+bool build_host_query(const std::string& host, uint16_t type, std::vector<uint8_t>& query) {
+    query.assign(12, 0);
+    store_be16(query.data(), g_dns_query_id.fetch_add(1, std::memory_order_relaxed));
+    store_be16(query.data() + 2, 0x0100); // RD
+    store_be16(query.data() + 4, 1);
+    if (!append_dns_name(host, query)) return false;
+    const size_t offset = query.size();
+    query.resize(offset + 4);
+    store_be16(query.data() + offset, type);
+    store_be16(query.data() + offset + 2, 1);
+    return true;
+}
+
+bool skip_dns_name(const uint8_t* message, size_t length, size_t& offset) {
+    if (!message || offset >= length) return false;
+    unsigned labels = 0;
+    while (offset < length) {
+        const uint8_t size = message[offset++];
+        if (size == 0) return true;
+        if ((size & 0xc0u) == 0xc0u) {
+            if (offset >= length) return false;
+            ++offset;
+            return true;
+        }
+        if ((size & 0xc0u) != 0 || size > 63 || ++labels > 127 ||
+            offset + size > length) return false;
+        offset += size;
+    }
+    return false;
+}
+
+std::vector<std::string> parse_host_response(const std::vector<uint8_t>& response,
+                                             int family) {
+    std::vector<std::string> addresses;
+    if (response.size() < 12 || (load_be16(response.data() + 2) & 0x800fu) != 0x8000u)
+        return addresses;
+    const uint16_t questions = load_be16(response.data() + 4);
+    const uint16_t answers = load_be16(response.data() + 6);
+    size_t offset = 12;
+    for (uint16_t i = 0; i < questions; ++i) {
+        if (!skip_dns_name(response.data(), response.size(), offset) || offset + 4 > response.size())
+            return std::vector<std::string>();
+        offset += 4;
+    }
+    for (uint16_t i = 0; i < answers && addresses.size() < 16; ++i) {
+        if (!skip_dns_name(response.data(), response.size(), offset) || offset + 10 > response.size())
+            return std::vector<std::string>();
+        const uint16_t type = load_be16(response.data() + offset);
+        const uint16_t klass = load_be16(response.data() + offset + 2);
+        const uint16_t rdlength = load_be16(response.data() + offset + 8);
+        offset += 10;
+        if (offset + rdlength > response.size()) return std::vector<std::string>();
+        const bool want4 = (family == AF_UNSPEC || family == AF_INET) &&
+            type == 1 && klass == 1 && rdlength == 4;
+        const bool want6 = (family == AF_UNSPEC || family == AF_INET6) &&
+            type == 28 && klass == 1 && rdlength == 16;
+        if (want4 || want6) {
+            char text[INET6_ADDRSTRLEN] = {};
+            const int af = want4 ? AF_INET : AF_INET6;
+            if (inet_ntop(af, response.data() + offset, text, sizeof(text)))
+                addresses.emplace_back(text);
+        }
+        offset += rdlength;
+    }
+    return addresses;
+}
+
+} // namespace
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 namespace {
@@ -470,62 +562,16 @@ void DnsResolver::on_work(uv_work_t* work) {
         return;
     }
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
-    // Android's resolver gives VPN DNS queries only a short time to complete.
-    // Trying IPv6 and IPv4 upstreams serially can exceed that deadline when an
-    // upstream is unreachable, even though a later server is healthy. Race the
-    // configured servers and keep the first valid response instead.
-    struct RaceState {
-        std::mutex mutex;
-        std::vector<uint8_t> query;
-        ProtectCallback protector;
-        uint32_t mark = 0;
-        std::vector<uint8_t> response;
-        std::atomic<bool> cancelled{false};
-        bool resolved = false;
-    };
-    auto state = std::make_shared<RaceState>();
-    state->query = request->query;
-    state->protector = request->protector;
-    state->mark = request->mark;
-
-    std::vector<std::thread> workers;
-    workers.reserve(request->upstreams.size() * 2);
+    // uv_queue_work already uses libuv's bounded worker pool. Do all upstream
+    // attempts in that worker instead of spawning two native threads per DNS
+    // request, which allowed a burst of queries to exhaust process resources.
     for (const auto& upstream : request->upstreams) {
-        auto start_worker = [state, upstream, &workers](bool tcp) {
-            try {
-                workers.emplace_back([state, upstream, tcp]() {
-                    std::vector<uint8_t> candidate;
-                    const bool ok = tcp
-                        ? resolve_tcp(upstream, state->query, state->protector,
-                                      state->mark, candidate, &state->cancelled)
-                        : resolve_udp(upstream, state->query, state->protector,
-                                      state->mark, candidate, &state->cancelled);
-                    if (!ok && !operation_cancelled(&state->cancelled)) {
-                        TX_DEBUG("DNS upstream %s failed over %s", upstream.c_str(),
-                                 tcp ? "TCP" : "UDP");
-                    }
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    if (ok && !state->resolved) {
-                        state->response = std::move(candidate);
-                        state->resolved = true;
-                        state->cancelled.store(true, std::memory_order_release);
-                    }
-                });
-            } catch (const std::system_error& error) {
-                TX_WARN("Could not start DNS %s worker for %s: %s",
-                        tcp ? "TCP" : "UDP", upstream.c_str(), error.what());
-            }
-        };
-        // Some Android networks silently filter application UDP/53 while
-        // allowing TCP/53. Race both transports so fallback does not add a
-        // second timeout interval.
-        start_worker(false);
-        start_worker(true);
-    }
-    for (auto& worker : workers) worker.join();
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->resolved) request->response = state->response;
+        if (resolve_udp(upstream, request->query, request->protector,
+                        request->mark, request->response, nullptr) ||
+            resolve_tcp(upstream, request->query, request->protector,
+                        request->mark, request->response, nullptr)) {
+            return;
+        }
     }
     if (request->response.empty())
         TX_WARN("All %zu DNS upstreams failed", request->upstreams.size());
@@ -554,6 +600,57 @@ void DnsResolver::resolve_host(const std::string& host, int family,
         callback(std::vector<std::string>{host});
         return;
     }
+    if (!host_resolver_) {
+        if (!can_query()) {
+            TX_ERROR("No controlled DNS resolver is configured for %s", host.c_str());
+            callback(std::vector<std::string>());
+            return;
+        }
+
+        const uint64_t generation = generation_;
+        auto resolve_type = [this, host, family, callback, generation](uint16_t type,
+                                                                         bool fallback_ipv6) {
+            std::vector<uint8_t> query;
+            if (!build_host_query(host, type, query)) {
+                callback(std::vector<std::string>());
+                return;
+            }
+            resolve(query.data(), query.size(),
+                [this, host, family, callback, generation, fallback_ipv6]
+                (std::vector<uint8_t> response) {
+                    if (generation != generation_) {
+                        callback(std::vector<std::string>());
+                        return;
+                    }
+                    std::vector<std::string> addresses =
+                        parse_host_response(response, family);
+                    if (!addresses.empty() || !fallback_ipv6) {
+                        callback(std::move(addresses));
+                        return;
+                    }
+                    std::vector<uint8_t> query6;
+                    if (!build_host_query(host, 28, query6)) {
+                        callback(std::vector<std::string>());
+                        return;
+                    }
+                    resolve(query6.data(), query6.size(),
+                        [this, family, callback, generation](std::vector<uint8_t> response6) {
+                            if (generation != generation_) {
+                                callback(std::vector<std::string>());
+                                return;
+                            }
+                            callback(parse_host_response(response6, family));
+                        });
+                });
+        };
+        if (family == AF_INET6) {
+            resolve_type(28, false);
+        } else {
+            resolve_type(1, family == AF_UNSPEC);
+        }
+        return;
+    }
+
     auto* request = new HostRequest;
     request->work.data = request;
     request->host = host;
@@ -571,26 +668,8 @@ void DnsResolver::resolve_host(const std::string& host, int family,
 
 void DnsResolver::on_host_work(uv_work_t* work) {
     auto* request = static_cast<HostRequest*>(work->data);
-    if (request->resolver) {
+    if (request->resolver)
         request->addresses = request->resolver(request->host, request->family);
-        return;
-    }
-    addrinfo hints{};
-    hints.ai_family = request->family;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* result = nullptr;
-    if (getaddrinfo(request->host.c_str(), nullptr, &hints, &result) != 0) return;
-    for (auto* ai = result; ai && request->addresses.size() < 16; ai = ai->ai_next) {
-        char text[INET6_ADDRSTRLEN]{};
-        const void* source = ai->ai_family == AF_INET
-            ? static_cast<const void*>(&reinterpret_cast<sockaddr_in*>(ai->ai_addr)->sin_addr)
-            : ai->ai_family == AF_INET6
-                ? static_cast<const void*>(&reinterpret_cast<sockaddr_in6*>(ai->ai_addr)->sin6_addr)
-                : nullptr;
-        if (source && inet_ntop(ai->ai_family, source, text, sizeof(text)))
-            request->addresses.emplace_back(text);
-    }
-    freeaddrinfo(result);
 }
 
 void DnsResolver::after_host_work(uv_work_t* work, int status) {

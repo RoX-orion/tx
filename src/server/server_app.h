@@ -55,10 +55,11 @@ private:
             bool       remote_eof = false;
         };
         struct UdpOutbound {
-            uv_udp_t* udp;
-            SessionId session_id;
-            uint64_t generation;
-            uint64_t last_activity_ms;
+            uv_udp_t* udp = nullptr;
+            SessionId session_id = 0;
+            uint64_t generation = 0;
+            uint64_t last_activity_ms = 0;
+            int family = AF_UNSPEC;
         };
         std::unordered_map<SessionId, Outbound> outbounds;
         std::unordered_map<SessionId, UdpOutbound> udp_outbounds;
@@ -94,6 +95,8 @@ private:
     void handle_data(TunnelClientPtr client, SessionId sid, Buffer& payload);
     void handle_udp_packet(TunnelClientPtr client, SessionId sid,
                            const TargetAddr& target, Buffer& payload);
+    bool ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
+                                    TunnelClient::UdpOutbound& outbound, int family);
     void handle_disconnect(TunnelClientPtr client, SessionId sid);
     void handle_half_close(TunnelClientPtr client, SessionId sid);
     bool start_udp_cleanup_timer();

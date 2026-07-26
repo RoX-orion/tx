@@ -82,6 +82,8 @@ TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
 TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd);
 
 // Start the Android client with a physical-network bind + VPN-exemption callback.
+// This simplified API requires at least one dns.upstreams entry in the client
+// config. Use tx_client_start_android_ex() for app-provided DNS hooks.
 // Native code takes ownership of tun_fd, including startup-failure paths.
 // protect_user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,

@@ -29,7 +29,8 @@ struct TxServerHandle {
 namespace {
 
 tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
-                         const tx_android_network_hooks_t* hooks) {
+                         const tx_android_network_hooks_t* hooks,
+                         bool require_explicit_dns) {
     if (!config || !config->config_path) return nullptr;
 
     tx::SocketProtectCallback socket_protector;
@@ -79,6 +80,16 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
         return nullptr;
     }
 
+    if (require_explicit_dns && cfg.dns_upstreams.empty()) {
+        TX_ERROR("tx_client_start_android requires dns.upstreams or "
+                 "tx_client_start_android_ex DNS hooks");
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+        if (tun_fd >= 0) ::close(tun_fd);
+#endif
+        delete handle;
+        return nullptr;
+    }
+
     if (config->log_level) {
         cfg.log_level = config->log_level;
     }
@@ -106,11 +117,11 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
 extern "C" {
 
 tx_handle_t tx_client_start(const tx_client_config_t* config) {
-    return start_client(config, -1, nullptr);
+    return start_client(config, -1, nullptr, false);
 }
 
 tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
-    return start_client(config, tun_fd, nullptr);
+    return start_client(config, tun_fd, nullptr, false);
 }
 
 tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
@@ -122,7 +133,7 @@ tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd
     hooks.version = TX_ANDROID_NETWORK_HOOKS_VERSION;
     hooks.protect_socket = protect_fn;
     hooks.user_data = protect_user_data;
-    return start_client(config, tun_fd, &hooks);
+    return start_client(config, tun_fd, &hooks, true);
 }
 
 tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
@@ -130,7 +141,7 @@ tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun
     if (tun_fd < 0 || !hooks || hooks->struct_size < sizeof(tx_android_network_hooks_t) ||
         hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket ||
         !hooks->resolve_host || !hooks->query_dns) return nullptr;
-    return start_client(config, tun_fd, hooks);
+    return start_client(config, tun_fd, hooks, false);
 }
 
 void tx_client_notify_network_changed(tx_handle_t handle) {

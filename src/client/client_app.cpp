@@ -362,8 +362,17 @@ bool ClientApp::init(const ClientConfig& config) {
         TX_ERROR("Failed to configure fake-IP DNS: %s", dns_error.c_str());
         return false;
     }
+    uint32_t dns_bypass_mark = 0;
+#if defined(TX_PLATFORM_LINUX)
+    // SO_MARK is needed only for the lwIP TUN policy-routing path.  Applying
+    // it to ordinary HTTP/SOCKS DNS sockets makes unprivileged clients fail
+    // with EPERM before they can issue a query.
+    if (config_.tun_enabled && config_.tun_tcp_stack == "lwip") {
+        dns_bypass_mark = config_.tun_bypass_mark;
+    }
+#endif
     dns_resolver_.configure(config_.dns_upstreams, socket_protector_,
-                            config_.tun_bypass_mark, host_resolver_, dns_query_);
+                            dns_bypass_mark, host_resolver_, dns_query_);
 
     // Load router
     if (!router_.load(config.router)) {

@@ -9,7 +9,7 @@
   - `protocol`: SOCKS5, HTTP proxy, and tunnel protocol handling.
   - `router`: routing decisions.
   - `geo`: GeoIP/GeoSite parsing and lookup structures.
-  - `net`: TCP server and buffer utilities.
+  - `net`: TCP stream abstraction、DNS/fake-IP、lwIP TUN 和流量回收设施。
   - `client` / `server`: executable apps and config parsing.
 
 ## Build And Run
@@ -44,12 +44,11 @@ ctest --test-dir build --output-on-failure
 - OpenSSL and the C++ runtime are intentionally linked dynamically on all platforms.
 - `OPENSSL_ROOT_DIR` is optional and should only be passed when OpenSSL is installed outside the platform's normal search paths.
 
-The top-level `CMakeLists.txt` expects helper modules `cmake/TxUtils.cmake` and `cmake/FetchDeps.cmake`. At initialization time this repository did not contain a `cmake/` directory, so a clean CMake configure may fail until those files are restored or the dependency setup is adjusted.
+The top-level `CMakeLists.txt` uses `cmake/TxUtils.cmake` and `cmake/FetchDeps.cmake`; a clean configure can fetch libuv、nlohmann_json 和 HEV lwIP into `.deps/` when `TX_FETCH_DEPS=ON`.
 
 ## Tests
 - Test files live in `tests/` and use simple `assert`-based executables.
-- `tests/CMakeLists.txt` currently registers `crypto`, `geoip`, `geosite`, `socks5`, `http_proxy`, `router`, and `tunnel`.
-- At initialization time `tests/test_tunnel.cpp` was not present, while `tests/CMakeLists.txt` still referenced it. Expect configure/build failures unless that test is added or the registration is removed.
+- `tests/CMakeLists.txt` currently registers 17 个测试：`crypto`、`geoip`、`geosite`、`socks5`、`http_proxy`、`router`、`tunnel`、`tun_packet`、`lwip_udp_stack`、`lwip_tcp_stack`、`fake_ip_dns`、`dns_resolver`、`tls_sni`、`socket_protector`、`tcp_session_callbacks`、`udp_flow_timeout` 和 `client_config`。
 
 ## Coding Conventions
 - Keep public APIs in `include/tx/...` and implementations in matching `src/...` modules.
@@ -73,37 +72,39 @@ The top-level `CMakeLists.txt` expects helper modules `cmake/TxUtils.cmake` and 
   - `type: "block"` rejects TCP connections or drops UDP packets.
 - Old client config fields such as top-level `server`, `geo.direct_geoip`, and `geo.direct_geosite` are intentionally unsupported.
 - Default Android routing should keep private IPs first, for example `{"ip":["geoip:private"],"outboundTag":"direct-out"}`, so LAN targets such as `192.168.0.1` do not go through the remote tunnel.
-- In Android TUN mode, traffic currently flows through tun2socks into the local SOCKS5 inbound. Domain rules only work when the SOCKS5 request carries a domain or when future fake-IP reverse mapping is added; otherwise routing falls back to IP rules.
+- 原生 lwIP TUN 路径会用 fake-IP 反向映射和 TLS SNI 恢复域名，再按 `AsIs` 规则路由。HTTP/SOCKS5 监听器在 `tun.auto_redirect=false` 时仍会保留，因此 tun2socks 是可选兼容路径，而不是 Android 的唯一数据面。
 
 ## Native TUN Status
-- Client config now has a `tun` section with fields such as `enabled`, `fd`, `name`, `address`, `prefix`, `mtu`, `auto_config`, `auto_route`, `auto_redirect`, `redirect_port`, `redirect_mark`, `routes`, `mode`, `tcp_stack`, and `udp_stack`.
-- Supported native TUN mode is currently `mode: "mixed"` with `tcp_stack: "system"` and `udp_stack: "gvisor"`.
+- Client config now has a `tun` section with fields such as `enabled`, `fd`, `name`, `address` / `addresses`, `mtu`, `auto_config`, `auto_route`, `auto_redirect`, `redirect_port`, `redirect_mark`, `bypass_mark`, `route_table`, `rule_priority`, `routes`, `mode`, `tcp_stack`, and `udp_stack`.
+- `tun.mode` is deprecated. The default native mode is `tcp_stack: "lwip"` plus `udp_stack: "lwip"`; `udp_stack` currently must be `lwip`. `tcp_stack: "system"` is Linux-only and is intended for the transparent-redirect path.
 - `tx_client_start_with_tun_fd()` exists for Android `VpnService` integration. Android supplies the TUN fd externally; Android native code does not open `/dev/net/tun`.
-- `include/tx/net/tun_packet.h` and `src/net/tun_packet.cpp` parse IPv4/IPv6 TUN packets and build UDP TUN responses. `tests/test_tun_packet.cpp` covers IPv4/IPv6 UDP roundtrips.
-- Native TUN UDP packets are routed through the same UDP direct / TX tunnel / block handling used by SOCKS5 UDP.
-- Native TUN TCP packets are not handled by a user-space TCP stack. On non-Linux platforms they are still effectively a system-stack placeholder unless traffic is bridged through SOCKS/tun2socks or another platform mechanism.
+- `include/tx/net/tun_packet.h` and `src/net/tun_packet.cpp` parse IPv4/IPv6 TUN packets; `LwipUdpStack` additionally exposes the lwIP TCP stream bridge. `tests/test_tun_packet.cpp` covers IPv4/IPv6 UDP roundtrips, while `test_lwip_tcp_stack` / `test_lwip_udp_stack` cover the data plane.
+- Native TUN TCP and UDP are both routed through the same direct / TX tunnel / block decision model as HTTP/SOCKS. TCP bridging preserves half-close and applies bounded write backpressure.
+- fake-IP DNS handles UDP/TCP A and AAAA locally, retains bounded stable forward/reverse mappings, emits HTTPS/SVCB NODATA, and forwards other DNS types to configured upstreams. For a non-fake TCP/443 flow, TLS ClientHello SNI can restore the original domain before routing.
 
 ## Linux TUN / auto_redirect Notes
 - Linux has a `PlatformTunDevice` backend that can open `/dev/net/tun`, set `IFF_TUN | IFF_NO_PI`, configure IPv4 address/netmask/MTU, bring the interface up, and add IPv4 CIDR routes.
-- When `tun.auto_route=true` and `tun.routes` is empty, Linux auto-adds IPv4 split-default routes `0.0.0.0/1` and `128.0.0.0/1`.
+- In lwIP mode, `tun.auto_route=true` installs a dedicated policy-routing table. With empty `tun.routes`, it adds IPv4 (`0.0.0.0/1`, `128.0.0.0/1`) and IPv6 (`::/1`, `8000::/1`) split-default routes, with `tun.bypass_mark` returning TX egress to the main table.
+- In Linux `tcp_stack=system` mode, normal TUN route installation is IPv4-only; do not describe it as a gateway IPv6 route implementation.
 - When `tun.auto_redirect=true`, Linux starts a transparent TCP listener on `0.0.0.0:<tun.redirect_port>` and installs nftables rules in table `inet tx_auto_redirect`.
 - The current Linux redirect implementation targets local IPv4 TCP `OUTPUT` traffic. It is not yet a full gateway/side-router `PREROUTING TPROXY` implementation.
-- TX outbound TCP sockets are marked with `SO_MARK` using `tun.redirect_mark` before `uv_tcp_connect()`. The nftables redirect rule skips that mark to avoid redirect loops.
+- lwIP TUN direct/TX egress sockets use `tun.bypass_mark`; ordinary HTTP/SOCKS DNS sockets deliberately use mark 0. In `auto_redirect` mode, TCP egress uses `tun.redirect_mark`, which the nftables rule skips to avoid redirect loops.
 - Transparent listener sockets must be explicitly opened before setting `IP_TRANSPARENT`; outbound sockets must be explicitly opened before applying `SO_MARK`. Do not move these socket options back before libuv creates/opens the OS socket.
 - `stop_tun_listener()` removes the nftables auto_redirect table and stops the transparent listener.
 - Linux TUN and redirect setup usually require root or `CAP_NET_ADMIN`; `SO_MARK` may require elevated privileges as well.
 
 ## Android Runtime Notes
-- Android's current practical traffic path remains:
+- Android's native data path is:
 
 ```text
-VpnService TUN fd -> tun2socks -> local SOCKS5 127.0.0.1:1080 -> tx router -> direct / tx tunnel / block
+VpnService TUN fd -> HEV lwIP TCP/UDP -> tx router -> direct / tx tunnel / block
 ```
 
-- Because Android still depends on tun2socks for TCP/domain traffic, TUN mode must keep the HTTP/SOCKS5 and SOCKS5 UDP listeners available unless a fully native platform TCP path is enabled.
-- The current code keeps proxy listeners in TUN mode when `tun.auto_redirect=false`. This preserves Android/tun2socks compatibility.
+- Android rejects `tcp_stack=system`; use `tcp_stack=lwip` and let `VpnService` provide the fd. The native layer owns that fd after startup, including failure paths.
+- The current code keeps proxy listeners in TUN mode when `tun.auto_redirect=false`; this preserves optional tun2socks compatibility without making it a requirement.
 - Linux `tun.auto_redirect` is not available on Android; do not assume Android can use nftables/IP_TRANSPARENT.
-- Native direct/tunnel sockets support a protector callback through `tx_client_start_android()`. The Android JNI layer still needs to call `VpnService.protect(fd)`; system DNS sockets require a separate bypass strategy.
+- Native direct/tunnel and controlled DNS sockets support a protector callback. The JNI layer must call `VpnService.protect(fd)` and, when necessary, bind the fd to the selected physical `Network`.
+- `tx_client_start_android()` requires a non-empty `dns.upstreams` configuration. For app-provided host and DNS resolution, call `tx_client_start_android_ex()` with both DNS hooks.
 
 ## UDP / QUIC Status
 - SOCKS5 `UDP ASSOCIATE` is supported.
@@ -111,6 +112,8 @@ VpnService TUN fd -> tun2socks -> local SOCKS5 127.0.0.1:1080 -> tx router -> di
 - `tx_client` forwards SOCKS5 UDP packets through a shared UDP TX tunnel.
 - `tx_server` sends UDP packets to targets and returns responses through the tunnel.
 - UDP routed to a `tx` outbound is proxied through the encrypted tunnel. UDP routed to `direct` is relayed locally by `tx_client`. UDP routed to `block` is dropped.
+- Server UDP flow sockets are created for the first target address family, so IPv6 literals and AAAA-only UDP domains are supported.
+- A TUN UDP/443 destination with no fake-IP domain mapping is intentionally dropped to encourage TCP fallback, where TLS SNI can preserve domain routing.
 - Client and server UDP flows are removed after an idle timeout. Configure `udp.idle_timeout` in seconds; the default is 300 seconds.
 
 ## Android Build Context

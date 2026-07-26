@@ -142,13 +142,62 @@ std::vector<std::string> parse_host_response(const std::vector<uint8_t>& respons
 
 } // namespace
 
-#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
+    defined(TX_PLATFORM_WINDOWS)
 namespace {
 
-bool configure_socket(int fd, const DnsResolver::ProtectCallback& protector,
+#if defined(TX_PLATFORM_WINDOWS)
+using DnsSocket = SOCKET;
+using DnsSocklen = int;
+constexpr DnsSocket kInvalidDnsSocket = INVALID_SOCKET;
+
+void close_dns_socket(DnsSocket socket) {
+    closesocket(socket);
+}
+
+int dns_socket_error() {
+    return WSAGetLastError();
+}
+
+bool dns_socket_retryable(int error) {
+    return error == WSAEINTR || error == WSAEWOULDBLOCK;
+}
+
+void set_dns_socket_timeout(DnsSocket socket, int timeout_ms) {
+    const DWORD timeout = static_cast<DWORD>(timeout_ms);
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+}
+#else
+using DnsSocket = int;
+using DnsSocklen = socklen_t;
+constexpr DnsSocket kInvalidDnsSocket = -1;
+
+void close_dns_socket(DnsSocket socket) {
+    close(socket);
+}
+
+int dns_socket_error() {
+    return errno;
+}
+
+bool dns_socket_retryable(int error) {
+    return error == EINTR || error == EAGAIN || error == EWOULDBLOCK;
+}
+
+void set_dns_socket_timeout(DnsSocket socket, int timeout_ms) {
+    timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+#endif
+
+bool configure_socket(DnsSocket fd, const DnsResolver::ProtectCallback& protector,
                       uint32_t mark) {
-    if (protector && !protector(fd)) {
-        TX_ERROR("Socket protector rejected DNS fd %d", fd);
+    if (protector && !protector(static_cast<int>(fd))) {
+        TX_ERROR("Socket protector rejected DNS socket");
         return false;
     }
 #if defined(TX_PLATFORM_LINUX)
@@ -157,14 +206,12 @@ bool configure_socket(int fd, const DnsResolver::ProtectCallback& protector,
 #else
     (void)mark;
 #endif
-    timeval timeout{2, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    set_dns_socket_timeout(fd, 2000);
     return true;
 }
 
 bool upstream_address(const std::string& host, int socktype,
-                      sockaddr_storage& storage, socklen_t& length) {
+                      sockaddr_storage& storage, DnsSocklen& length) {
     std::string numeric_host = host;
     std::string service = "53";
     if (!host.empty() && host.front() == '[') {
@@ -193,7 +240,7 @@ bool upstream_address(const std::string& host, int socktype,
         return false;
     }
     std::memcpy(&storage, result->ai_addr, result->ai_addrlen);
-    length = static_cast<socklen_t>(result->ai_addrlen);
+    length = static_cast<DnsSocklen>(result->ai_addrlen);
     freeaddrinfo(result);
     return true;
 }
@@ -202,13 +249,12 @@ bool operation_cancelled(const std::atomic<bool>* cancelled) {
     return cancelled && cancelled->load(std::memory_order_acquire);
 }
 
-bool write_all(int fd, const uint8_t* data, size_t len,
+bool write_all(DnsSocket fd, const uint8_t* data, size_t len,
                const std::atomic<bool>* cancelled) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(1);
     while (len) {
         if (operation_cancelled(cancelled)) {
-            errno = ECANCELED;
             return false;
         }
 #ifdef MSG_NOSIGNAL
@@ -216,8 +262,13 @@ bool write_all(int fd, const uint8_t* data, size_t len,
 #else
         constexpr int send_flags = 0;
 #endif
-        ssize_t n = send(fd, data, len, send_flags);
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) &&
+#if defined(TX_PLATFORM_WINDOWS)
+        const int n = send(fd, reinterpret_cast<const char*>(data),
+                           static_cast<int>(len), send_flags);
+#else
+        const ssize_t n = send(fd, data, len, send_flags);
+#endif
+        if (n < 0 && dns_socket_retryable(dns_socket_error()) &&
             std::chrono::steady_clock::now() < deadline) {
             continue;
         }
@@ -227,17 +278,20 @@ bool write_all(int fd, const uint8_t* data, size_t len,
     return true;
 }
 
-bool read_all(int fd, uint8_t* data, size_t len,
+bool read_all(DnsSocket fd, uint8_t* data, size_t len,
               const std::atomic<bool>* cancelled) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(1);
     while (len) {
         if (operation_cancelled(cancelled)) {
-            errno = ECANCELED;
             return false;
         }
-        ssize_t n = recv(fd, data, len, 0);
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) &&
+#if defined(TX_PLATFORM_WINDOWS)
+        const int n = recv(fd, reinterpret_cast<char*>(data), static_cast<int>(len), 0);
+#else
+        const ssize_t n = recv(fd, data, len, 0);
+#endif
+        if (n < 0 && dns_socket_retryable(dns_socket_error()) &&
             std::chrono::steady_clock::now() < deadline) {
             continue;
         }
@@ -247,8 +301,54 @@ bool read_all(int fd, uint8_t* data, size_t len,
     return true;
 }
 
-bool connect_with_timeout(int fd, const sockaddr* address, socklen_t address_len,
+bool connect_with_timeout(DnsSocket fd, const sockaddr* address, DnsSocklen address_len,
                           int timeout_ms, const std::atomic<bool>* cancelled) {
+#if defined(TX_PLATFORM_WINDOWS)
+    u_long nonblocking = 1;
+    if (ioctlsocket(fd, FIONBIO, &nonblocking) != 0) return false;
+
+    int result = connect(fd, address, address_len);
+    if (result == SOCKET_ERROR) {
+        const int connect_error = WSAGetLastError();
+        if (connect_error != WSAEWOULDBLOCK && connect_error != WSAEINPROGRESS) {
+            nonblocking = 0;
+            ioctlsocket(fd, FIONBIO, &nonblocking);
+            return false;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        result = SOCKET_ERROR;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !operation_cancelled(cancelled)) {
+            fd_set writable;
+            FD_ZERO(&writable);
+            FD_SET(fd, &writable);
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            timeval wait{0, static_cast<long>(std::max<int64_t>(
+                1000, std::min<int64_t>(50000, remaining * 1000)))};
+            const int selected = select(0, nullptr, &writable, nullptr, &wait);
+            if (selected == SOCKET_ERROR && WSAGetLastError() == WSAEINTR) continue;
+            if (selected <= 0) continue;
+
+            int socket_error = 0;
+            int error_len = sizeof(socket_error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                           reinterpret_cast<char*>(&socket_error), &error_len) == 0 &&
+                socket_error == 0) {
+                result = 0;
+            } else if (socket_error != 0) {
+                WSASetLastError(socket_error);
+            }
+            break;
+        }
+        if (result != 0 && WSAGetLastError() == 0) WSASetLastError(WSAETIMEDOUT);
+    }
+    nonblocking = 0;
+    ioctlsocket(fd, FIONBIO, &nonblocking);
+    return result == 0;
+#else
     const int original_flags = fcntl(fd, F_GETFL, 0);
     if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0)
         return false;
@@ -287,6 +387,7 @@ bool connect_with_timeout(int fd, const sockaddr* address, socklen_t address_len
     fcntl(fd, F_SETFL, original_flags);
     errno = saved_errno;
     return result == 0;
+#endif
 }
 
 struct DnsQuestion {
@@ -397,23 +498,21 @@ bool resolve_tcp(const std::string& upstream, const std::vector<uint8_t>& query,
                  std::vector<uint8_t>& response,
                  const std::atomic<bool>* cancelled) {
     if (operation_cancelled(cancelled)) return false;
-    sockaddr_storage address{}; socklen_t address_len = 0;
+    sockaddr_storage address{}; DnsSocklen address_len = 0;
     if (!upstream_address(upstream, SOCK_STREAM, address, address_len)) {
         TX_WARN("Invalid DNS upstream address %s", upstream.c_str());
         return false;
     }
-    int fd = socket(address.ss_family, SOCK_STREAM, 0);
-    if (fd < 0) {
-        TX_WARN("DNS TCP socket for %s failed: %s", upstream.c_str(), strerror(errno));
+    DnsSocket fd = socket(address.ss_family, SOCK_STREAM, 0);
+    if (fd == kInvalidDnsSocket) {
+        TX_WARN("DNS TCP socket for %s failed: %d", upstream.c_str(), dns_socket_error());
         return false;
     }
     bool ok = configure_socket(fd, protector, mark);
-    timeval tcp_timeout{0, 100000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tcp_timeout, sizeof(tcp_timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tcp_timeout, sizeof(tcp_timeout));
+    set_dns_socket_timeout(fd, 100);
     if (ok && !connect_with_timeout(fd, reinterpret_cast<sockaddr*>(&address),
                                     address_len, 1000, cancelled)) {
-        TX_DEBUG("DNS TCP connect to %s failed: %s", upstream.c_str(), strerror(errno));
+        TX_DEBUG("DNS TCP connect to %s failed: %d", upstream.c_str(), dns_socket_error());
         ok = false;
     }
     uint8_t length[2]; store_be16(length, static_cast<uint16_t>(query.size()));
@@ -426,14 +525,14 @@ bool resolve_tcp(const std::string& upstream, const std::vector<uint8_t>& query,
         response.resize(response_len);
         ok = read_all(fd, response.data(), response.size(), cancelled);
     }
-    close(fd);
+    const int exchange_error = dns_socket_error();
+    close_dns_socket(fd);
     if (ok && !dns_response_matches_query(query, response)) {
         TX_DEBUG("DNS TCP response from %s did not match the query", upstream.c_str());
         ok = false;
     }
     if (!ok) {
-        TX_DEBUG("DNS TCP exchange with %s failed: %s", upstream.c_str(),
-                 strerror(errno));
+        TX_DEBUG("DNS TCP exchange with %s failed: %d", upstream.c_str(), exchange_error);
         response.clear();
     }
     return ok;
@@ -444,22 +543,20 @@ bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
                  std::vector<uint8_t>& response,
                  const std::atomic<bool>* cancelled) {
     if (operation_cancelled(cancelled)) return false;
-    sockaddr_storage address{}; socklen_t address_len = 0;
+    sockaddr_storage address{}; DnsSocklen address_len = 0;
     if (!upstream_address(upstream, SOCK_DGRAM, address, address_len)) {
         TX_WARN("Invalid DNS upstream address %s", upstream.c_str());
         return false;
     }
-    int fd = socket(address.ss_family, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        TX_WARN("DNS UDP socket for %s failed: %s", upstream.c_str(), strerror(errno));
+    DnsSocket fd = socket(address.ss_family, SOCK_DGRAM, 0);
+    if (fd == kInvalidDnsSocket) {
+        TX_WARN("DNS UDP socket for %s failed: %d", upstream.c_str(), dns_socket_error());
         return false;
     }
     bool ok = configure_socket(fd, protector, mark);
-    timeval udp_timeout{0, 100000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &udp_timeout, sizeof(udp_timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &udp_timeout, sizeof(udp_timeout));
+    set_dns_socket_timeout(fd, 100);
     if (ok && connect(fd, reinterpret_cast<sockaddr*>(&address), address_len) != 0) {
-        TX_DEBUG("DNS UDP connect to %s failed: %s", upstream.c_str(), strerror(errno));
+        TX_DEBUG("DNS UDP connect to %s failed: %d", upstream.c_str(), dns_socket_error());
         ok = false;
     }
     if (ok) {
@@ -468,27 +565,39 @@ bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
 #else
         constexpr int send_flags = 0;
 #endif
-        ssize_t sent = send(fd, query.data(), query.size(), send_flags);
+#if defined(TX_PLATFORM_WINDOWS)
+        const int sent = send(fd, reinterpret_cast<const char*>(query.data()),
+                              static_cast<int>(query.size()), send_flags);
+        ok = sent == static_cast<int>(query.size());
+#else
+        const ssize_t sent = send(fd, query.data(), query.size(), send_flags);
         ok = sent == static_cast<ssize_t>(query.size());
-        if (!ok) TX_DEBUG("DNS UDP send to %s failed: %s", upstream.c_str(),
-                         strerror(errno));
+#endif
+        if (!ok) TX_DEBUG("DNS UDP send to %s failed: %d", upstream.c_str(),
+                          dns_socket_error());
     }
     uint8_t buffer[65535];
+#if defined(TX_PLATFORM_WINDOWS)
+    int received = -1;
+#else
     ssize_t received = -1;
+#endif
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(2);
     while (ok && !operation_cancelled(cancelled) &&
            std::chrono::steady_clock::now() < deadline) {
+ #if defined(TX_PLATFORM_WINDOWS)
+        received = recv(fd, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+ #else
         received = recv(fd, buffer, sizeof(buffer), 0);
+ #endif
         if (received >= 0) break;
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) break;
+        if (!dns_socket_retryable(dns_socket_error())) break;
     }
-    if (operation_cancelled(cancelled)) errno = ECANCELED;
-    const int receive_errno = errno;
-    close(fd);
+    const int receive_error = dns_socket_error();
+    close_dns_socket(fd);
     if (received < 12) {
-        TX_DEBUG("DNS UDP receive from %s failed: %s", upstream.c_str(),
-                strerror(receive_errno));
+        TX_DEBUG("DNS UDP receive from %s failed: %d", upstream.c_str(), receive_error);
         return false;
     }
     response.assign(buffer, buffer + received);
@@ -561,7 +670,8 @@ void DnsResolver::on_work(uv_work_t* work) {
         request->response = request->query_hook(request->query.data(), request->query.size());
         return;
     }
-#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
+    defined(TX_PLATFORM_WINDOWS)
     // uv_queue_work already uses libuv's bounded worker pool. Do all upstream
     // attempts in that worker instead of spawning two native threads per DNS
     // request, which allowed a burst of queries to exhaust process resources.
@@ -575,8 +685,6 @@ void DnsResolver::on_work(uv_work_t* work) {
     }
     if (request->response.empty())
         TX_WARN("All %zu DNS upstreams failed", request->upstreams.size());
-#else
-    (void)request;
 #endif
 }
 

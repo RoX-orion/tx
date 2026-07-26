@@ -659,27 +659,8 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
             payload.clear();
             return;
         }
-        auto* udp = new uv_udp_t;
-        if (uv_udp_init(loop_, udp) != 0) {
-            delete udp;
-            payload.clear();
-            return;
-        }
         const uint64_t generation = client->next_udp_generation++;
-        auto* ctx = new UdpCtx{this, client, sid, generation};
-        udp->data = ctx;
-
-        sockaddr_in bind_addr;
-        uv_ip4_addr("0.0.0.0", 0, &bind_addr);
-        if (uv_udp_bind(udp, reinterpret_cast<const sockaddr*>(&bind_addr), 0) != 0 ||
-            uv_udp_recv_start(udp, ServerApp::udp_alloc, ServerApp::on_udp_read) != 0) {
-            uv_close(reinterpret_cast<uv_handle_t*>(udp), ServerApp::on_udp_closed);
-            payload.clear();
-            return;
-        }
-
         TunnelClient::UdpOutbound out;
-        out.udp = udp;
         out.session_id = sid;
         out.generation = generation;
         out.last_activity_ms = uv_now(loop_);
@@ -689,6 +670,10 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
 
     sockaddr_storage addr;
     if (target_to_sockaddr(target, addr)) {
+        if (!ensure_udp_outbound_socket(client, sid, it->second, addr.ss_family)) {
+            payload.clear();
+            return;
+        }
         auto* wr = new UdpSendReq;
         wr->data = new char[payload.readable()];
         memcpy(wr->data, payload.data(), payload.readable());
@@ -719,6 +704,53 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
     }
 
     payload.clear();
+}
+
+bool ServerApp::ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
+                                           TunnelClient::UdpOutbound& outbound,
+                                           int family) {
+    if (outbound.udp) {
+        if (outbound.family == family) return true;
+        TX_WARN("Dropping UDP session %u target with address family %d; flow uses %d",
+                sid, family, outbound.family);
+        return false;
+    }
+    if (family != AF_INET && family != AF_INET6) return false;
+
+    auto* udp = new uv_udp_t;
+    const int init_status = uv_udp_init(loop_, udp);
+    if (init_status != 0) {
+        TX_ERROR("Failed to initialize UDP session %u: %s", sid, uv_strerror(init_status));
+        delete udp;
+        return false;
+    }
+
+    auto* ctx = new UdpCtx{this, client, sid, outbound.generation};
+    udp->data = ctx;
+    int bind_status = 0;
+    if (family == AF_INET) {
+        sockaddr_in bind_addr;
+        uv_ip4_addr("0.0.0.0", 0, &bind_addr);
+        bind_status = uv_udp_bind(udp, reinterpret_cast<const sockaddr*>(&bind_addr), 0);
+    } else {
+        sockaddr_in6 bind_addr;
+        uv_ip6_addr("::", 0, &bind_addr);
+        bind_status = uv_udp_bind(udp, reinterpret_cast<const sockaddr*>(&bind_addr), 0);
+    }
+    if (bind_status != 0 ||
+        uv_udp_recv_start(udp, ServerApp::udp_alloc, ServerApp::on_udp_read) != 0) {
+        if (bind_status != 0) {
+            TX_ERROR("Failed to bind UDP session %u: %s", sid, uv_strerror(bind_status));
+        } else {
+            TX_ERROR("Failed to start UDP receive for session %u", sid);
+        }
+        uv_close(reinterpret_cast<uv_handle_t*>(udp), ServerApp::on_udp_closed);
+        return false;
+    }
+
+    outbound.udp = udp;
+    outbound.family = family;
+    return true;
 }
 
 void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
@@ -940,6 +972,14 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
                 memcpy(a6, selected->ai_addr, sizeof(sockaddr_in6));
                 a6->sin6_port = htons(ctx->target.port);
             } else {
+                if (res) uv_freeaddrinfo(res);
+                delete ctx;
+                delete req;
+                return;
+            }
+
+            if (!ctx->app->ensure_udp_outbound_socket(ctx->client, ctx->sid,
+                                                       it->second, addr.ss_family)) {
                 if (res) uv_freeaddrinfo(res);
                 delete ctx;
                 delete req;

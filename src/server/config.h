@@ -3,7 +3,6 @@
 #include <string>
 #include <cstdint>
 #include <vector>
-#include "tx/crypto/aead.h"
 
 namespace tx {
 
@@ -13,9 +12,7 @@ struct ServerConfig {
     uint16_t    listen_port = 443;
 
     // Authentication
-    std::string secret;
     std::vector<uint8_t> psk;
-    AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
 
     // UDP outbounds are removed after this much inactivity.
     uint64_t    udp_idle_timeout_ms = 300000;

@@ -66,16 +66,6 @@ bool Router::load(const RouterConfig& config) {
     return true;
 }
 
-RouteDecision Router::decide(const std::string& host, const IpAddr& ip) const {
-    // Keep this compatibility overload AsIs: a supplied domain is authoritative
-    // and must not fall through to the resolved IP.
-    if (!host.empty()) {
-        RouteDecision decision = decide_by_host(host);
-        return decision.matched ? decision : fallback_decision();
-    }
-    return decide_by_ip(ip);
-}
-
 RouteDecision Router::decide_target(const TargetAddr& target) const {
     if (target.type == AddrType::Domain) {
         RouteDecision decision = decide_by_host(target.host);

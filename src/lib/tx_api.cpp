@@ -41,6 +41,7 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
             return hooks.protect_socket(fd, hooks.user_data) != 0;
         };
     }
+#if !defined(TX_PLATFORM_ANDROID)
     if (hooks && hooks->resolve_host) {
         host_resolver = [hooks = *hooks](const std::string& host, int family) {
             tx_android_address_t output[TX_ANDROID_MAX_RESOLVED_ADDRESSES]{};
@@ -65,6 +66,7 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
             return response;
         };
     }
+#endif
 
     auto* handle = new TxClientHandle;
     handle->app = std::make_unique<tx::ClientApp>(std::move(socket_protector),
@@ -81,8 +83,7 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
     }
 
     if (require_explicit_dns && cfg.dns_upstreams.empty()) {
-        TX_ERROR("tx_client_start_android requires dns.upstreams or "
-                 "tx_client_start_android_ex DNS hooks");
+        TX_ERROR("tx_client_start_android requires at least one dns.upstreams entry");
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
         if (tun_fd >= 0) ::close(tun_fd);
 #endif
@@ -139,9 +140,13 @@ tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd
 tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
                                        const tx_android_network_hooks_t* hooks) {
     if (tun_fd < 0 || !hooks || hooks->struct_size < sizeof(tx_android_network_hooks_t) ||
-        hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket ||
-        !hooks->resolve_host || !hooks->query_dns) return nullptr;
-    return start_client(config, tun_fd, hooks, false);
+        hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket) {
+        return nullptr;
+    }
+    // On Android, host and DNS hooks used to call the physical system
+    // resolver.  The native client now carries configured DNS queries through
+    // the TX tunnel, so accept old hook structs but never invoke those fields.
+    return start_client(config, tun_fd, hooks, true);
 }
 
 void tx_client_notify_network_changed(tx_handle_t handle) {

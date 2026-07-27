@@ -15,16 +15,29 @@ public:
     using ResolveCallback = std::function<void(std::vector<uint8_t>)>;
     using HostResolveHook = std::function<std::vector<std::string>(const std::string&, int)>;
     using QueryHook = std::function<std::vector<uint8_t>(const uint8_t*, size_t)>;
+    // Runs on the owning loop and must eventually invoke the callback.  This
+    // is used when DNS itself has to travel through an already-established
+    // proxy rather than being sent by a local UDP socket.
+    using AsyncQueryHook = std::function<void(std::vector<uint8_t>, ResolveCallback)>;
     using HostResolveCallback = std::function<void(std::vector<std::string>)>;
 
     explicit DnsResolver(uv_loop_t* loop);
     void configure(std::vector<std::string> upstreams,
                    ProtectCallback protector, uint32_t bypass_mark,
                    HostResolveHook host_resolver = HostResolveHook(),
-                   QueryHook query_hook = QueryHook());
+                   QueryHook query_hook = QueryHook(),
+                   AsyncQueryHook async_query_hook = AsyncQueryHook());
     void resolve(const uint8_t* query, size_t query_len, ResolveCallback callback);
     void resolve_host(const std::string& host, int family, HostResolveCallback callback);
-    bool can_query() const { return static_cast<bool>(query_hook_) || !upstreams_.empty(); }
+    // Shared by alternate transports (for example Android's TX tunnel DNS
+    // path) so they apply the same response authentication as socket DNS.
+    static bool response_matches_query(const std::vector<uint8_t>& query,
+                                       const std::vector<uint8_t>& response);
+    static bool response_is_truncated(const std::vector<uint8_t>& response);
+    bool can_query() const {
+        return static_cast<bool>(async_query_hook_) || static_cast<bool>(query_hook_) ||
+               !upstreams_.empty();
+    }
     bool has_host_hook() const { return static_cast<bool>(host_resolver_); }
     void cancel_pending();
 
@@ -41,6 +54,7 @@ private:
     uint32_t bypass_mark_ = 0;
     HostResolveHook host_resolver_;
     QueryHook query_hook_;
+    AsyncQueryHook async_query_hook_;
     uint64_t generation_ = 1;
 };
 

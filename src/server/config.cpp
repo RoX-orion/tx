@@ -63,11 +63,8 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
         }
 
         if (j.contains("cipher")) {
-            std::string cipher_name = j["cipher"].get<std::string>();
-            if (!parse_aead_cipher(cipher_name, config.cipher)) {
-                TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
-                return false;
-            }
+            TX_ERROR("Server cipher is no longer configured; remove the cipher field");
+            return false;
         }
 
         if (j.contains("udp")) {
@@ -110,8 +107,8 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
         }
 
         if (j.contains("secret")) {
-            config.secret = j["secret"].get<std::string>();
-            if (!Secret::parse_psk(config.secret, config.psk)) {
+            const std::string secret = j["secret"].get<std::string>();
+            if (!Secret::parse_psk(secret, config.psk)) {
                 return false;
             }
         } else if (j.contains("password")) {

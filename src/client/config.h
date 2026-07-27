@@ -20,7 +20,6 @@ struct OutboundConfig {
     OutboundType type = OutboundType::Tx;
     std::string server_host;
     uint16_t    server_port = 443;
-    std::string secret;
     std::vector<uint8_t> psk;
     AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
 };
@@ -59,6 +58,9 @@ struct ClientConfig {
     std::string dns_fake_ipv4_range = "198.18.0.0/16";
     std::string dns_fake_ipv6_range = "fd00:198:18::/96";
     std::vector<std::string> dns_upstreams;
+    // Android sends these numeric upstreams through this TX outbound rather
+    // than asking the physical network's resolver.
+    std::string dns_outbound_tag = "proxy-out-tx";
     uint32_t dns_cache_ttl = 60;
     uint32_t dns_cache_capacity = 4096;
 

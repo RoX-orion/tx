@@ -38,12 +38,8 @@ public:
     // Load geo data files and configure routing rules
     bool load(const RouterConfig& config);
 
-    // Make routing decision
-    RouteDecision decide(const std::string& host, const IpAddr& resolved_ip) const;
-
-    // Apply the configured AsIs policy to a protocol target. Domains only use
-    // domain rules and then the explicit last-rule fallback; IP literals only
-    // use IP rules.
+    // Apply the AsIs domain strategy: domain-typed targets use domain rules
+    // only, falling back to the last rule; IP-typed targets use IP rules only.
     RouteDecision decide_target(const TargetAddr& target) const;
 
     // Overload: when we only have hostname (no IP yet)

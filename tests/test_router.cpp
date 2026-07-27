@@ -84,7 +84,12 @@ static void test_host_routing() {
     assert(!router.decide_by_host("example.com").matched);
 
     // AsIs must not re-route an unmatched domain through its resolved private IP.
-    assert(router.decide("example.com", tx::IpAddr::from_ipv4(192, 168, 1, 2)).outbound_tag == "proxy-out");
+    tx::TargetAddr unmatched_domain;
+    unmatched_domain.type = tx::AddrType::Domain;
+    unmatched_domain.host = "example.com";
+    unmatched_domain.port = 443;
+    assert(router.decide_target(unmatched_domain).outbound_tag == "proxy-out");
+    assert(!router.decide_target(unmatched_domain).matched);
 
     tx::TargetAddr domain;
     domain.type = tx::AddrType::Domain;

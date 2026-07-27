@@ -186,6 +186,16 @@ void test_first_success_and_validation() {
 } // namespace
 
 int main() {
+    const auto wire_query = make_query();
+    auto wire_response = make_response(wire_query);
+    assert(tx::DnsResolver::response_matches_query(wire_query, wire_response));
+    assert(!tx::DnsResolver::response_is_truncated(wire_response));
+    wire_response[2] |= 0x02;
+    assert(tx::DnsResolver::response_matches_query(wire_query, wire_response));
+    assert(tx::DnsResolver::response_is_truncated(wire_response));
+    wire_response[1] ^= 0x01;
+    assert(!tx::DnsResolver::response_matches_query(wire_query, wire_response));
+
     uv_loop_t loop;
     assert(uv_loop_init(&loop) == 0);
     tx::DnsResolver resolver(&loop);
@@ -221,6 +231,23 @@ int main() {
     });
     uv_run(&loop, UV_RUN_DEFAULT);
     assert(host_done && query_done && host_worker && query_worker);
+
+    tx::DnsResolver async_resolver(&loop);
+    bool async_called = false;
+    bool async_done = false;
+    async_resolver.configure({}, tx::DnsResolver::ProtectCallback(), 0,
+        tx::DnsResolver::HostResolveHook(), tx::DnsResolver::QueryHook(),
+        [&](std::vector<uint8_t> request, tx::DnsResolver::ResolveCallback complete) {
+            assert(std::this_thread::get_id() == loop_thread);
+            assert(request.size() == sizeof(query));
+            async_called = true;
+            complete(make_response(request));
+        });
+    async_resolver.resolve(query, sizeof(query), [&](std::vector<uint8_t> response) {
+        assert(response.size() == sizeof(query));
+        async_done = true;
+    });
+    assert(async_called && async_done);
     assert(uv_loop_close(&loop) == 0);
 #if defined(__linux__)
     test_first_success_and_validation();

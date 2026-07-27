@@ -616,11 +616,21 @@ bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
 
 DnsResolver::DnsResolver(uv_loop_t* loop) : loop_(loop) {}
 
+bool DnsResolver::response_matches_query(const std::vector<uint8_t>& query,
+                                         const std::vector<uint8_t>& response) {
+    return dns_response_matches_query(query, response);
+}
+
+bool DnsResolver::response_is_truncated(const std::vector<uint8_t>& response) {
+    return response.size() >= 4 && (load_be16(response.data() + 2) & 0x0200u) != 0;
+}
+
 void DnsResolver::configure(std::vector<std::string> upstreams,
                             ProtectCallback protector, uint32_t bypass_mark,
-                            HostResolveHook host_resolver, QueryHook query_hook) {
+                            HostResolveHook host_resolver, QueryHook query_hook,
+                            AsyncQueryHook async_query_hook) {
 #if !defined(TX_PLATFORM_WINDOWS)
-    if (upstreams.empty()) {
+    if (upstreams.empty() && !query_hook && !async_query_hook) {
         std::ifstream resolv("/etc/resolv.conf");
         std::string line;
         while (std::getline(resolv, line)) {
@@ -637,14 +647,29 @@ void DnsResolver::configure(std::vector<std::string> upstreams,
     bypass_mark_ = bypass_mark;
     host_resolver_ = std::move(host_resolver);
     query_hook_ = std::move(query_hook);
+    async_query_hook_ = std::move(async_query_hook);
 }
 
 void DnsResolver::resolve(const uint8_t* query, size_t query_len,
                           ResolveCallback callback) {
     if (!callback) return;
     if (!query || query_len < 12 || query_len > 65535 ||
-        (!query_hook_ && upstreams_.empty())) {
+        (!async_query_hook_ && !query_hook_ && upstreams_.empty())) {
         callback(std::vector<uint8_t>());
+        return;
+    }
+    if (async_query_hook_) {
+        const uint64_t generation = generation_;
+        std::vector<uint8_t> request(query, query + query_len);
+        auto complete = [this, generation, request, callback = std::move(callback)]
+                        (std::vector<uint8_t> response) mutable {
+            if (generation != generation_ ||
+                (!response.empty() && !dns_response_matches_query(request, response))) {
+                response.clear();
+            }
+            callback(std::move(response));
+        };
+        async_query_hook_(std::move(request), std::move(complete));
         return;
     }
     auto* request = new Request;

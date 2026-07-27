@@ -55,6 +55,8 @@ public:
     ClientTrafficStats traffic_stats() const;
 
 private:
+    friend struct ClientAppDnsTest;
+
     struct TunnelTimerCtx;
     struct DirectUdpRelay;
 
@@ -103,6 +105,13 @@ private:
     enum class UdpFlowKind {
         Socks5,
         Tun,
+        InternalDns,
+    };
+
+    enum class InternalDnsStage {
+        Udp,
+        TcpConnect,
+        TcpResponse,
     };
 
     struct UdpFlow {
@@ -118,6 +127,13 @@ private:
         const OutboundConfig* outbound = nullptr;
         size_t pending_proxy_bytes = 0;
         bool proxied = false;
+        DnsResolver::ResolveCallback dns_callback;
+        std::vector<uint8_t> dns_query;
+        size_t dns_upstream_index = 0;
+        TargetAddr dns_upstream;
+        InternalDnsStage dns_stage = InternalDnsStage::Udp;
+        uint64_t dns_deadline_ms = 0;
+        Buffer dns_tcp_response;
     };
 
     struct UdpTunnel {
@@ -196,6 +212,29 @@ private:
         std::shared_ptr<std::vector<std::string>> addresses, size_t index);
     void send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid, const TargetAddr& target,
                          const uint8_t* data, size_t len);
+    void resolve_dns_via_tunnel(std::vector<uint8_t> query,
+                                DnsResolver::ResolveCallback callback);
+    bool parse_dns_upstream(const std::string& upstream, TargetAddr& target) const;
+    void start_internal_dns_attempt(const std::string& flow_key);
+    void retry_internal_dns(const std::string& flow_key, const char* reason);
+    void start_internal_dns_tcp(const std::string& flow_key,
+                                const UdpTunnelPtr& tunnel);
+    void send_internal_dns_tcp_query(const std::string& flow_key,
+                                     const UdpTunnelPtr& tunnel);
+    void handle_internal_dns_udp_response(const std::string& flow_key,
+                                          const UdpTunnelPtr& tunnel,
+                                          const TargetAddr& source,
+                                          const uint8_t* data, size_t len);
+    void handle_internal_dns_tcp_data(const std::string& flow_key,
+                                      const uint8_t* data, size_t len);
+    void complete_internal_dns(const std::string& flow_key,
+                               std::vector<uint8_t> response,
+                               bool notify_peer);
+    bool rotate_internal_dns_session(const std::string& flow_key);
+    void discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionId sid);
+    bool send_shared_tunnel_disconnect(const UdpTunnelPtr& tunnel, SessionId sid);
+    void arm_internal_dns_timer();
+    void stop_internal_dns_timer();
     bool ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
                                  int target_family);
     void send_direct_udp_packet(const std::string& flow_key, UdpFlow& flow,
@@ -222,6 +261,7 @@ private:
                                    const struct sockaddr* addr, unsigned flags);
     static void on_direct_udp_closed(uv_handle_t* handle);
     static void on_udp_cleanup_timer(uv_timer_t* timer);
+    static void on_internal_dns_timer(uv_timer_t* timer);
 
     // Native TUN input. Mixed mode currently handles UDP packets natively and
     // keeps TCP on the configured system-stack path.
@@ -288,6 +328,8 @@ private:
     std::unordered_map<SessionId, std::string> udp_session_keys_;
     uv_timer_t         udp_cleanup_timer_;
     bool               udp_cleanup_timer_started_;
+    uv_timer_t         internal_dns_timer_;
+    bool               internal_dns_timer_initialized_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

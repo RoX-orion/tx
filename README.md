@@ -192,9 +192,9 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-当前共有 17 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
-tunnel、TUN packet、HEV lwIP TCP / UDP、fake-IP DNS、DNS resolver、TLS SNI、
-socket protector、TCP 回调和 UDP flow timeout。
+当前共有 19 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
+tunnel、TUN packet、HEV lwIP TCP / UDP、fake-IP DNS、DNS resolver、TX 隧道 DNS、
+客户端/服务端配置、TLS SNI、socket protector、TCP 回调和 UDP flow timeout。
 
 ## 配置
 
@@ -243,7 +243,6 @@ cp config/client.json.example client.json
         "max_client_rate_mbps": 64
     },
     "secret": "base64:REPLACE_WITH_GEN_SECRET_OUTPUT",
-    "cipher": "aes-256-gcm",
     "log_level": "info"
 }
 ```
@@ -253,7 +252,7 @@ cp config/client.json.example client.json
 - `listen.host`：服务端监听地址。
 - `listen.port`：服务端监听端口。
 - `secret`：客户端与服务端共享的高熵 PSK，支持 `base64:`、`hex:`、`uuid-v4:` 前缀；推荐使用 `--gen-secret` 生成 `base64:`。
-- `cipher`：隧道 AEAD 算法，可选 `aes-256-gcm` 或 `chacha20-poly1305`。
+- AEAD 算法由客户端各 TX 出站的 `server.cipher` 在握手时选择，服务端无需重复配置。
 - `udp.idle_timeout`：UDP 出站空闲回收时间，单位秒，默认 300，范围 1～86400。
 - `limits.max_clients`：同时连接的隧道客户端上限。
 - `limits.max_unauthenticated_per_ip` / `max_new_clients_per_second`：握手前连接的每 IP 上限与新连接速率上限。
@@ -384,7 +383,10 @@ netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由�
 Android 共享库提供以下启动接口：
 
 - `tx_client_start_with_tun_fd()`：使用 `VpnService` 提供的 TUN fd 启动客户端。
-- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。该简化接口要求配置至少一个 `dns.upstreams`；否则启动会失败。需要由 Android 解析域名或执行 DNS 查询时，请使用 `tx_client_start_android_ex()` 并提供两个 DNS hook。
+- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。Android 配置必须提供至少一个数值 `dns.upstreams`；查询由 TX 隧道送到远端服务器后再访问该 DNS，不能回退到物理网络 DNS。TX 服务器地址在 Android 上必须使用 IP 字面量，避免启动前的 DNS 引导泄漏。
+
+Android 隧道 DNS 按 `dns.upstreams` 顺序尝试，每个 UDP/TCP 阶段的超时为 2 秒；
+收到 UDP TC 响应时会在同一 TX 加密连接上改用标准 DNS-over-TCP。
 
 TX 客户端与服务端隧道帧协议已升级为 v2，并通过 `HalfClose` 命令传播双向 TCP
 FIN。v1 帧会明确作为版本不匹配拒绝，升级时必须同步部署客户端和服务端。

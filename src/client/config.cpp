@@ -292,8 +292,8 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
                         }
                     }
                     if (server.contains("secret")) {
-                        outbound.secret = server["secret"].get<std::string>();
-                        if (!Secret::parse_psk(outbound.secret, outbound.psk)) {
+                        const std::string secret = server["secret"].get<std::string>();
+                        if (!Secret::parse_psk(secret, outbound.psk)) {
                             return false;
                         }
                     } else if (server.contains("password")) {
@@ -417,6 +417,7 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
             config.dns_fake_ipv6_range = dns.value("fake_ipv6_range", config.dns_fake_ipv6_range);
             config.dns_cache_ttl = dns.value("cache_ttl", config.dns_cache_ttl);
             config.dns_cache_capacity = dns.value("cache_capacity", config.dns_cache_capacity);
+            config.dns_outbound_tag = dns.value("outboundTag", config.dns_outbound_tag);
             if (dns.contains("upstreams")) {
                 config.dns_upstreams.clear();
                 for (const auto& upstream : dns["upstreams"])

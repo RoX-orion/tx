@@ -7,9 +7,10 @@
 
 namespace {
 
-std::string config_json(const char* domain_strategy_line) {
+std::string config_json(const char* domain_strategy_line, const char* udp_json = nullptr) {
     return std::string("{\n") +
         "  \"outbounds\": [{\"tag\":\"direct-out\",\"type\":\"direct\"}],\n" +
+        (udp_json ? std::string("  \"udp\": ") + udp_json + ",\n" : "") +
         "  \"routing\": {\n" +
         (domain_strategy_line ? std::string("    \"domainStrategy\": \"") +
                                     domain_strategy_line + "\",\n" : "") +
@@ -37,6 +38,13 @@ int main() {
     tx::ClientConfig default_config;
     assert(load_text("default", config_json(nullptr), default_config));
     assert(default_config.router.domain_strategy == "AsIs");
+    assert(default_config.udp_quic_sniff);
+
+    tx::ClientConfig quic_sniff_disabled;
+    assert(load_text("quic_sniff_disabled",
+                     config_json(nullptr, "{\"quic_sniff\":false}"),
+                     quic_sniff_disabled));
+    assert(!quic_sniff_disabled.udp_quic_sniff);
 
     tx::ClientConfig explicit_config;
     assert(load_text("asis", config_json("AsIs"), explicit_config));

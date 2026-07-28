@@ -58,8 +58,10 @@ struct ClientConfig {
     std::string dns_fake_ipv4_range = "198.18.0.0/16";
     std::string dns_fake_ipv6_range = "fd00:198:18::/96";
     std::vector<std::string> dns_upstreams;
-    // Android sends these numeric upstreams through this TX outbound rather
-    // than asking the physical network's resolver.
+    // Android sends local fake-IP DNS queries to these numeric upstreams
+    // through this TX outbound rather than asking the physical resolver.
+    // Ordinary targets sent through a TX outbound retain their domains and
+    // are resolved by the TX server.
     std::string dns_outbound_tag = "proxy-out-tx";
     uint32_t dns_cache_ttl = 60;
     uint32_t dns_cache_capacity = 4096;
@@ -67,6 +69,9 @@ struct ClientConfig {
     // UDP flows are removed after this much inactivity.
     uint64_t    udp_idle_timeout_ms = 300000;
     uint32_t    udp_max_flows = 4096;
+    // Recover QUIC Initial SNI for native TUN UDP/443 flows whose destination
+    // is a real IP rather than a fake-IP mapping.
+    bool        udp_quic_sniff = true;
 
     // Bound unauthenticated/local proxy state in long-running clients.
     uint32_t    max_proxy_connections = 4096;

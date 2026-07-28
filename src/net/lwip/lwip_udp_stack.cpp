@@ -334,6 +334,8 @@ struct LwipUdpStack::Impl {
         const uint64_t id = self->next_flow_id++;
         self->udp_flows.emplace(id, UdpFlow{id, pcb});
         self->udp_pcb_flows.emplace(pcb, id);
+        // HEV Pretend UDP documents this accept callback's p/addr/port as
+        // unused. The first actual datagram is delivered to receive_udp().
         udp_recv(pcb, receive_udp, self);
     }
     static void receive_udp(void* arg, udp_pcb* pcb, pbuf* packet,

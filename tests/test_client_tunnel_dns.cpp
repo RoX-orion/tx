@@ -4,12 +4,16 @@
 
 #include <arpa/inet.h>
 #include <cassert>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <string>
 #include <vector>
 
 namespace tx {
@@ -95,6 +99,25 @@ uint16_t reserve_tcp_port() {
     const uint16_t port = ntohs(address.sin_port);
     close(fd);
     return port;
+}
+
+int open_tcp_listener(uint16_t& port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    int one = 1;
+    assert(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0);
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    assert(listen(fd, 4) == 0);
+    socklen_t length = sizeof(address);
+    assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    port = ntohs(address.sin_port);
+    set_receive_timeout(fd, 4);
+    return fd;
 }
 
 bool read_all(int fd, uint8_t* data, size_t size) {
@@ -315,6 +338,68 @@ void test_tcp_failure_uses_next_upstream(uint16_t server_port,
     assert(result == expected);
 }
 
+void test_tx_target_domain_uses_server_resolver(uint16_t server_port,
+                                                const std::vector<uint8_t>& psk) {
+    // Any Android-side pre-resolution of the target would send a packet here.
+    // It intentionally has no responder.
+    DnsSockets blackhole = open_dns_sockets(false);
+    uint16_t target_port = 0;
+    const int target_listener = open_tcp_listener(target_port);
+    std::atomic<bool> target_connected(false);
+    std::atomic<bool> release_target(false);
+    std::thread target([target_listener, &target_connected, &release_target]() {
+        int peer = accept(target_listener, nullptr, nullptr);
+        if (peer >= 0) {
+            target_connected.store(true);
+            while (!release_target.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            close(peer);
+        }
+        close(target_listener);
+    });
+
+    tx::ClientApp app;
+    tx::ClientConfig config = client_config(
+        server_port, {"127.0.0.1:" + std::to_string(blackhole.port)}, psk);
+    config.http_port = reserve_tcp_port();
+    config.socks5_port = reserve_tcp_port();
+    assert(app.init(config));
+    std::thread client_loop([&app]() { app.run(); });
+
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    assert(client >= 0);
+    set_receive_timeout(client, 4);
+    sockaddr_in proxy{};
+    proxy.sin_family = AF_INET;
+    proxy.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    proxy.sin_port = htons(config.http_port);
+    assert(connect(client, reinterpret_cast<sockaddr*>(&proxy), sizeof(proxy)) == 0);
+
+    const std::string request = "CONNECT localhost:" + std::to_string(target_port) +
+        " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert(write_all(client, reinterpret_cast<const uint8_t*>(request.data()), request.size()));
+    uint8_t response[256]{};
+    const ssize_t response_len = recv(client, response, sizeof(response), 0);
+    assert(response_len > 0);
+    const std::string response_text(reinterpret_cast<const char*>(response),
+                                    static_cast<size_t>(response_len));
+    assert(response_text.find("HTTP/1.1 200") == 0);
+    assert(target_connected.load());
+    close(client);
+
+    release_target.store(true);
+    target.join();
+    app.stop();
+    client_loop.join();
+
+    assert(fcntl(blackhole.udp, F_SETFL, O_NONBLOCK) == 0);
+    uint8_t query[512];
+    assert(recv(blackhole.udp, query, sizeof(query), 0) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    close(blackhole.udp);
+}
+
 } // namespace
 
 int main() {
@@ -334,6 +419,7 @@ int main() {
     test_all_upstreams_fail(server_port, psk);
     test_truncated_tcp_fallback(server_port, psk);
     test_tcp_failure_uses_next_upstream(server_port, psk);
+    test_tx_target_domain_uses_server_resolver(server_port, psk);
 
     server.stop();
     server_thread.join();

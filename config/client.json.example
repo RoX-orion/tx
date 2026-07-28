@@ -5,7 +5,8 @@
     },
     "udp": {
         "idle_timeout": 300,
-        "max_flows": 4096
+        "max_flows": 4096,
+        "quic_sniff": true
     },
     "limits": {
         "max_proxy_connections": 4096

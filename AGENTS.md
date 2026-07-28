@@ -1,33 +1,35 @@
-# Repository Guidelines
+# 仓库协作指南
 
-## Project Overview
-- `tx` is a C++14 proxy/tunnel project built with CMake.
-- Main binaries are `tx_client` and `tx_server`.
-- Core code is organized under `src/` with public headers under `include/tx/`.
-- Major modules:
-  - `crypto`: AES-GCM encryption and key derivation.
-  - `protocol`: SOCKS5, HTTP proxy, and tunnel protocol handling.
-  - `router`: routing decisions.
-  - `geo`: GeoIP/GeoSite parsing and lookup structures.
-  - `net`: TCP stream abstraction、DNS/fake-IP、lwIP TUN 和流量回收设施。
-  - `client` / `server`: executable apps and config parsing.
+## 项目概览
 
-## Build And Run
-Use an out-of-tree build:
+- `tx` 是使用 CMake 构建的 C++14 代理 / 隧道项目。
+- 主要可执行程序为 `tx_client` 和 `tx_server`；Android 构建产物为共享库 `libtx.so`。
+- 核心实现位于 `src/`，公共头文件位于 `include/tx/`。
+- 主要模块：
+  - `crypto`：AES-GCM 加密和密钥派生。
+  - `protocol`：SOCKS5、HTTP 代理、隧道协议、TLS/QUIC SNI 解析。
+  - `router`：路由匹配与出站选择。
+  - `geo`：GeoIP / GeoSite 解析和查找结构。
+  - `net`：TCP 流抽象、DNS/fake-IP、lwIP TUN 和流量回收设施。
+  - `client` / `server`：应用入口和配置解析。
+
+## 构建与运行
+
+使用 out-of-tree 构建：
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Run examples:
+运行示例：
 
 ```sh
 ./build/bin/tx_server -c config/server.json.example
 ./build/bin/tx_client -c config/client.json.example
 ```
 
-Tests are enabled by default when not building for Android:
+非 Android 平台默认启用测试：
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTX_BUILD_TESTS=ON
@@ -35,94 +37,139 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-## Dependencies
-- CMake 3.25.1+
-- C++14 compiler
-- OpenSSL
-- libuv
-- nlohmann_json
-- OpenSSL and the C++ runtime are intentionally linked dynamically on all platforms.
-- `OPENSSL_ROOT_DIR` is optional and should only be passed when OpenSSL is installed outside the platform's normal search paths.
+## 依赖
 
-The top-level `CMakeLists.txt` uses `cmake/TxUtils.cmake` and `cmake/FetchDeps.cmake`; a clean configure can fetch libuv、nlohmann_json 和 HEV lwIP into `.deps/` when `TX_FETCH_DEPS=ON`.
+- CMake 3.25.1 或更高版本。
+- 支持 C++14 的编译器。
+- OpenSSL、libuv 和 nlohmann_json。
+- OpenSSL 与 C++ 运行时在所有平台都刻意采用动态链接。
+- `OPENSSL_ROOT_DIR` 是可选项；仅当 OpenSSL 不在平台默认搜索路径时传入。
 
-## Tests
-- Test files live in `tests/` and use simple `assert`-based executables.
-- `tests/CMakeLists.txt` currently registers 17 个测试：`crypto`、`geoip`、`geosite`、`socks5`、`http_proxy`、`router`、`tunnel`、`tun_packet`、`lwip_udp_stack`、`lwip_tcp_stack`、`fake_ip_dns`、`dns_resolver`、`tls_sni`、`socket_protector`、`tcp_session_callbacks`、`udp_flow_timeout` 和 `client_config`。
+顶层 `CMakeLists.txt` 使用 `cmake/TxUtils.cmake` 和 `cmake/FetchDeps.cmake`。启用
+`TX_FETCH_DEPS=ON` 时，干净配置可将 libuv、nlohmann_json 和 HEV lwIP 下载到 `.deps/`。
 
-## Coding Conventions
-- Keep public APIs in `include/tx/...` and implementations in matching `src/...` modules.
-- Code is namespaced under `tx`.
-- Prefer the existing small, direct C++14 style. Avoid broad refactors unless the task requires them.
-- Existing tests use `printf` and `assert`; match that style for focused unit coverage.
-- Preserve platform conditionals already present in CMake and source code.
+## 测试
 
-## Workflow Notes
-- Use `rg` / `rg --files` for search.
-- Do not edit generated build output under `build/` or `cmake-build-debug/` unless explicitly requested.
-- Treat `config/*.example` as examples; avoid putting real secrets in them.
+- 测试文件位于 `tests/`，使用简单的 `printf` 和 `assert` 风格。
+- `tests/CMakeLists.txt` 当前注册 21 个测试：`crypto`、`geoip`、`geosite`、`socks5`、
+  `http_proxy`、`router`、`tunnel`、`tun_packet`、`lwip_udp_stack`、
+  `socket_protector`、`udp_flow_timeout`、`fake_ip_dns`、`lwip_tcp_stack`、
+  `tcp_session_callbacks`、`dns_resolver`、`tls_sni`、`quic_sni`、`client_config`、
+  `server_config`、`client_tunnel_dns` 和 `client_quic_routing`。
 
-## Current Architecture Notes
-- The client configuration has moved to an `outbounds` + `routing.rules` model.
-- `routing.rules` is evaluated from top to bottom. The last rule is the fallback when no prior matcher applies.
-- `routing.rules[*].outboundTag` is only a reference to an outbound tag. Do not collapse it into a direct/proxy/block decision inside the router.
-- Actual behavior is defined by `outbounds[*]`:
-  - `type: "direct"` connects directly.
-  - `type: "tx"` connects through a TX encrypted tunnel using that outbound's `server` settings.
-  - `type: "block"` rejects TCP connections or drops UDP packets.
-- Old client config fields such as top-level `server`, `geo.direct_geoip`, and `geo.direct_geosite` are intentionally unsupported.
-- Default Android routing should keep private IPs first, for example `{"ip":["geoip:private"],"outboundTag":"direct-out"}`, so LAN targets such as `192.168.0.1` do not go through the remote tunnel.
-- 原生 lwIP TUN 路径会用 fake-IP 反向映射和 TLS SNI 恢复域名，再按 `AsIs` 规则路由。HTTP/SOCKS5 监听器在 `tun.auto_redirect=false` 时仍会保留，因此 tun2socks 是可选兼容路径，而不是 Android 的唯一数据面。
+## 编码约定
 
-## Native TUN Status
-- Client config now has a `tun` section with fields such as `enabled`, `fd`, `name`, `address` / `addresses`, `mtu`, `auto_config`, `auto_route`, `auto_redirect`, `redirect_port`, `redirect_mark`, `bypass_mark`, `route_table`, `rule_priority`, `routes`, `mode`, `tcp_stack`, and `udp_stack`.
-- `tun.mode` is deprecated. The default native mode is `tcp_stack: "lwip"` plus `udp_stack: "lwip"`; `udp_stack` currently must be `lwip`. `tcp_stack: "system"` is Linux-only and is intended for the transparent-redirect path.
-- `tx_client_start_with_tun_fd()` exists for Android `VpnService` integration. Android supplies the TUN fd externally; Android native code does not open `/dev/net/tun`.
-- `include/tx/net/tun_packet.h` and `src/net/tun_packet.cpp` parse IPv4/IPv6 TUN packets; `LwipUdpStack` additionally exposes the lwIP TCP stream bridge. `tests/test_tun_packet.cpp` covers IPv4/IPv6 UDP roundtrips, while `test_lwip_tcp_stack` / `test_lwip_udp_stack` cover the data plane.
-- Native TUN TCP and UDP are both routed through the same direct / TX tunnel / block decision model as HTTP/SOCKS. TCP bridging preserves half-close and applies bounded write backpressure.
-- fake-IP DNS handles UDP/TCP A and AAAA locally, retains bounded stable forward/reverse mappings, emits HTTPS/SVCB NODATA, and forwards other DNS types to configured upstreams. For a non-fake TCP/443 flow, TLS ClientHello SNI can restore the original domain before routing.
+- 公共 API 放在 `include/tx/...`，实现放在对应的 `src/...` 模块。
+- 代码使用 `tx` 命名空间。
+- 保持现有直接、轻量的 C++14 风格；除非任务需要，避免大范围重构。
+- 新增聚焦测试时沿用现有 `printf` / `assert` 风格。
+- 保留 CMake 和源文件中已有的平台条件编译。
 
-## Linux TUN / auto_redirect Notes
-- Linux has a `PlatformTunDevice` backend that can open `/dev/net/tun`, set `IFF_TUN | IFF_NO_PI`, configure IPv4 address/netmask/MTU, bring the interface up, and add IPv4 CIDR routes.
-- In lwIP mode, `tun.auto_route=true` installs a dedicated policy-routing table. With empty `tun.routes`, it adds IPv4 (`0.0.0.0/1`, `128.0.0.0/1`) and IPv6 (`::/1`, `8000::/1`) split-default routes, with `tun.bypass_mark` returning TX egress to the main table.
-- In Linux `tcp_stack=system` mode, normal TUN route installation is IPv4-only; do not describe it as a gateway IPv6 route implementation.
-- When `tun.auto_redirect=true`, Linux starts a transparent TCP listener on `0.0.0.0:<tun.redirect_port>` and installs nftables rules in table `inet tx_auto_redirect`.
-- The current Linux redirect implementation targets local IPv4 TCP `OUTPUT` traffic. It is not yet a full gateway/side-router `PREROUTING TPROXY` implementation.
-- lwIP TUN direct/TX egress sockets use `tun.bypass_mark`; ordinary HTTP/SOCKS DNS sockets deliberately use mark 0. In `auto_redirect` mode, TCP egress uses `tun.redirect_mark`, which the nftables rule skips to avoid redirect loops.
-- Transparent listener sockets must be explicitly opened before setting `IP_TRANSPARENT`; outbound sockets must be explicitly opened before applying `SO_MARK`. Do not move these socket options back before libuv creates/opens the OS socket.
-- `stop_tun_listener()` removes the nftables auto_redirect table and stops the transparent listener.
-- Linux TUN and redirect setup usually require root or `CAP_NET_ADMIN`; `SO_MARK` may require elevated privileges as well.
+## 工作流约定
+- 未明确要求时，不要修改 `build/` 或 `cmake-build-debug/` 中的生成产物。
+- `config/*.example` 仅为示例，不能写入真实密钥。
+- 不要自动执行破坏性 Git 命令；保留工作树中与当前任务无关的改动。
 
-## Android Runtime Notes
-- Android's native data path is:
+## 当前配置与路由模型
+
+- 客户端配置使用 `outbounds` 加 `routing.rules` 模型。
+- `routing.rules` 按从上到下顺序匹配；最后一条规则是所有前序匹配失败时的兜底。
+- `routing.rules[*].outboundTag` 只引用出站标签，不能在路由器中将它折叠成
+  direct / proxy / block 决策。
+- 实际行为由 `outbounds[*]` 决定：
+  - `type: "direct"`：直接连接。
+  - `type: "tx"`：按该出站的 `server` 配置建立 TX 加密隧道。
+  - `type: "block"`：拒绝 TCP 或丢弃 UDP。
+- 旧的顶层 `server`、`geo.direct_geoip` 和 `geo.direct_geosite` 已刻意不再支持。
+- Android 默认路由必须把私网 IP 放在首位，例如
+  `{"ip":["geoip:private"],"outboundTag":"direct-out"}`，确保 `192.168.0.1` 等
+  局域网目标不会进入远端隧道。
+- 原生 lwIP TUN 路径会使用 fake-IP 反向映射、TLS SNI 和 QUIC Initial SNI 恢复域名，
+  再按 `AsIs` 规则路由。`tun.auto_redirect=false` 时仍会保留 HTTP/SOCKS5 监听器，
+  因而 tun2socks 只是兼容选项，不是 Android 的唯一数据面。
+
+## 原生 TUN 状态
+
+- 客户端的 `tun` 配置包括 `enabled`、`fd`、`name`、`address` / `addresses`、`mtu`、
+  `auto_config`、`auto_route`、`auto_redirect`、`redirect_port`、`redirect_mark`、
+  `bypass_mark`、`route_table`、`rule_priority`、`routes`、`mode`、`tcp_stack` 和
+  `udp_stack` 等字段。
+- `tun.mode` 已弃用。默认原生模式为 `tcp_stack: "lwip"` 和
+  `udp_stack: "lwip"`；`udp_stack` 当前只能为 `lwip`。`tcp_stack: "system"` 仅
+  Linux 支持，且只用于透明重定向路径。
+- `tx_client_start_with_tun_fd()` 用于 Android `VpnService` 集成。Android 提供 TUN fd，
+  原生代码不会打开 `/dev/net/tun`。
+- `include/tx/net/tun_packet.h` 与 `src/net/tun_packet.cpp` 解析 IPv4/IPv6 TUN 数据包；
+  `LwipUdpStack` 还提供 lwIP TCP 流桥接。`test_tun_packet` 覆盖 IPv4/IPv6 UDP 往返，
+  `test_lwip_tcp_stack` 和 `test_lwip_udp_stack` 覆盖数据面。
+- 原生 TUN TCP 和 UDP 与 HTTP/SOCKS 使用相同的 direct / TX / block 路由模型。TCP
+  桥接保留半关闭语义并实施有界写入背压。
+- fake-IP DNS 在本地处理 UDP/TCP A 和 AAAA，维护有界稳定正反映射，对 HTTPS/SVCB
+  返回 NODATA，并将其他 DNS 类型转发至配置的上游。没有 fake-IP 映射的 TCP/443
+  流会尝试通过 TLS ClientHello SNI 恢复域名后再路由。
+
+## Linux TUN 与 auto_redirect
+
+- Linux 的 `PlatformTunDevice` 可以打开 `/dev/net/tun`，设置 `IFF_TUN | IFF_NO_PI`，
+  配置 IPv4 地址/掩码/MTU、启用接口并添加 IPv4 CIDR 路由。
+- 在 lwIP 模式下，`tun.auto_route=true` 会安装独立策略路由表。`tun.routes` 为空时，
+  添加 IPv4（`0.0.0.0/1`、`128.0.0.0/1`）和 IPv6（`::/1`、`8000::/1`）分段默认路由，
+  并通过 `tun.bypass_mark` 让 TX 出站返回主路由表。
+- Linux `tcp_stack=system` 模式的普通 TUN 路由仅支持 IPv4；不要把它描述为 IPv6
+  网关路由实现。
+- `tun.auto_redirect=true` 时，Linux 会在 `0.0.0.0:<tun.redirect_port>` 启动透明 TCP
+  监听器，并创建 nftables 表 `inet tx_auto_redirect`。
+- 当前 Linux 重定向只作用于本机 IPv4 TCP `OUTPUT` 流量，不是完整的网关/旁路由
+  `PREROUTING TPROXY` 实现。
+- lwIP TUN 的 direct/TX 出站 socket 使用 `tun.bypass_mark`；普通 HTTP/SOCKS DNS
+  socket 刻意使用 mark 0。`auto_redirect` 模式中，TCP 出站使用
+  `tun.redirect_mark`，由 nftables 规则跳过以避免重定向循环。
+- 必须先让 libuv 创建/打开透明监听 socket，再设置 `IP_TRANSPARENT`；必须先创建/打开
+  出站 socket，再设置 `SO_MARK`。不要把这些选项移回 libuv 创建 socket 之前。
+- `stop_tun_listener()` 会删除 nftables 自动重定向表并停止透明监听器。
+- Linux TUN 与重定向通常需要 root 或 `CAP_NET_ADMIN`；`SO_MARK` 也可能需要额外权限。
+
+## Android 运行时约定
+
+Android 原生数据路径：
 
 ```text
 VpnService TUN fd -> HEV lwIP TCP/UDP -> tx router -> direct / tx tunnel / block
 ```
 
-- Android rejects `tcp_stack=system`; use `tcp_stack=lwip` and let `VpnService` provide the fd. The native layer owns that fd after startup, including failure paths.
-- The current code keeps proxy listeners in TUN mode when `tun.auto_redirect=false`; this preserves optional tun2socks compatibility without making it a requirement.
-- Linux `tun.auto_redirect` is not available on Android; do not assume Android can use nftables/IP_TRANSPARENT.
-- Native direct/tunnel and controlled DNS sockets support a protector callback. The JNI layer must call `VpnService.protect(fd)` and, when necessary, bind the fd to the selected physical `Network`.
-- `tx_client_start_android()` requires a non-empty `dns.upstreams` configuration. For app-provided host and DNS resolution, call `tx_client_start_android_ex()` with both DNS hooks.
+- Android 不支持 `tcp_stack=system`；必须使用 `tcp_stack=lwip`，并由 `VpnService`
+  提供 fd。原生层在启动成功和失败路径中均拥有并关闭该 fd。
+- `tun.auto_redirect` 是 Linux 功能，Android 不支持 nftables 或 `IP_TRANSPARENT`。
+- 原生 direct、TX 和受控 DNS socket 都支持 protector 回调。JNI 层必须调用
+  `VpnService.protect(fd)`，必要时再将 fd 绑定至选定的物理 `Network`；失败必须让该
+  流失败，不能冒险造成 VPN 路由环路。
+- `tx_client_start_android()` 要求非空的数值 `dns.upstreams`，DNS 查询经已配置的 TX
+  出站转发到远端，不得回退到物理网络 DNS。
+- `tx_client_start_android_ex()` 的 `resolve_host` 与 `query_dns` 字段仅为 ABI 兼容而
+  保留；Android 上不会调用它们，只有 `protect_socket` 生效。需要在 Android 启动前
+  解析服务器主机名时，应用应通过选定的物理网络自行解析，再把数值地址写入配置。
 
-## UDP / QUIC Status
-- SOCKS5 `UDP ASSOCIATE` is supported.
-- The tunnel protocol includes `TunnelCmd::UdpPacket`.
-- `tx_client` forwards SOCKS5 UDP packets through a shared UDP TX tunnel.
-- `tx_server` sends UDP packets to targets and returns responses through the tunnel.
-- UDP routed to a `tx` outbound is proxied through the encrypted tunnel. UDP routed to `direct` is relayed locally by `tx_client`. UDP routed to `block` is dropped.
-- Server UDP flow sockets are created for the first target address family, so IPv6 literals and AAAA-only UDP domains are supported.
-- A TUN UDP/443 destination with no fake-IP domain mapping is intentionally dropped to encourage TCP fallback, where TLS SNI can preserve domain routing.
-- Client and server UDP flows are removed after an idle timeout. Configure `udp.idle_timeout` in seconds; the default is 300 seconds.
+## UDP 与 QUIC 状态
 
-## Android Build Context
-- Android project path: `/mnt/f/program/android/txz`.
-- Android NDK path: `/home/andre/Android/android-ndk-r29`.
-- Android OpenSSL path: `/mnt/f/DevEnv/AndroidSDK/android_openssl/ssl_3`.
-- Android builds should use the dynamic C++ runtime (`ANDROID_STL=c++_shared`).
-- Default Android CMake build directory: `build-android-arm64`; it has been configured with `ANDROID_STL=c++_shared`.
-- Configure the Android native build with:
+- 已支持 SOCKS5 `UDP ASSOCIATE`。
+- 隧道协议包含 `TunnelCmd::UdpPacket`。
+- `tx_client` 通过共享 UDP TX 隧道转发 SOCKS5 UDP；`tx_server` 将 UDP 发往目标并把
+  响应通过隧道返回。
+- 路由到 `tx` 的 UDP 通过加密隧道代理，路由到 `direct` 的 UDP 在客户端本地中继，
+  路由到 `block` 的 UDP 被丢弃。
+- 服务端 UDP flow 按首个目标地址族创建 socket，因此支持 IPv6 字面量和仅 AAAA 的域名。
+- 对没有 fake-IP 域名映射的 TUN UDP/443，默认开启的 `udp.quic_sniff` 尝试从 QUIC
+  Initial 中恢复 SNI 以用于路由；实际 UDP 仍发往原始数值目标。SNI 不可用、关闭嗅探
+  或触及资源上限时，回退到普通按 IP 路由，不再主动丢弃该流。
+- 客户端和服务端 UDP flow 按空闲超时回收。`udp.idle_timeout` 单位为秒，默认 300。
+
+## Android 构建与打包
+
+- Android 项目路径为 `/home/andre/code/android/txz`。
+- NDK 路径为 `/home/andre/Android/android-ndk-r29`；OpenSSL 路径为
+  `/home/andre/Android/android_openssl/ssl_3`。
+- 必须使用动态 C++ 运行时：`ANDROID_STL=c++_shared`。
+- 默认 Android 构建目录为 `build-android-arm64`。
 
 ```sh
 cmake -S . -B build-android-arm64 \
@@ -131,44 +178,23 @@ cmake -S . -B build-android-arm64 \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-24 \
   -DANDROID_STL=c++_shared \
-  -DOPENSSL_ROOT_DIR=/mnt/f/DevEnv/AndroidSDK/android_openssl/ssl_3
-```
-
-- Build the Android native library with:
-
-```sh
+  -DOPENSSL_ROOT_DIR=/home/andre/Android/android_openssl/ssl_3
 cmake --build build-android-arm64 -j$(nproc)
 ```
 
-- Copy the library into the Android project with:
+- `libtx.so` 动态依赖 OpenSSL 与 `libc++_shared.so`。每个 ABI 的 Android APK 必须同时
+  打包 `libtx.so`、`libssl_3.so`、`libcrypto_3.so` 和 `libc++_shared.so`；以
+  `readelf -d libtx.so` 中的 `NEEDED` 条目为准。
+- 若 Android 工程以 `app/src/main/jniLibs/<ABI>/` 提供这些库，它们都应提交到版本库，
+  以确保干净检出可以构建并运行；不要用宽泛的 `*.so` 忽略规则排除它们。
+- 构建完成后至少复制 `build-android-arm64/lib/libtx.so` 到 Android 工程对应 ABI 目录，
+  并从所用 NDK/OpenSSL 发行包同步匹配 ABI 的其余三个动态库。
+- Android 项目的 WSL Gradle 构建可能无法解析 Windows 格式的 `local.properties`；必要时
+  在 Windows 环境从 Android 工程目录执行 `gradlew.bat assembleDebug`。
 
-```sh
-cp build-android-arm64/lib/libtx.so \
-  /mnt/f/program/android/txz/app/src/main/jniLibs/arm64-v8a/libtx.so
-```
+## 验证与已知限制
 
-- `libc++_shared.so` comes from the NDK and should be present in the Android project when using `c++_shared`:
-
-```sh
-/home/andre/Android/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so
-```
-
-- The Android project's WSL Gradle build may not understand `local.properties` when it contains a Windows `sdk.dir=F\:\\...` path. Building via Windows `cmd.exe` from `F:\program\android\txz` works:
-
-```sh
-/mnt/c/Windows/System32/cmd.exe /c "cd /d F:\program\android\txz && gradlew.bat assembleDebug"
-```
-
-- Windows-side adb path:
-
-```sh
-/mnt/c/Windows/System32/cmd.exe /c "F:\DevEnv\AndroidSDK\platform-tools\adb.exe devices"
-```
-
-- If writing to `/mnt/f/...` is blocked by sandboxing, request escalation rather than using generated build output as a workaround.
-
-## Current Branch Verification Notes
-- Recent local verification passed:
+- 提交前至少运行主机测试套件；涉及 Android 原生代码时，再运行 Android NDK 构建。
 
 ```sh
 cmake --build build -j$(nproc)
@@ -176,6 +202,7 @@ ctest --test-dir build --output-on-failure
 cmake --build build-android-arm64 -j$(nproc)
 ```
 
-- The Android native build currently passes with `ANDROID_STL=c++_shared`. It may still emit unused lambda capture warnings in `src/client/client_app.cpp`.
-- Runtime Linux auto_redirect has not been fully validated with root/CAP_NET_ADMIN in this session; test it with real nftables privileges before treating it as production-ready.
-- Current known future work: full Linux gateway `PREROUTING TPROXY`, stronger outbound bypass/policy routing, DNS/fake-IP with domain preservation, Android JNI `VpnService.protect(fd)` and DNS bypass, Windows Wintun compile/runtime validation, and a Windows TCP system-stack mechanism such as WFP or WinDivert.
+- Linux `auto_redirect` 尚未以 root/CAP_NET_ADMIN 在真实环境完成全面运行验证，不能视为
+  已达到生产就绪。
+- 后续工作包括完整 Linux 网关 `PREROUTING TPROXY`、更强的出站绕过/策略路由、
+  Windows Wintun 的编译与运行验证，以及 Windows system-stack 方案（WFP 或 WinDivert）。

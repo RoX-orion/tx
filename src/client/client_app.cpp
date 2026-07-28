@@ -38,6 +38,10 @@ constexpr size_t kMaxUdpPendingPackets = 1024;
 constexpr size_t kMaxUdpPendingBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxUdpPendingBytesPerFlow = 512 * 1024;
 constexpr size_t kMaxUdpTunnelWriteBacklog = 8 * 1024 * 1024;
+constexpr uint64_t kQuicSniffTimeoutMs = 300;
+constexpr size_t kMaxQuicSniffPendingBytesPerFlow = 16 * 1024;
+constexpr size_t kMaxQuicSniffActiveFlows = 256;
+constexpr size_t kMaxQuicSniffPendingBytes = 4 * 1024 * 1024;
 
 bool same_numeric_target(const TargetAddr& left, const TargetAddr& right) {
     if (left.type != right.type || left.port != right.port ||
@@ -777,9 +781,16 @@ void ClientApp::arm_internal_dns_timer() {
     uint64_t earliest = 0;
     for (const auto& item : udp_flows_) {
         const UdpFlow& flow = item.second;
-        if (flow.kind != UdpFlowKind::InternalDns || flow.dns_deadline_ms == 0) continue;
-        if (earliest == 0 || flow.dns_deadline_ms < earliest) {
-            earliest = flow.dns_deadline_ms;
+        if (flow.kind == UdpFlowKind::InternalDns && flow.dns_deadline_ms != 0) {
+            if (earliest == 0 || flow.dns_deadline_ms < earliest) {
+                earliest = flow.dns_deadline_ms;
+            }
+        }
+        if (flow.kind == UdpFlowKind::Tun && flow.quic_sniffer &&
+            flow.quic_sniff_deadline_ms != 0) {
+            if (earliest == 0 || flow.quic_sniff_deadline_ms < earliest) {
+                earliest = flow.quic_sniff_deadline_ms;
+            }
         }
     }
 
@@ -821,16 +832,24 @@ void ClientApp::on_internal_dns_timer(uv_timer_t* timer) {
     if (!app || app->stopping_) return;
 
     const uint64_t now = uv_now(app->loop_);
-    std::vector<std::string> expired;
+    std::vector<std::string> expired_dns;
+    std::vector<std::string> expired_quic;
     for (const auto& item : app->udp_flows_) {
         const UdpFlow& flow = item.second;
         if (flow.kind == UdpFlowKind::InternalDns && flow.dns_deadline_ms != 0 &&
             now >= flow.dns_deadline_ms) {
-            expired.push_back(item.first);
+            expired_dns.push_back(item.first);
+        }
+        if (flow.kind == UdpFlowKind::Tun && flow.quic_sniffer &&
+            flow.quic_sniff_deadline_ms != 0 && now >= flow.quic_sniff_deadline_ms) {
+            expired_quic.push_back(item.first);
         }
     }
-    for (const auto& flow_key : expired) {
+    for (const auto& flow_key : expired_dns) {
         app->retry_internal_dns(flow_key, "timeout");
+    }
+    for (const auto& flow_key : expired_quic) {
+        app->fallback_tun_quic_to_ip(flow_key);
     }
     app->arm_internal_dns_timer();
 }
@@ -841,6 +860,8 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
 
     UdpFlow& flow = it->second;
     const bool was_internal_dns = flow.kind == UdpFlowKind::InternalDns;
+    const bool had_quic_sniff_state = flow.quic_sniffer ||
+        !flow.quic_pending_packets.empty() || flow.quic_pending_bytes != 0;
     SessionId sid = flow.session_id;
     DnsResolver::ResolveCallback dns_callback = std::move(flow.dns_callback);
     UdpTunnelPtr tunnel;
@@ -860,6 +881,8 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
     }
 
     close_direct_udp_relay(flow);
+    release_tun_quic_sniffer(flow);
+    clear_tun_quic_pending(flow);
     if (flow.kind == UdpFlowKind::Tun && flow.lwip_flow_id != 0) {
         lwip_udp_stack_.close_flow(flow.lwip_flow_id);
     }
@@ -877,7 +900,7 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
         }
     }
     udp_flows_.erase(it);
-    if (was_internal_dns) arm_internal_dns_timer();
+    if (was_internal_dns || had_quic_sniff_state) arm_internal_dns_timer();
     if (dns_callback) dns_callback(std::vector<uint8_t>());
 }
 
@@ -1834,8 +1857,9 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
             flow.client_addr_len = sizeof(sockaddr_in6);
             memcpy(&flow.client_addr, addr, sizeof(sockaddr_in6));
         }
-        it = app->udp_flows_.emplace(flow_key, flow).first;
-        app->udp_session_keys_[flow.session_id] = flow_key;
+        const SessionId session_id = flow.session_id;
+        it = app->udp_flows_.emplace(flow_key, std::move(flow)).first;
+        app->udp_session_keys_[session_id] = flow_key;
     }
     it->second.last_activity_ms = uv_now(app->loop_);
 
@@ -1855,31 +1879,6 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
         app->send_direct_udp_packet(flow_key, it->second, target, payload, payload_len);
         return;
     }
-
-#if defined(TX_PLATFORM_ANDROID)
-    if (target.type == AddrType::Domain) {
-        const SessionId session_id = it->second.session_id;
-        std::vector<uint8_t> packet(payload, payload + payload_len);
-        app->dns_resolver_.resolve_host(target.host, AF_UNSPEC,
-            [app, flow_key, session_id, outbound, target, packet]
-            (std::vector<std::string> addresses) {
-                auto flow = app->udp_flows_.find(flow_key);
-                if (addresses.empty() || flow == app->udp_flows_.end() ||
-                    flow->second.session_id != session_id) {
-                    return;
-                }
-                TargetAddr resolved = target;
-                resolved.host = addresses.front();
-                resolved.type = resolved.host.find(':') == std::string::npos
-                    ? AddrType::IPv4 : AddrType::IPv6;
-                flow->second.proxied = true;
-                flow->second.outbound = outbound;
-                app->send_udp_packet(app->get_udp_tunnel(outbound), session_id,
-                                     resolved, packet.data(), packet.size());
-            });
-        return;
-    }
-#endif
 
     it->second.proxied = true;
     it->second.outbound = outbound;
@@ -2436,6 +2435,151 @@ void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
     lwip_udp_stack_.input(data, len);
 }
 
+bool ClientApp::finalize_tun_udp_route(UdpFlow& flow, const TargetAddr& route_target,
+                                       const TargetAddr& send_target) {
+    const RouteDecision decision = router_.decide_target(route_target);
+    const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
+    if (!outbound) {
+        TX_ERROR("TUN UDP route selected unknown outboundTag: %s",
+                 decision.outbound_tag.c_str());
+        return false;
+    }
+
+    release_tun_quic_sniffer(flow);
+    flow.route_target = route_target;
+    flow.send_target = send_target;
+    flow.outbound = outbound;
+    flow.proxied = outbound->type == OutboundType::Tx;
+    flow.route_ready = true;
+    return true;
+}
+
+void ClientApp::dispatch_tun_udp_packet(const std::string& flow_key, UdpFlow& flow,
+                                        const uint8_t* data, size_t len) {
+    if (!flow.route_ready || !flow.outbound || !data) return;
+
+    const OutboundConfig* outbound = flow.outbound;
+    if (outbound->type == OutboundType::Block) {
+        TX_DEBUG("[TUN][Block][UDP] route=%s:%u send=%s:%u",
+                 flow.route_target.host.c_str(), flow.route_target.port,
+                 flow.send_target.host.c_str(), flow.send_target.port);
+        return;
+    }
+    if (outbound->type == OutboundType::Direct) {
+        TX_DEBUG("[TUN][Direct][UDP] route=%s:%u send=%s:%u",
+                 flow.route_target.host.c_str(), flow.route_target.port,
+                 flow.send_target.host.c_str(), flow.send_target.port);
+        send_direct_udp_packet(flow_key, flow, flow.send_target, data, len);
+        return;
+    }
+
+    // Keep domain targets intact for TX.  The server resolves them through
+    // its own system resolver; dns.upstreams is only for local DNS handling.
+    send_udp_packet(get_udp_tunnel(outbound), flow.session_id, flow.send_target, data, len);
+}
+
+void ClientApp::release_tun_quic_sniffer(UdpFlow& flow) {
+    if (flow.quic_sniffer) {
+        flow.quic_sniffer.reset();
+        if (quic_sniff_active_flows_ > 0) --quic_sniff_active_flows_;
+    }
+    flow.quic_sniff_deadline_ms = 0;
+}
+
+void ClientApp::clear_tun_quic_pending(UdpFlow& flow) {
+    quic_sniff_pending_bytes_ -= std::min(quic_sniff_pending_bytes_,
+                                          flow.quic_pending_bytes);
+    flow.quic_pending_packets.clear();
+    flow.quic_pending_bytes = 0;
+}
+
+void ClientApp::flush_tun_quic_pending(const std::string& flow_key, UdpFlow& flow) {
+    release_tun_quic_sniffer(flow);
+    std::deque<std::vector<uint8_t>> pending;
+    pending.swap(flow.quic_pending_packets);
+    quic_sniff_pending_bytes_ -= std::min(quic_sniff_pending_bytes_,
+                                          flow.quic_pending_bytes);
+    flow.quic_pending_bytes = 0;
+    for (const auto& packet : pending) {
+        dispatch_tun_udp_packet(flow_key, flow, packet.data(), packet.size());
+    }
+}
+
+void ClientApp::fallback_tun_quic_to_ip(const std::string& flow_key) {
+    auto it = udp_flows_.find(flow_key);
+    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::Tun ||
+        it->second.route_ready) {
+        return;
+    }
+    UdpFlow& flow = it->second;
+    const TargetAddr target = flow.send_target;
+    if ((target.type != AddrType::IPv4 && target.type != AddrType::IPv6) ||
+        !finalize_tun_udp_route(flow, target, target)) {
+        release_tun_quic_sniffer(flow);
+        clear_tun_quic_pending(flow);
+        return;
+    }
+    flush_tun_quic_pending(flow_key, flow);
+}
+
+void ClientApp::process_tun_quic_packet(const std::string& flow_key, UdpFlow& flow,
+                                        const uint8_t* data, size_t len) {
+    if (!data) return;
+
+    const bool exceeds_packet_limit = len > kMaxQuicSniffPendingBytesPerFlow ||
+        flow.quic_pending_bytes > kMaxQuicSniffPendingBytesPerFlow - len;
+    const bool exceeds_global_limit = len > kMaxQuicSniffPendingBytes ||
+        quic_sniff_pending_bytes_ > kMaxQuicSniffPendingBytes - len;
+    if (exceeds_packet_limit || exceeds_global_limit) {
+        TX_DEBUG("[TUN][QUIC] sniff packet queue limit reached; using original IP");
+        fallback_tun_quic_to_ip(flow_key);
+        if (flow.route_ready) dispatch_tun_udp_packet(flow_key, flow, data, len);
+        return;
+    }
+
+    if (!flow.quic_sniffer) {
+        if (quic_sniff_active_flows_ >= kMaxQuicSniffActiveFlows) {
+            TX_DEBUG("[TUN][QUIC] sniff flow limit reached; using original IP");
+            fallback_tun_quic_to_ip(flow_key);
+            if (flow.route_ready) dispatch_tun_udp_packet(flow_key, flow, data, len);
+            return;
+        }
+        flow.quic_sniffer.reset(new QuicSniSniffer());
+        ++quic_sniff_active_flows_;
+        flow.quic_sniff_deadline_ms = uv_now(loop_) + kQuicSniffTimeoutMs;
+    }
+
+    flow.quic_pending_packets.emplace_back(data, data + len);
+    flow.quic_pending_bytes += len;
+    quic_sniff_pending_bytes_ += len;
+
+    std::string host;
+    const QuicSniResult result = flow.quic_sniffer->feed(data, len, host);
+    if (result == QuicSniResult::Found) {
+        TargetAddr route_target = flow.send_target;
+        route_target.type = AddrType::Domain;
+        route_target.host = std::move(host);
+        TX_DEBUG("[TUN][QUIC] recovered domain %s for %s:%u",
+                 route_target.host.c_str(), flow.send_target.host.c_str(),
+                 flow.send_target.port);
+        if (finalize_tun_udp_route(flow, route_target, flow.send_target)) {
+            flush_tun_quic_pending(flow_key, flow);
+        } else {
+            release_tun_quic_sniffer(flow);
+            clear_tun_quic_pending(flow);
+        }
+        return;
+    }
+    if (result == QuicSniResult::NeedMore) {
+        arm_internal_dns_timer();
+        return;
+    }
+
+    TX_DEBUG("[TUN][QUIC] SNI unavailable (%d); using original IP",
+             static_cast<int>(result));
+    fallback_tun_quic_to_ip(flow_key);
+}
+
 void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
                                          const IpAddr& source,
                                          const IpAddr& destination,
@@ -2476,6 +2620,7 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         return;
     }
 
+    const TargetAddr numeric_target = target;
     std::string domain;
     const bool fake_ip = fake_ip_dns_.reverse_lookup(target.host, domain);
     if (fake_ip) {
@@ -2505,71 +2650,36 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         flow.tun_src_ip = source;
         flow.tun_dst_ip = destination;
         flow.lwip_flow_id = lwip_flow_id;
-        it = udp_flows_.emplace(flow_key, flow).first;
-        udp_session_keys_[flow.session_id] = flow_key;
+        const SessionId session_id = flow.session_id;
+        it = udp_flows_.emplace(flow_key, std::move(flow)).first;
+        udp_session_keys_[session_id] = flow_key;
     }
-    it->second.last_activity_ms = uv_now(loop_);
-
-    RouteDecision decision = router_.decide_target(target);
-    const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
-    if (!outbound) {
-        TX_ERROR("TUN UDP route selected unknown outboundTag: %s",
-                 decision.outbound_tag.c_str());
-        return;
-    }
-    if (outbound->type == OutboundType::Block) {
-        TX_DEBUG("[TUN][Block][UDP] %s:%u", target.host.c_str(), target.port);
-        return;
-    }
-    if (outbound->type == OutboundType::Direct) {
-        TX_DEBUG("[TUN][Direct][UDP] %s:%u", target.host.c_str(), target.port);
-        send_direct_udp_packet(flow_key, it->second, target, data, len);
+    UdpFlow& flow = it->second;
+    flow.last_activity_ms = uv_now(loop_);
+    if (flow.route_ready) {
+        dispatch_tun_udp_packet(flow_key, flow, data, len);
         return;
     }
 
-    // A non-fake UDP/443 destination has lost its domain (typically because an
-    // app used DoH or a cached address). Forwarding that potentially poisoned
-    // IP through TX cannot be repaired by the server. Dropping the QUIC path
-    // makes Chromium/YouTube retry over TCP, where ClientHello SNI restores the
-    // domain and the TX server performs clean remote resolution.
-    if (!fake_ip && destination.port == 443) {
-        static std::atomic<unsigned> quic_fallback_diagnostics{0};
-        const unsigned diagnostic = quic_fallback_diagnostics.fetch_add(1);
-        if (diagnostic < 12) {
-            TX_WARN("[TUN][UDP] dropping non-domain QUIC target %s to force TCP/SNI fallback",
-                    destination.to_string().c_str());
+    if (fake_ip) {
+        // Preserve the established fake-IP behavior: the domain is both the
+        // routing target and the target sent to the existing UDP path.
+        if (finalize_tun_udp_route(flow, target, target)) {
+            dispatch_tun_udp_packet(flow_key, flow, data, len);
         }
         return;
     }
 
-#if defined(TX_PLATFORM_ANDROID)
-    if (target.type == AddrType::Domain) {
-        const SessionId session_id = it->second.session_id;
-        std::vector<uint8_t> packet(data, data + len);
-        dns_resolver_.resolve_host(target.host, AF_UNSPEC,
-            [this, flow_key, session_id, outbound, target, packet]
-            (std::vector<std::string> addresses) {
-                auto flow = udp_flows_.find(flow_key);
-                if (addresses.empty() || flow == udp_flows_.end() ||
-                    flow->second.session_id != session_id) {
-                    return;
-                }
-                TargetAddr resolved = target;
-                resolved.host = addresses.front();
-                resolved.type = resolved.host.find(':') == std::string::npos
-                    ? AddrType::IPv4 : AddrType::IPv6;
-                flow->second.proxied = true;
-                flow->second.outbound = outbound;
-                send_udp_packet(get_udp_tunnel(outbound), session_id, resolved,
-                                packet.data(), packet.size());
-            });
+    flow.route_target = numeric_target;
+    flow.send_target = numeric_target;
+    if (numeric_target.port == 443 && config_.udp_quic_sniff) {
+        process_tun_quic_packet(flow_key, flow, data, len);
         return;
     }
-#endif
 
-    it->second.proxied = true;
-    it->second.outbound = outbound;
-    send_udp_packet(get_udp_tunnel(outbound), it->second.session_id, target, data, len);
+    if (finalize_tun_udp_route(flow, numeric_target, numeric_target)) {
+        dispatch_tun_udp_packet(flow_key, flow, data, len);
+    }
 }
 
 bool ClientApp::write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
@@ -2948,33 +3058,6 @@ void ClientApp::connect_via_tunnel(ProxyConnPtr conn) {
             conn->target.host.c_str(), conn->target.port);
 
     connections_[conn->session_id] = conn;
-
-#if defined(TX_PLATFORM_ANDROID)
-    // Resolve proxy-domain targets through the user-selected DNS server over
-    // the TX UDP tunnel before opening their TCP tunnel.  The server therefore
-    // receives a numeric target and never falls back to its own resolver for
-    // Android proxy traffic.
-    if (conn->target.type == AddrType::Domain) {
-        const std::string original_host = conn->target.host;
-        dns_resolver_.resolve_host(original_host, AF_UNSPEC,
-            [this, conn](std::vector<std::string> addresses) {
-                if (!conn || !conn->local_session || conn->local_session->is_closed() ||
-                    connections_.find(conn->session_id) == connections_.end()) {
-                    return;
-                }
-                if (addresses.empty()) {
-                    TX_ERROR("Proxy DNS failed for %s", conn->target.host.c_str());
-                    fail_tunnel_connection(conn);
-                    return;
-                }
-                conn->target.host = addresses.front();
-                conn->target.type = conn->target.host.find(':') == std::string::npos
-                    ? AddrType::IPv4 : AddrType::IPv6;
-                if (!start_tunnel(conn)) fail_tunnel_connection(conn);
-            });
-        return;
-    }
-#endif
 
     if (!start_tunnel(conn)) {
         TX_ERROR("Failed to establish tunnel");

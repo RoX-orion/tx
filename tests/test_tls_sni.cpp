@@ -48,6 +48,11 @@ std::vector<uint8_t> client_hello(const std::string& host) {
     return record;
 }
 
+std::vector<uint8_t> raw_client_hello(const std::vector<uint8_t>& record) {
+    assert(record.size() >= 5);
+    return std::vector<uint8_t>(record.begin() + 5, record.end());
+}
+
 std::vector<uint8_t> split_records(const std::vector<uint8_t>& record, size_t first_payload) {
     assert(record.size() > 5 + first_payload);
     const size_t payload_size = record.size() - 5;
@@ -71,6 +76,13 @@ int main() {
     assert(tx::extract_tls_sni(hello.data(), hello.size() - 1, host) ==
            tx::TlsSniResult::NeedMore);
     assert(tx::extract_tls_sni(hello.data(), hello.size(), host) ==
+           tx::TlsSniResult::Found);
+    assert(host == "www.youtube.com");
+
+    const auto raw = raw_client_hello(hello);
+    assert(tx::extract_tls_client_hello_sni(raw.data(), raw.size() - 1, host) ==
+           tx::TlsSniResult::NeedMore);
+    assert(tx::extract_tls_client_hello_sni(raw.data(), raw.size(), host) ==
            tx::TlsSniResult::Found);
     assert(host == "www.youtube.com");
 

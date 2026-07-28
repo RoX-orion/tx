@@ -28,6 +28,18 @@ struct TxServerHandle {
 
 namespace {
 
+void apply_log_level(const std::string& value) {
+    if (value == "debug") {
+        tx::set_log_level(tx::LogLevel::Debug);
+    } else if (value == "warn") {
+        tx::set_log_level(tx::LogLevel::Warn);
+    } else if (value == "error") {
+        tx::set_log_level(tx::LogLevel::Error);
+    } else {
+        tx::set_log_level(tx::LogLevel::Info);
+    }
+}
+
 tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
                          const tx_android_network_hooks_t* hooks,
                          bool require_explicit_dns) {
@@ -94,6 +106,7 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
     if (config->log_level) {
         cfg.log_level = config->log_level;
     }
+    apply_log_level(cfg.log_level);
     if (tun_fd >= 0) {
         cfg.tun_enabled = true;
         cfg.tun_fd = tun_fd;

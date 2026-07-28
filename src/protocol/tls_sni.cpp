@@ -37,36 +37,16 @@ bool valid_hostname(const std::string& host) {
 
 } // namespace
 
-TlsSniResult extract_tls_sni(const uint8_t* data, size_t len, std::string& host) {
+TlsSniResult extract_tls_client_hello_sni(const uint8_t* data, size_t len,
+                                          std::string& host) {
     host.clear();
-    if (!data || len < 5) return TlsSniResult::NeedMore;
-    if (data[0] != 22 || data[1] != 3) return TlsSniResult::NotFound;
+    if (!data || len < 4) return TlsSniResult::NeedMore;
+    if (data[0] != 1) return TlsSniResult::NotFound;
 
-    // A ClientHello may be split across multiple handshake records (not just
-    // TCP reads). Reassemble record payloads before parsing its extensions.
-    std::vector<uint8_t> handshake;
-    size_t input_pos = 0;
-    size_t required = 4;
-    while (handshake.size() < required) {
-        if (input_pos + 5 > len) return TlsSniResult::NeedMore;
-        if (data[input_pos] != 22 || data[input_pos + 1] != 3)
-            return TlsSniResult::NotFound;
-        const size_t record_length = read_u16(data + input_pos + 3);
-        if (input_pos + 5 + record_length > len) return TlsSniResult::NeedMore;
-        handshake.insert(handshake.end(), data + input_pos + 5,
-                         data + input_pos + 5 + record_length);
-        input_pos += 5 + record_length;
-        if (handshake.size() >= 4) {
-            if (handshake[0] != 1) return TlsSniResult::NotFound;
-            required = 4 + read_u24(handshake.data() + 1);
-            if (required > 65539) return TlsSniResult::NotFound;
-        }
-    }
-
-    const uint8_t* hello = handshake.data();
-    const size_t record_length = handshake.size();
+    const uint8_t* hello = data;
     const size_t hello_length = read_u24(hello + 1);
-    if (hello_length + 4 > record_length) return TlsSniResult::NotFound;
+    if (hello_length > 65535) return TlsSniResult::NotFound;
+    if (len < hello_length + 4) return TlsSniResult::NeedMore;
 
     size_t pos = 4;
     const size_t end = 4 + hello_length;
@@ -123,6 +103,35 @@ TlsSniResult extract_tls_sni(const uint8_t* data, size_t len, std::string& host)
         pos += extension_length;
     }
     return TlsSniResult::NotFound;
+}
+
+TlsSniResult extract_tls_sni(const uint8_t* data, size_t len, std::string& host) {
+    host.clear();
+    if (!data || len < 5) return TlsSniResult::NeedMore;
+    if (data[0] != 22 || data[1] != 3) return TlsSniResult::NotFound;
+
+    // A ClientHello may be split across multiple handshake records (not just
+    // TCP reads). Reassemble record payloads before parsing its extensions.
+    std::vector<uint8_t> handshake;
+    size_t input_pos = 0;
+    size_t required = 4;
+    while (handshake.size() < required) {
+        if (input_pos + 5 > len) return TlsSniResult::NeedMore;
+        if (data[input_pos] != 22 || data[input_pos + 1] != 3)
+            return TlsSniResult::NotFound;
+        const size_t record_length = read_u16(data + input_pos + 3);
+        if (input_pos + 5 + record_length > len) return TlsSniResult::NeedMore;
+        handshake.insert(handshake.end(), data + input_pos + 5,
+                         data + input_pos + 5 + record_length);
+        input_pos += 5 + record_length;
+        if (handshake.size() >= 4) {
+            if (handshake[0] != 1) return TlsSniResult::NotFound;
+            required = 4 + read_u24(handshake.data() + 1);
+            if (required > 65539) return TlsSniResult::NotFound;
+        }
+    }
+
+    return extract_tls_client_hello_sni(handshake.data(), handshake.size(), host);
 }
 
 } // namespace tx

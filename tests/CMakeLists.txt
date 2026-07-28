@@ -33,6 +33,7 @@ tx_add_test(lwip_tcp_stack)
 tx_add_test(tcp_session_callbacks)
 tx_add_test(dns_resolver)
 tx_add_test(tls_sni)
+tx_add_test(quic_sni)
 tx_add_test(client_config)
 target_sources(test_client_config PRIVATE ../src/client/config.cpp)
 target_include_directories(test_client_config PRIVATE ../src/client)
@@ -49,4 +50,11 @@ target_sources(test_client_tunnel_dns PRIVATE
 target_include_directories(test_client_tunnel_dns PRIVATE
     ../src/client
     ../src/server)
+target_compile_definitions(test_client_tunnel_dns PRIVATE TX_PLATFORM_ANDROID=1)
 set_tests_properties(test_client_tunnel_dns PROPERTIES TIMEOUT 20)
+tx_add_test(client_quic_routing)
+target_sources(test_client_quic_routing PRIVATE
+    ../src/client/client_app.cpp
+    ../src/client/config.cpp
+    ../src/client/platform_tun.cpp)
+target_include_directories(test_client_quic_routing PRIVATE ../src/client)

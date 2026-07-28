@@ -356,6 +356,7 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
             }
             config.udp_idle_timeout_ms = static_cast<uint64_t>(idle_timeout) * 1000;
             config.udp_max_flows = udp.value("max_flows", config.udp_max_flows);
+            config.udp_quic_sniff = udp.value("quic_sniff", config.udp_quic_sniff);
         }
 
         if (j.contains("limits")) {

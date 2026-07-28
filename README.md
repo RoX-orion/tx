@@ -17,7 +17,7 @@
 - 高熵 PSK 认证和 X25519/ECDHE 会话密钥派生。
 - 基于 GeoIP / GeoSite 的有序路由规则，以及 direct / tx / block 出站。
 - IPv4 / IPv6 原生 TUN TCP / UDP 数据面（HEV lwIP）。
-- fake-IP DNS、TLS SNI 域名恢复，以及按域名优先的 `AsIs` 路由。
+- fake-IP DNS、TLS/QUIC SNI 域名恢复，以及按域名优先的 `AsIs` 路由。
 - Linux TUN 自动配置、policy route 和本机 TCP 透明重定向。
 - Android `VpnService` TUN fd、socket protector 与 DNS hook C API。
 - 有界的连接、流、握手、连接超时、速率和写入背压控制。
@@ -182,6 +182,30 @@ build-android/lib/libtx.so
 
 Android 模式下使用动态 OpenSSL 和 NDK 的 `c++_shared` 动态 C++ 运行库。
 
+### Android APK 动态库打包
+
+`libtx.so` 不是自包含的静态产物。当前 Android 构建会动态依赖 OpenSSL 和 NDK C++
+运行时；应用必须为每个 ABI 把以下库一起放入 APK（通常位于
+`app/src/main/jniLibs/<ABI>/`）：
+
+```text
+libtx.so
+libssl_3.so
+libcrypto_3.so
+libc++_shared.so
+```
+
+库文件必须来自同一 ABI 的构建环境。`libtx.so`、`libssl_3.so` 与 `libcrypto_3.so`
+的版本应匹配；`libc++_shared.so` 应来自所用 NDK。发布前可用以下命令确认实际运行时
+依赖，并以 `NEEDED` 条目为准：
+
+```sh
+readelf -d build-android/lib/libtx.so | rg NEEDED
+```
+
+若 Android 工程直接维护 `jniLibs`，上述四个库都应提交到版本库，保证干净检出后可
+打包和运行；不要用 `*.so` 规则忽略它们。
+
 ## 测试
 
 Debug 构建并运行测试：
@@ -192,9 +216,10 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-当前共有 19 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
+当前共有 21 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
 tunnel、TUN packet、HEV lwIP TCP / UDP、fake-IP DNS、DNS resolver、TX 隧道 DNS、
-客户端/服务端配置、TLS SNI、socket protector、TCP 回调和 UDP flow timeout。
+客户端/服务端配置、TLS SNI、QUIC SNI、QUIC 路由、socket protector、TCP 回调和 UDP
+flow timeout。
 
 ## 配置
 
@@ -273,7 +298,8 @@ cp config/client.json.example client.json
     },
     "udp": {
         "idle_timeout": 300,
-        "max_flows": 4096
+        "max_flows": 4096,
+        "quic_sniff": true
     },
     "limits": {
         "max_proxy_connections": 4096
@@ -345,6 +371,8 @@ cp config/client.json.example client.json
 - `listen.socks5`：本地 SOCKS5 代理监听地址和端口。
 - `udp.idle_timeout`：UDP flow 空闲回收时间，单位秒，默认 300，范围 1～86400。
 - `udp.max_flows`：客户端 UDP flow 上限，范围 1～1000000。
+- `udp.quic_sniff`：是否对无 fake-IP 映射的 TUN UDP/443 流尝试从 QUIC Initial 恢复
+  SNI，默认 `true`。嗅探无法得到 SNI 时仍按原始 IP 路由。
 - `limits.max_proxy_connections`：本地 HTTP / SOCKS / TUN TCP 连接总上限，范围 1～1000000。
 - `tun`：原生 TUN 配置；启用时 `tcp_stack` 可为 `lwip` 或 Linux 专用的 `system`，`udp_stack` 当前必须为 `lwip`。
 - `dns`：当前仅支持 `mode: "fake-ip"`；`upstreams` 为数值 DNS 上游地址列表，`cache_ttl` 和 `cache_capacity` 分别控制映射存活时间和 LRU 容量。
@@ -378,12 +406,13 @@ netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由�
 - Windows 使用 Wintun 后端；其编译与运行验证仍应在真实 Windows 环境进行。
 - Android 由 `VpnService` 提供真实 TUN fd，txlib 接管 fd 所有权并直接运行 lwIP。未启用 Linux `auto_redirect` 时，HTTP / SOCKS5 监听器会保留，因而仍可选用 tun2socks 兼容路径。所有 native 出站 socket 都必须通过 `VpnService.protect(fd)`。
 - 内置 fake-IP DNS 支持 UDP/TCP A、AAAA、HTTPS/SVCB NODATA、稳定正反映射和 LRU 容量控制；其他 DNS 类型转发至上游。默认池为 `198.18.0.0/16` 与 `fd00:198:18::/96`。
-- 对 fake-IP 映射缺失的 TCP/443，客户端会尝试从 TLS ClientHello 提取 SNI 以恢复域名；非 fake-IP 的 UDP/443 会被丢弃以促使应用回退到可恢复域名的 TCP 路径。ICMP 当前丢弃，DoH/DoT 仍只能按目标 IP 路由。
+- 对 fake-IP 映射缺失的 TCP/443，客户端会尝试从 TLS ClientHello 提取 SNI 以恢复域名；对真实 IP 的 UDP/443，`udp.quic_sniff`（默认开启）会尝试从 QUIC Initial 提取 SNI 用于路由，但仍向原始 IP 发送 UDP。SNI 不可用、嗅探关闭或达到资源上限时会正常按 IP 路由，不再主动丢弃该流。ICMP 当前丢弃；DoH/DoT 的非 QUIC 流量仍通常只能按目标 IP 路由。
 
 Android 共享库提供以下启动接口：
 
 - `tx_client_start_with_tun_fd()`：使用 `VpnService` 提供的 TUN fd 启动客户端。
-- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。Android 配置必须提供至少一个数值 `dns.upstreams`；查询由 TX 隧道送到远端服务器后再访问该 DNS，不能回退到物理网络 DNS。TX 服务器地址在 Android 上必须使用 IP 字面量，避免启动前的 DNS 引导泄漏。
+- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。Android 配置必须提供至少一个数值 `dns.upstreams`；查询由 TX 隧道送到远端服务器后再访问该 DNS，不能回退到物理网络 DNS。调用方应在启动前通过选定的物理网络解析服务器主机名，并把数值地址写入配置，避免 DNS 引导泄漏或循环。
+- `tx_client_start_android_ex()`：接受带版本的 Android 网络 hooks 结构；Android 上仅使用 `protect_socket`，`resolve_host` 与 `query_dns` 字段保留 ABI 兼容但不会被调用。
 
 Android 隧道 DNS 按 `dns.upstreams` 顺序尝试，每个 UDP/TCP 阶段的超时为 2 秒；
 收到 UDP TC 响应时会在同一 TX 加密连接上改用标准 DNS-over-TCP。

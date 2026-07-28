@@ -14,6 +14,7 @@
 #include "tx/protocol/tunnel.h"
 #include "tx/protocol/socks5.h"
 #include "tx/protocol/http_proxy.h"
+#include "tx/protocol/quic_sni.h"
 #include "tx/net/lwip_udp_stack.h"
 #include "tx/net/fake_ip_dns.h"
 #include "tx/net/tcp_flow_bridge.h"
@@ -56,6 +57,7 @@ public:
 
 private:
     friend struct ClientAppDnsTest;
+    friend struct ClientAppQuicTest;
 
     struct TunnelTimerCtx;
     struct DirectUdpRelay;
@@ -127,6 +129,15 @@ private:
         const OutboundConfig* outbound = nullptr;
         size_t pending_proxy_bytes = 0;
         bool proxied = false;
+        // TUN QUIC routing can use a recovered domain while retaining the
+        // original numeric destination for the actual UDP send.
+        TargetAddr route_target;
+        TargetAddr send_target;
+        bool route_ready = false;
+        std::unique_ptr<QuicSniSniffer> quic_sniffer;
+        std::deque<std::vector<uint8_t>> quic_pending_packets;
+        size_t quic_pending_bytes = 0;
+        uint64_t quic_sniff_deadline_ms = 0;
         DnsResolver::ResolveCallback dns_callback;
         std::vector<uint8_t> dns_query;
         size_t dns_upstream_index = 0;
@@ -277,6 +288,16 @@ private:
     void handle_lwip_udp_datagram(uint64_t flow_id, const IpAddr& source,
                                   const IpAddr& destination,
                                   const uint8_t* data, size_t len);
+    bool finalize_tun_udp_route(UdpFlow& flow, const TargetAddr& route_target,
+                                const TargetAddr& send_target);
+    void dispatch_tun_udp_packet(const std::string& flow_key, UdpFlow& flow,
+                                 const uint8_t* data, size_t len);
+    void process_tun_quic_packet(const std::string& flow_key, UdpFlow& flow,
+                                 const uint8_t* data, size_t len);
+    void fallback_tun_quic_to_ip(const std::string& flow_key);
+    void release_tun_quic_sniffer(UdpFlow& flow);
+    void clear_tun_quic_pending(UdpFlow& flow);
+    void flush_tun_quic_pending(const std::string& flow_key, UdpFlow& flow);
     bool write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
                               const uint8_t* data, size_t len);
     static void on_tun_poll(uv_poll_t* handle, int status, int events);
@@ -330,6 +351,8 @@ private:
     bool               udp_cleanup_timer_started_;
     uv_timer_t         internal_dns_timer_;
     bool               internal_dns_timer_initialized_;
+    size_t             quic_sniff_active_flows_ = 0;
+    size_t             quic_sniff_pending_bytes_ = 0;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

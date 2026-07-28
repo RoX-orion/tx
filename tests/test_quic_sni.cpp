@@ -184,9 +184,12 @@ Labels labels_for(uint32_t version) {
     }
 }
 
-std::vector<uint8_t> initial_packet(uint32_t version, uint8_t packet_number,
+std::vector<uint8_t> initial_packet(uint32_t version, uint64_t packet_number,
                                     uint64_t crypto_offset,
-                                    const uint8_t* crypto, size_t crypto_len) {
+    const uint8_t* crypto, size_t crypto_len,
+                                    size_t packet_number_len = 1) {
+    assert(packet_number_len >= 1 && packet_number_len <= 4);
+    assert(packet_number < (UINT64_C(1) << 62));
     const Labels labels = labels_for(version);
     std::vector<uint8_t> plaintext;
     plaintext.push_back(0x06); // CRYPTO
@@ -208,18 +211,23 @@ std::vector<uint8_t> initial_packet(uint32_t version, uint8_t packet_number,
     assert(hkdf_expand_label(client_secret, labels.hp, hp_key, sizeof(hp_key)));
 
     std::vector<uint8_t> packet;
-    packet.push_back(static_cast<uint8_t>(0xc0 | (labels.packet_type << 4)));
+    packet.push_back(static_cast<uint8_t>(0xc0 | (labels.packet_type << 4) |
+                                          (packet_number_len - 1)));
     push32(packet, version);
     packet.push_back(sizeof(dcid));
     packet.insert(packet.end(), dcid, dcid + sizeof(dcid));
     packet.push_back(sizeof(scid));
     packet.insert(packet.end(), scid, scid + sizeof(scid));
     packet.push_back(0); // token length
-    push_varint(packet, 1 + plaintext.size() + 16);
+    push_varint(packet, packet_number_len + plaintext.size() + 16);
     const size_t packet_number_offset = packet.size();
-    packet.push_back(packet_number);
+    for (size_t i = packet_number_len; i-- > 0;) {
+        packet.push_back(static_cast<uint8_t>(packet_number >> (i * 8)));
+    }
 
-    iv[11] ^= packet_number;
+    for (size_t i = 0; i < 8; ++i) {
+        iv[sizeof(iv) - 1 - i] ^= static_cast<uint8_t>(packet_number >> (8 * i));
+    }
     const std::vector<uint8_t> encrypted = aes_gcm_encrypt(key, iv, packet, plaintext);
     packet.insert(packet.end(), encrypted.begin(), encrypted.end());
     assert(packet_number_offset + 4 + 16 <= packet.size());
@@ -282,6 +290,21 @@ void test_fragmented_and_out_of_order() {
     assert(host == "video.googlevideo.com");
 }
 
+void test_packet_number_reconstruction() {
+    const std::vector<uint8_t> hello = client_hello("packet-number.example");
+    const size_t split = 13;
+    // The second packet carries only the low byte (0) of packet number 256.
+    // It must be reconstructed using the expected value after packet 255.
+    const auto first = initial_packet(kVersion1, 255, 0, hello.data(), split);
+    const auto second = initial_packet(kVersion1, 256, split, hello.data() + split,
+                                       hello.size() - split);
+    tx::QuicSniSniffer sniffer;
+    std::string host;
+    assert(sniffer.feed(first.data(), first.size(), host) == tx::QuicSniResult::NeedMore);
+    assert(sniffer.feed(second.data(), second.size(), host) == tx::QuicSniResult::Found);
+    assert(host == "packet-number.example");
+}
+
 void test_failures() {
     const std::vector<uint8_t> hello = client_hello("example.com");
     auto packet = initial_packet(kVersion1, 0, 0, hello.data(), hello.size());
@@ -321,6 +344,7 @@ void test_failures() {
 int main() {
     test_versions();
     test_fragmented_and_out_of_order();
+    test_packet_number_reconstruction();
     test_failures();
     std::printf("quic_sni tests passed\n");
     return 0;

@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 #include <atomic>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
@@ -27,6 +28,8 @@ public:
     uv_loop_t* loop() const { return loop_; }
 
 private:
+    friend struct ServerAppUdpTest;
+
     // A tunnel session from one client
     struct TunnelClient {
         SessionPtr       session;
@@ -55,11 +58,18 @@ private:
             bool       remote_eof = false;
         };
         struct UdpOutbound {
-            uv_udp_t* udp = nullptr;
+            uv_udp_t* udp_v4 = nullptr;
+            uv_udp_t* udp_v6 = nullptr;
             SessionId session_id = 0;
             uint64_t generation = 0;
             uint64_t last_activity_ms = 0;
-            int family = AF_UNSPEC;
+            sockaddr_storage peer{};
+            socklen_t peer_len = 0;
+            bool peer_ready = false;
+            bool resolving = false;
+            TargetAddr resolution_target;
+            std::deque<std::vector<uint8_t>> pending_resolution_packets;
+            size_t pending_resolution_bytes = 0;
         };
         std::unordered_map<SessionId, Outbound> outbounds;
         std::unordered_map<SessionId, UdpOutbound> udp_outbounds;
@@ -71,6 +81,7 @@ private:
         TunnelClientPtr client;
         SessionId sid;
         uint64_t generation;
+        int family;
     };
     struct UdpResolveCtx {
         ServerApp* app;
@@ -78,7 +89,6 @@ private:
         SessionId sid;
         uint64_t generation;
         TargetAddr target;
-        std::vector<uint8_t> payload;
     };
     struct HandshakeTimerCtx {
         ServerApp* app;
@@ -97,6 +107,12 @@ private:
                            const TargetAddr& target, Buffer& payload);
     bool ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
                                     TunnelClient::UdpOutbound& outbound, int family);
+    uv_udp_t* udp_outbound_socket(TunnelClient::UdpOutbound& outbound, int family) const;
+    void close_udp_outbound(TunnelClient::UdpOutbound& outbound);
+    bool queue_udp_resolution_packet(TunnelClient::UdpOutbound& outbound,
+                                     const uint8_t* data, size_t len);
+    bool send_udp_datagram(uv_udp_t* udp, const sockaddr_storage& target,
+                           const uint8_t* data, size_t len);
     void handle_disconnect(TunnelClientPtr client, SessionId sid);
     void handle_half_close(TunnelClientPtr client, SessionId sid);
     bool start_udp_cleanup_timer();

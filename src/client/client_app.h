@@ -123,8 +123,20 @@ private:
         int client_addr_len;
         IpAddr tun_src_ip;
         IpAddr tun_dst_ip;
+        // The application sent this flow to a fake address.  Replies must
+        // retain that fake address as their TUN source so connected UDP
+        // sockets (notably QUIC) accept them.
+        bool fake_ip_target = false;
         uint64_t lwip_flow_id = 0;
         DirectUdpRelay* direct_relay = nullptr;
+        // A UDP flow that started with a domain must use one resolved peer for
+        // its entire lifetime.  This keeps QUIC packets on the same CDN node
+        // and prevents concurrent datagrams from reordering around DNS.
+        TargetAddr direct_resolution_target;
+        TargetAddr direct_send_target;
+        bool direct_target_resolving = false;
+        std::deque<std::vector<uint8_t>> direct_resolution_packets;
+        size_t direct_resolution_bytes = 0;
         uint64_t last_activity_ms = 0;
         const OutboundConfig* outbound = nullptr;
         size_t pending_proxy_bytes = 0;
@@ -135,6 +147,7 @@ private:
         TargetAddr send_target;
         bool route_ready = false;
         std::unique_ptr<QuicSniSniffer> quic_sniffer;
+        std::string quic_initial_dcid;
         std::deque<std::vector<uint8_t>> quic_pending_packets;
         size_t quic_pending_bytes = 0;
         uint64_t quic_sniff_deadline_ms = 0;
@@ -160,6 +173,12 @@ private:
         size_t pending_bytes = 0;
     };
     using UdpTunnelPtr = std::shared_ptr<UdpTunnel>;
+
+    struct QuicRouteCacheEntry {
+        TargetAddr route_target;
+        const OutboundConfig* outbound = nullptr;
+        uint64_t expires_at_ms = 0;
+    };
 
     // Accept handlers for HTTP and SOCKS5 listeners
     void on_http_accept(SessionPtr session);
@@ -290,6 +309,10 @@ private:
                                   const uint8_t* data, size_t len);
     bool finalize_tun_udp_route(UdpFlow& flow, const TargetAddr& route_target,
                                 const TargetAddr& send_target);
+    bool inherit_tun_quic_route(UdpFlow& flow, const uint8_t* data, size_t len);
+    void remember_tun_quic_route(const UdpFlow& flow, const std::string& cid);
+    void remember_tun_quic_response_route(const UdpFlow& flow,
+                                          const uint8_t* data, size_t len);
     void dispatch_tun_udp_packet(const std::string& flow_key, UdpFlow& flow,
                                  const uint8_t* data, size_t len);
     void process_tun_quic_packet(const std::string& flow_key, UdpFlow& flow,
@@ -298,6 +321,7 @@ private:
     void release_tun_quic_sniffer(UdpFlow& flow);
     void clear_tun_quic_pending(UdpFlow& flow);
     void flush_tun_quic_pending(const std::string& flow_key, UdpFlow& flow);
+    IpAddr tun_udp_response_source(const UdpFlow& flow, const TargetAddr& source) const;
     bool write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
                               const uint8_t* data, size_t len);
     static void on_tun_poll(uv_poll_t* handle, int status, int events);
@@ -353,6 +377,7 @@ private:
     bool               internal_dns_timer_initialized_;
     size_t             quic_sniff_active_flows_ = 0;
     size_t             quic_sniff_pending_bytes_ = 0;
+    std::unordered_map<std::string, QuicRouteCacheEntry> quic_route_cache_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

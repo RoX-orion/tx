@@ -40,6 +40,11 @@ target_include_directories(test_client_config PRIVATE ../src/client)
 tx_add_test(server_config)
 target_sources(test_server_config PRIVATE ../src/server/config.cpp)
 target_include_directories(test_server_config PRIVATE ../src/server)
+tx_add_test(server_udp)
+target_sources(test_server_udp PRIVATE
+    ../src/server/server_app.cpp
+    ../src/server/config.cpp)
+target_include_directories(test_server_udp PRIVATE ../src/server)
 tx_add_test(client_tunnel_dns)
 target_sources(test_client_tunnel_dns PRIVATE
     ../src/client/client_app.cpp

@@ -42,6 +42,7 @@ constexpr uint64_t kQuicSniffTimeoutMs = 300;
 constexpr size_t kMaxQuicSniffPendingBytesPerFlow = 16 * 1024;
 constexpr size_t kMaxQuicSniffActiveFlows = 256;
 constexpr size_t kMaxQuicSniffPendingBytes = 4 * 1024 * 1024;
+constexpr size_t kMaxQuicRouteCacheEntries = 1024;
 
 bool same_numeric_target(const TargetAddr& left, const TargetAddr& right) {
     if (left.type != right.type || left.port != right.port ||
@@ -50,6 +51,29 @@ bool same_numeric_target(const TargetAddr& left, const TargetAddr& right) {
     }
     return IpAddr::from_string(left.host, left.port) ==
            IpAddr::from_string(right.host, right.port);
+}
+
+bool same_target(const TargetAddr& left, const TargetAddr& right) {
+    return left.type == right.type && left.port == right.port && left.host == right.host;
+}
+
+bool extract_quic_long_connection_ids(const uint8_t* data, size_t len,
+                                      std::string& dcid, std::string& scid) {
+    dcid.clear();
+    scid.clear();
+    // Header form and fixed bit must both be set.  CID bytes themselves are
+    // not header-protected, so this can also inspect encrypted responses.
+    if (!data || len < 7 || (data[0] & 0xc0) != 0xc0) return false;
+    size_t pos = 5; // first byte and version
+    const size_t dcid_len = data[pos++];
+    if (dcid_len > 20 || dcid_len > len - pos) return false;
+    dcid.assign(reinterpret_cast<const char*>(data + pos), dcid_len);
+    pos += dcid_len;
+    if (pos >= len) return false;
+    const size_t scid_len = data[pos++];
+    if (scid_len > 20 || scid_len > len - pos) return false;
+    scid.assign(reinterpret_cast<const char*>(data + pos), scid_len);
+    return true;
 }
 
 std::unique_ptr<uv_loop_t> create_app_loop(const char* app_name) {
@@ -518,6 +542,7 @@ void ClientApp::on_network_async(uv_async_t* handle) {
 
 void ClientApp::network_changed_on_loop() {
     dns_resolver_.cancel_pending();
+    quic_route_cache_.clear();
     close_all_udp_tunnels();
     std::vector<std::string> flows;
     for (const auto& item : udp_flows_) flows.push_back(item.first);
@@ -918,6 +943,10 @@ void ClientApp::cleanup_idle_udp_flows(uint64_t now_ms) {
     for (const auto& flow_key : expired) {
         remove_udp_flow(flow_key, true);
     }
+    for (auto it = quic_route_cache_.begin(); it != quic_route_cache_.end();) {
+        if (it->second.expires_at_ms <= now_ms) it = quic_route_cache_.erase(it);
+        else ++it;
+    }
     if (!expired.empty()) {
         TX_DEBUG("Cleaned up %zu idle UDP flows", expired.size());
     }
@@ -1081,22 +1110,78 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
         return;
     }
 
+    // Domain UDP is resolved once per flow.  Re-resolving successive QUIC
+    // datagrams can select different CDN peers and can also reorder packets
+    // while several DNS operations complete.
+    if (flow.direct_send_target.host.size() != 0 &&
+        same_target(flow.direct_resolution_target, target)) {
+        send_direct_udp_packet(flow_key, flow, flow.direct_send_target, data, len);
+        return;
+    }
+
+    const auto queue_packet = [&flow, data, len]() {
+        if (flow.direct_resolution_packets.size() >= kMaxUdpPendingPackets ||
+            len > kMaxUdpPendingBytesPerFlow ||
+            flow.direct_resolution_bytes > kMaxUdpPendingBytesPerFlow - len) {
+            TX_WARN("Dropping direct UDP packet while resolving %s: queue limit reached",
+                    flow.direct_resolution_target.host.c_str());
+            return false;
+        }
+        flow.direct_resolution_packets.emplace_back(data, data + len);
+        flow.direct_resolution_bytes += len;
+        return true;
+    };
+
+    if (flow.direct_target_resolving) {
+        if (!same_target(flow.direct_resolution_target, target)) {
+            TX_WARN("Dropping direct UDP packet for changed target %s:%u while resolving %s:%u",
+                    target.host.c_str(), target.port,
+                    flow.direct_resolution_target.host.c_str(),
+                    flow.direct_resolution_target.port);
+            return;
+        }
+        queue_packet();
+        return;
+    }
+
+    flow.direct_resolution_target = target;
+    flow.direct_target_resolving = true;
+    if (!queue_packet()) {
+        flow.direct_target_resolving = false;
+        return;
+    }
+
     const SessionId session_id = flow.session_id;
-    std::vector<uint8_t> payload(data, data + len);
     dns_resolver_.resolve_host(target.host, AF_UNSPEC,
-        [this, flow_key, session_id, target, payload](std::vector<std::string> addresses) {
+        [this, flow_key, session_id, target](std::vector<std::string> addresses) {
             auto flow_it = udp_flows_.find(flow_key);
-            if (addresses.empty() || flow_it == udp_flows_.end() ||
-                flow_it->second.session_id != session_id) {
+            if (flow_it == udp_flows_.end() || flow_it->second.session_id != session_id ||
+                !flow_it->second.direct_target_resolving ||
+                !same_target(flow_it->second.direct_resolution_target, target)) {
+                return;
+            }
+            UdpFlow& current = flow_it->second;
+            current.direct_target_resolving = false;
+            if (addresses.empty()) {
                 TX_WARN("[Direct][UDP] DNS lookup failed for %s", target.host.c_str());
+                current.direct_resolution_packets.clear();
+                current.direct_resolution_bytes = 0;
                 return;
             }
             TargetAddr resolved = target;
             resolved.host = addresses.front();
             resolved.type = resolved.host.find(':') == std::string::npos
                 ? AddrType::IPv4 : AddrType::IPv6;
-            send_direct_udp_packet(flow_key, flow_it->second, resolved,
-                                   payload.data(), payload.size());
+            current.direct_send_target = resolved;
+            if (current.kind == UdpFlowKind::Tun) current.send_target = resolved;
+
+            std::deque<std::vector<uint8_t>> pending;
+            pending.swap(current.direct_resolution_packets);
+            current.direct_resolution_bytes = 0;
+            for (const auto& packet : pending) {
+                send_direct_udp_packet(flow_key, current, resolved,
+                                       packet.data(), packet.size());
+            }
         });
 }
 
@@ -1117,6 +1202,7 @@ void ClientApp::send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr&
                                           const uint8_t* data, size_t len,
                                           RouteAction route) {
     if (flow.kind == UdpFlowKind::Tun) {
+        remember_tun_quic_response_route(flow, data, len);
         if (write_tun_udp_packet(flow, source, data, len)) {
             record_traffic(route, false, len);
         }
@@ -2454,6 +2540,80 @@ bool ClientApp::finalize_tun_udp_route(UdpFlow& flow, const TargetAddr& route_ta
     return true;
 }
 
+bool ClientApp::inherit_tun_quic_route(UdpFlow& flow, const uint8_t* data, size_t len) {
+    if (!data || len < 2) return false;
+    const uint64_t now = uv_now(loop_);
+    std::string cid;
+    std::string ignored;
+    if ((data[0] & 0x80) != 0) {
+        if (!extract_quic_long_connection_ids(data, len, cid, ignored) || cid.empty()) {
+            return false;
+        }
+    } else {
+        // A short header contains the destination CID immediately after its
+        // first byte.  Its length is implicit, so compare it to bounded CIDs
+        // learned from the server's long-header responses.
+        if ((data[0] & 0x40) == 0) return false;
+        for (auto it = quic_route_cache_.begin(); it != quic_route_cache_.end();) {
+            if (it->second.expires_at_ms <= now || !it->second.outbound) {
+                it = quic_route_cache_.erase(it);
+                continue;
+            }
+            const std::string& known = it->first;
+            if (!known.empty() && known.size() <= len - 1 &&
+                std::memcmp(data + 1, known.data(), known.size()) == 0) {
+                cid = known;
+                break;
+            }
+            ++it;
+        }
+        if (cid.empty()) return false;
+    }
+
+    const auto it = quic_route_cache_.find(cid);
+    if (it == quic_route_cache_.end() || it->second.expires_at_ms <= now ||
+        !it->second.outbound) {
+        if (it != quic_route_cache_.end()) quic_route_cache_.erase(it);
+        return false;
+    }
+
+    release_tun_quic_sniffer(flow);
+    flow.route_target = it->second.route_target;
+    flow.outbound = it->second.outbound;
+    flow.proxied = flow.outbound->type == OutboundType::Tx;
+    flow.route_ready = true;
+    TX_DEBUG("[TUN][QUIC] inherited route %s from CID cache",
+             flow.route_target.host.c_str());
+    return true;
+}
+
+void ClientApp::remember_tun_quic_route(const UdpFlow& flow, const std::string& cid) {
+    if (cid.empty() || !flow.route_ready || !flow.outbound ||
+        flow.route_target.type != AddrType::Domain) {
+        return;
+    }
+    if (quic_route_cache_.find(cid) == quic_route_cache_.end() &&
+        quic_route_cache_.size() >= kMaxQuicRouteCacheEntries) {
+        quic_route_cache_.erase(quic_route_cache_.begin());
+    }
+    QuicRouteCacheEntry entry;
+    entry.route_target = flow.route_target;
+    entry.outbound = flow.outbound;
+    entry.expires_at_ms = uv_now(loop_) + config_.udp_idle_timeout_ms;
+    quic_route_cache_[cid] = std::move(entry);
+}
+
+void ClientApp::remember_tun_quic_response_route(const UdpFlow& flow,
+                                                  const uint8_t* data, size_t len) {
+    if (flow.kind != UdpFlowKind::Tun || flow.send_target.port != 443) return;
+    std::string dcid;
+    std::string scid;
+    if (!extract_quic_long_connection_ids(data, len, dcid, scid)) return;
+    // The server's SCID becomes the client's destination CID for subsequent
+    // short-header packets, including after QUIC connection migration.
+    remember_tun_quic_route(flow, scid);
+}
+
 void ClientApp::dispatch_tun_udp_packet(const std::string& flow_key, UdpFlow& flow,
                                         const uint8_t* data, size_t len) {
     if (!flow.route_ready || !flow.outbound || !data) return;
@@ -2526,6 +2686,11 @@ void ClientApp::process_tun_quic_packet(const std::string& flow_key, UdpFlow& fl
                                         const uint8_t* data, size_t len) {
     if (!data) return;
 
+    if (flow.quic_initial_dcid.empty()) {
+        std::string ignored;
+        extract_quic_long_connection_ids(data, len, flow.quic_initial_dcid, ignored);
+    }
+
     const bool exceeds_packet_limit = len > kMaxQuicSniffPendingBytesPerFlow ||
         flow.quic_pending_bytes > kMaxQuicSniffPendingBytesPerFlow - len;
     const bool exceeds_global_limit = len > kMaxQuicSniffPendingBytes ||
@@ -2563,6 +2728,7 @@ void ClientApp::process_tun_quic_packet(const std::string& flow_key, UdpFlow& fl
                  route_target.host.c_str(), flow.send_target.host.c_str(),
                  flow.send_target.port);
         if (finalize_tun_udp_route(flow, route_target, flow.send_target)) {
+            remember_tun_quic_route(flow, flow.quic_initial_dcid);
             flush_tun_quic_pending(flow_key, flow);
         } else {
             release_tun_quic_sniffer(flow);
@@ -2649,6 +2815,7 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         flow.client_addr_len = 0;
         flow.tun_src_ip = source;
         flow.tun_dst_ip = destination;
+        flow.fake_ip_target = fake_ip;
         flow.lwip_flow_id = lwip_flow_id;
         const SessionId session_id = flow.session_id;
         it = udp_flows_.emplace(flow_key, std::move(flow)).first;
@@ -2673,6 +2840,10 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
     flow.route_target = numeric_target;
     flow.send_target = numeric_target;
     if (numeric_target.port == 443 && config_.udp_quic_sniff) {
+        if (inherit_tun_quic_route(flow, data, len)) {
+            dispatch_tun_udp_packet(flow_key, flow, data, len);
+            return;
+        }
         process_tun_quic_packet(flow_key, flow, data, len);
         return;
     }
@@ -2682,11 +2853,17 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
     }
 }
 
+IpAddr ClientApp::tun_udp_response_source(const UdpFlow& flow,
+                                          const TargetAddr& source) const {
+    if (flow.fake_ip_target) return flow.tun_dst_ip;
+    return IpAddr::from_string(source.host, source.port);
+}
+
 bool ClientApp::write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
                                      const uint8_t* data, size_t len) {
     if (!tun_started_ || !tun_device_) return false;
 
-    IpAddr src = IpAddr::from_string(source.host, source.port);
+    const IpAddr src = tun_udp_response_source(flow, source);
     if (src.family != flow.tun_src_ip.family) {
         return false;
     }

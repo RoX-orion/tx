@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace tx {
@@ -38,6 +39,10 @@ private:
     bool started_;
     std::vector<uint8_t> crypto_;
     std::vector<uint8_t> present_;
+    // Initial packet numbers are truncated on the wire.  Keep the expected
+    // value per DCID while this flow is being sniffed so the AEAD nonce is
+    // reconstructed according to QUIC's packet-number decoding rules.
+    std::unordered_map<std::string, uint64_t> expected_packet_numbers_;
     size_t contiguous_bytes_;
     size_t buffered_bytes_;
 };

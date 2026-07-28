@@ -15,6 +15,8 @@ constexpr size_t kTunnelPauseWriteBacklog = 4 * 1024 * 1024;
 constexpr size_t kTunnelResumeWriteBacklog = 1024 * 1024;
 constexpr size_t kMaxTunnelWriteBacklog = 16 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
+constexpr size_t kMaxUdpResolutionPendingPackets = 1024;
+constexpr size_t kMaxUdpResolutionPendingBytes = 512 * 1024;
 
 std::unique_ptr<uv_loop_t> create_server_loop() {
     std::unique_ptr<uv_loop_t> loop(new uv_loop_t);
@@ -79,6 +81,24 @@ bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
     if (target.type == AddrType::IPv6) {
         auto* a6 = reinterpret_cast<sockaddr_in6*>(&out);
         return uv_ip6_addr(target.host.c_str(), target.port, a6) == 0;
+    }
+    return false;
+}
+
+bool same_sockaddr(const sockaddr_storage& left, const sockaddr_storage& right) {
+    if (left.ss_family != right.ss_family) return false;
+    if (left.ss_family == AF_INET) {
+        const auto* a = reinterpret_cast<const sockaddr_in*>(&left);
+        const auto* b = reinterpret_cast<const sockaddr_in*>(&right);
+        return a->sin_port == b->sin_port &&
+               std::memcmp(&a->sin_addr, &b->sin_addr, sizeof(a->sin_addr)) == 0;
+    }
+    if (left.ss_family == AF_INET6) {
+        const auto* a = reinterpret_cast<const sockaddr_in6*>(&left);
+        const auto* b = reinterpret_cast<const sockaddr_in6*>(&right);
+        return a->sin6_port == b->sin6_port &&
+               a->sin6_scope_id == b->sin6_scope_id &&
+               std::memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(a->sin6_addr)) == 0;
     }
     return false;
 }
@@ -296,11 +316,7 @@ void ServerApp::cleanup_idle_udp_outbounds(uint64_t now_ms) {
 
             SessionId sid = it->first;
             tunnel_send_disconnect(client, sid);
-            if (it->second.udp &&
-                !uv_is_closing(reinterpret_cast<uv_handle_t*>(it->second.udp))) {
-                uv_close(reinterpret_cast<uv_handle_t*>(it->second.udp),
-                         ServerApp::on_udp_closed);
-            }
+            close_udp_outbound(it->second);
             it = client->udp_outbounds.erase(it);
             ++cleaned;
         }
@@ -670,34 +686,71 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
 
     sockaddr_storage addr;
     if (target_to_sockaddr(target, addr)) {
+        if (it->second.resolving ||
+            (it->second.peer_ready && !same_sockaddr(it->second.peer, addr))) {
+            TX_WARN("Dropping UDP session %u packet for changed target %s:%u",
+                    sid, target.host.c_str(), target.port);
+            payload.clear();
+            return;
+        }
+        it->second.peer = addr;
+        it->second.peer_len = addr.ss_family == AF_INET ? sizeof(sockaddr_in)
+                                                         : sizeof(sockaddr_in6);
+        it->second.peer_ready = true;
         if (!ensure_udp_outbound_socket(client, sid, it->second, addr.ss_family)) {
             payload.clear();
             return;
         }
-        auto* wr = new UdpSendReq;
-        wr->data = new char[payload.readable()];
-        memcpy(wr->data, payload.data(), payload.readable());
-        wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(payload.readable()));
-        int r = uv_udp_send(&wr->req, it->second.udp, &wr->buf, 1,
-                            reinterpret_cast<const sockaddr*>(&addr),
-                            ServerApp::on_udp_send_done);
-        if (r != 0) {
-            delete[] wr->data;
-            delete wr;
-        }
+        send_udp_datagram(udp_outbound_socket(it->second, addr.ss_family), addr,
+                          payload.data(), payload.readable());
     } else if (target.type == AddrType::Domain) {
+        if (it->second.peer_ready) {
+            if (it->second.resolution_target.type != AddrType::Domain ||
+                it->second.resolution_target.host != target.host ||
+                it->second.resolution_target.port != target.port) {
+                TX_WARN("Dropping UDP session %u packet for changed domain target %s:%u",
+                        sid, target.host.c_str(), target.port);
+                payload.clear();
+                return;
+            }
+            uv_udp_t* udp = udp_outbound_socket(it->second, it->second.peer.ss_family);
+            if (udp) send_udp_datagram(udp, it->second.peer, payload.data(), payload.readable());
+            payload.clear();
+            return;
+        }
+        if (it->second.resolving) {
+            if (it->second.resolution_target.host != target.host ||
+                it->second.resolution_target.port != target.port) {
+                TX_WARN("Dropping UDP session %u packet for changed domain target %s:%u",
+                        sid, target.host.c_str(), target.port);
+            } else {
+                queue_udp_resolution_packet(it->second, payload.data(), payload.readable());
+            }
+            payload.clear();
+            return;
+        }
+
+        it->second.resolving = true;
+        it->second.resolution_target = target;
+        if (!queue_udp_resolution_packet(it->second, payload.data(), payload.readable())) {
+            it->second.resolving = false;
+            payload.clear();
+            return;
+        }
         auto* resolve_ctx = new UdpResolveCtx;
         resolve_ctx->app = this;
         resolve_ctx->client = client;
         resolve_ctx->sid = sid;
         resolve_ctx->generation = it->second.generation;
         resolve_ctx->target = target;
-        resolve_ctx->payload.assign(payload.data(), payload.data() + payload.readable());
         auto* req = new uv_getaddrinfo_t;
         req->data = resolve_ctx;
         int r = uv_getaddrinfo(loop_, req, ServerApp::on_udp_resolved,
                                target.host.c_str(), nullptr, nullptr);
         if (r != 0) {
+            it->second.resolving = false;
+            it->second.pending_resolution_packets.clear();
+            it->second.pending_resolution_bytes = 0;
             delete resolve_ctx;
             delete req;
         }
@@ -709,12 +762,7 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
 bool ServerApp::ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
                                            TunnelClient::UdpOutbound& outbound,
                                            int family) {
-    if (outbound.udp) {
-        if (outbound.family == family) return true;
-        TX_WARN("Dropping UDP session %u target with address family %d; flow uses %d",
-                sid, family, outbound.family);
-        return false;
-    }
+    if (udp_outbound_socket(outbound, family)) return true;
     if (family != AF_INET && family != AF_INET6) return false;
 
     auto* udp = new uv_udp_t;
@@ -725,7 +773,7 @@ bool ServerApp::ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid
         return false;
     }
 
-    auto* ctx = new UdpCtx{this, client, sid, outbound.generation};
+    auto* ctx = new UdpCtx{this, client, sid, outbound.generation, family};
     udp->data = ctx;
     int bind_status = 0;
     if (family == AF_INET) {
@@ -748,9 +796,62 @@ bool ServerApp::ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid
         return false;
     }
 
-    outbound.udp = udp;
-    outbound.family = family;
+    if (family == AF_INET) outbound.udp_v4 = udp;
+    else outbound.udp_v6 = udp;
     return true;
+}
+
+uv_udp_t* ServerApp::udp_outbound_socket(TunnelClient::UdpOutbound& outbound,
+                                         int family) const {
+    if (family == AF_INET) return outbound.udp_v4;
+    if (family == AF_INET6) return outbound.udp_v6;
+    return nullptr;
+}
+
+void ServerApp::close_udp_outbound(TunnelClient::UdpOutbound& outbound) {
+    const auto close_socket = [](uv_udp_t*& udp) {
+        if (udp && !uv_is_closing(reinterpret_cast<uv_handle_t*>(udp))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(udp), ServerApp::on_udp_closed);
+        }
+        udp = nullptr;
+    };
+    close_socket(outbound.udp_v4);
+    close_socket(outbound.udp_v6);
+    outbound.pending_resolution_packets.clear();
+    outbound.pending_resolution_bytes = 0;
+    outbound.resolving = false;
+}
+
+bool ServerApp::queue_udp_resolution_packet(TunnelClient::UdpOutbound& outbound,
+                                            const uint8_t* data, size_t len) {
+    if (!data || len == 0 ||
+        outbound.pending_resolution_packets.size() >= kMaxUdpResolutionPendingPackets ||
+        len > kMaxUdpResolutionPendingBytes ||
+        outbound.pending_resolution_bytes > kMaxUdpResolutionPendingBytes - len) {
+        TX_WARN("Dropping UDP packet while resolving %s: queue limit reached",
+                outbound.resolution_target.host.c_str());
+        return false;
+    }
+    outbound.pending_resolution_packets.emplace_back(data, data + len);
+    outbound.pending_resolution_bytes += len;
+    return true;
+}
+
+bool ServerApp::send_udp_datagram(uv_udp_t* udp, const sockaddr_storage& target,
+                                  const uint8_t* data, size_t len) {
+    if (!udp || !data || len == 0) return false;
+    auto* wr = new UdpSendReq;
+    wr->data = new char[len];
+    memcpy(wr->data, data, len);
+    wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
+    const int status = uv_udp_send(&wr->req, udp, &wr->buf, 1,
+                                   reinterpret_cast<const sockaddr*>(&target),
+                                   ServerApp::on_udp_send_done);
+    if (status == 0) return true;
+    TX_WARN("UDP send failed: %s", uv_strerror(status));
+    delete[] wr->data;
+    delete wr;
+    return false;
 }
 
 void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
@@ -764,11 +865,7 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
     }
     auto udp_it = client->udp_outbounds.find(sid);
     if (udp_it != client->udp_outbounds.end()) {
-        if (udp_it->second.udp &&
-            !uv_is_closing(reinterpret_cast<uv_handle_t*>(udp_it->second.udp))) {
-            uv_close(reinterpret_cast<uv_handle_t*>(udp_it->second.udp),
-                     ServerApp::on_udp_closed);
-        }
+        close_udp_outbound(udp_it->second);
         client->udp_outbounds.erase(udp_it);
     }
 }
@@ -932,7 +1029,21 @@ void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
 
     auto it = ctx->client->udp_outbounds.find(ctx->sid);
     if (it == ctx->client->udp_outbounds.end() ||
-        it->second.generation != ctx->generation) {
+        it->second.generation != ctx->generation ||
+        !it->second.peer_ready ||
+        ctx->app->udp_outbound_socket(it->second, ctx->family) != handle) {
+        return;
+    }
+    sockaddr_storage source_addr{};
+    if (addr->sa_family == AF_INET) {
+        memcpy(&source_addr, addr, sizeof(sockaddr_in));
+    } else if (addr->sa_family == AF_INET6) {
+        memcpy(&source_addr, addr, sizeof(sockaddr_in6));
+    } else {
+        return;
+    }
+    if (!same_sockaddr(it->second.peer, source_addr)) {
+        TX_DEBUG("Ignoring UDP response for session %u from an unexpected peer", ctx->sid);
         return;
     }
     it->second.last_activity_ms = uv_now(ctx->app->loop_);
@@ -948,7 +1059,9 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
     if (status == 0 && res && ctx && ctx->app && ctx->client && !ctx->client->closed) {
         auto it = ctx->client->udp_outbounds.find(ctx->sid);
         if (it != ctx->client->udp_outbounds.end() &&
-            it->second.generation == ctx->generation) {
+            it->second.generation == ctx->generation && it->second.resolving &&
+            it->second.resolution_target.host == ctx->target.host &&
+            it->second.resolution_target.port == ctx->target.port) {
             it->second.last_activity_ms = uv_now(ctx->app->loop_);
             const struct addrinfo* selected = nullptr;
             for (auto* ai = res; ai; ai = ai->ai_next) {
@@ -972,6 +1085,9 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
                 memcpy(a6, selected->ai_addr, sizeof(sockaddr_in6));
                 a6->sin6_port = htons(ctx->target.port);
             } else {
+                it->second.resolving = false;
+                it->second.pending_resolution_packets.clear();
+                it->second.pending_resolution_bytes = 0;
                 if (res) uv_freeaddrinfo(res);
                 delete ctx;
                 delete req;
@@ -980,23 +1096,38 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
 
             if (!ctx->app->ensure_udp_outbound_socket(ctx->client, ctx->sid,
                                                        it->second, addr.ss_family)) {
+                it->second.resolving = false;
+                it->second.pending_resolution_packets.clear();
+                it->second.pending_resolution_bytes = 0;
                 if (res) uv_freeaddrinfo(res);
                 delete ctx;
                 delete req;
                 return;
             }
 
-            auto* wr = new UdpSendReq;
-            wr->data = new char[ctx->payload.size()];
-            memcpy(wr->data, ctx->payload.data(), ctx->payload.size());
-            wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(ctx->payload.size()));
-            int r = uv_udp_send(&wr->req, it->second.udp, &wr->buf, 1,
-                                reinterpret_cast<const sockaddr*>(&addr),
-                                ServerApp::on_udp_send_done);
-            if (r != 0) {
-                delete[] wr->data;
-                delete wr;
+            it->second.peer = addr;
+            it->second.peer_len = addr.ss_family == AF_INET ? sizeof(sockaddr_in)
+                                                             : sizeof(sockaddr_in6);
+            it->second.peer_ready = true;
+            it->second.resolving = false;
+            uv_udp_t* udp = ctx->app->udp_outbound_socket(it->second, addr.ss_family);
+            std::deque<std::vector<uint8_t>> pending;
+            pending.swap(it->second.pending_resolution_packets);
+            it->second.pending_resolution_bytes = 0;
+            for (const auto& packet : pending) {
+                ctx->app->send_udp_datagram(udp, addr, packet.data(), packet.size());
             }
+        }
+    } else if (ctx && ctx->client && !ctx->client->closed) {
+        auto it = ctx->client->udp_outbounds.find(ctx->sid);
+        if (it != ctx->client->udp_outbounds.end() &&
+            it->second.generation == ctx->generation && it->second.resolving &&
+            it->second.resolution_target.host == ctx->target.host &&
+            it->second.resolution_target.port == ctx->target.port) {
+            it->second.resolving = false;
+            it->second.pending_resolution_packets.clear();
+            it->second.pending_resolution_bytes = 0;
+            TX_WARN("UDP DNS lookup failed for %s", ctx->target.host.c_str());
         }
     }
 
@@ -1045,11 +1176,7 @@ void ServerApp::on_tunnel_close(TunnelClientPtr client) {
     auto udp_outbounds_copy = std::move(client->udp_outbounds);
     client->udp_outbounds.clear();
     for (auto& kv : udp_outbounds_copy) {
-        if (kv.second.udp &&
-            !uv_is_closing(reinterpret_cast<uv_handle_t*>(kv.second.udp))) {
-            uv_close(reinterpret_cast<uv_handle_t*>(kv.second.udp),
-                     ServerApp::on_udp_closed);
-        }
+        close_udp_outbound(kv.second);
     }
 
     clients_.erase(client->session->handle());

@@ -22,6 +22,7 @@ constexpr size_t kSha256Size = 32;
 constexpr size_t kAesBlockSize = 16;
 constexpr size_t kGcmTagSize = 16;
 constexpr size_t kMaxAckRanges = 256;
+constexpr size_t kMaxInitialPacketNumberSpaces = 8;
 
 const uint8_t kSaltDraft29[] = {
     0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97,
@@ -211,7 +212,8 @@ enum class PacketParseResult {
 
 PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
                                   std::vector<uint8_t>& plaintext,
-                                  size_t& consumed) {
+                                  size_t& consumed,
+                                  std::unordered_map<std::string, uint64_t>& expected_numbers) {
     consumed = 0;
     if (!data || len < 7) return PacketParseResult::NotQuic;
     const uint8_t first = data[0];
@@ -230,6 +232,7 @@ PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
         return PacketParseResult::Malformed;
     }
     const uint8_t* dcid = data + pos;
+    const std::string dcid_key(reinterpret_cast<const char*>(dcid), dcid_len);
     pos += dcid_len;
     if (pos >= len) return PacketParseResult::Malformed;
     const uint8_t scid_len = data[pos++];
@@ -283,10 +286,26 @@ PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
         return PacketParseResult::Malformed;
     }
     header.resize(packet_number_offset + packet_number_len);
-    uint64_t packet_number = 0;
+    uint64_t truncated_packet_number = 0;
     for (size_t i = 0; i < packet_number_len; ++i) {
         header[packet_number_offset + i] ^= mask[i + 1];
-        packet_number = (packet_number << 8) | header[packet_number_offset + i];
+        truncated_packet_number =
+            (truncated_packet_number << 8) | header[packet_number_offset + i];
+    }
+
+    const uint64_t expected = expected_numbers.count(dcid_key)
+        ? expected_numbers[dcid_key] : 0;
+    const uint64_t packet_number_window = UINT64_C(1) << (packet_number_len * 8);
+    const uint64_t packet_number_half_window = packet_number_window / 2;
+    const uint64_t packet_number_mask = packet_number_window - 1;
+    uint64_t packet_number = (expected & ~packet_number_mask) | truncated_packet_number;
+    if (packet_number <= UINT64_MAX - packet_number_half_window &&
+        packet_number + packet_number_half_window <= expected &&
+        packet_number <= ((UINT64_C(1) << 62) - packet_number_window)) {
+        packet_number += packet_number_window;
+    } else if (packet_number > expected + packet_number_half_window &&
+               packet_number >= packet_number_window) {
+        packet_number -= packet_number_window;
     }
     for (size_t i = 0; i < 8; ++i) {
         iv[sizeof(iv) - 1 - i] ^= static_cast<uint8_t>(packet_number >> (8 * i));
@@ -300,6 +319,16 @@ PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
     OPENSSL_cleanse(iv, sizeof(iv));
     OPENSSL_cleanse(mask, sizeof(mask));
     if (!ok) return PacketParseResult::Malformed;
+    if (expected_numbers.find(dcid_key) == expected_numbers.end() &&
+        expected_numbers.size() >= kMaxInitialPacketNumberSpaces) {
+        expected_numbers.clear();
+    }
+    const uint64_t next_expected = packet_number == ((UINT64_C(1) << 62) - 1)
+        ? packet_number : packet_number + 1;
+    auto number_it = expected_numbers.find(dcid_key);
+    if (number_it == expected_numbers.end() || number_it->second < next_expected) {
+        expected_numbers[dcid_key] = next_expected;
+    }
     consumed = packet_end;
     return PacketParseResult::Initial;
 }
@@ -334,6 +363,7 @@ void QuicSniSniffer::reset() {
     started_ = false;
     std::vector<uint8_t>().swap(crypto_);
     std::vector<uint8_t>().swap(present_);
+    expected_packet_numbers_.clear();
     contiguous_bytes_ = 0;
     buffered_bytes_ = 0;
 }
@@ -382,7 +412,8 @@ QuicSniResult QuicSniSniffer::feed(const uint8_t* data, size_t len, std::string&
         std::vector<uint8_t> plaintext;
         size_t packet_len = 0;
         const PacketParseResult packet_result = decrypt_initial(
-            data + packet_offset, len - packet_offset, plaintext, packet_len);
+            data + packet_offset, len - packet_offset, plaintext, packet_len,
+            expected_packet_numbers_);
         if (packet_result != PacketParseResult::Initial) {
             // Later packets in a coalesced datagram can be Handshake or
             // 0-RTT packets. Once an Initial was parsed, they simply provide

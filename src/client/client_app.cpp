@@ -32,29 +32,63 @@ namespace {
 constexpr uint64_t kTunnelHandshakeTimeoutMs = 8000;
 constexpr uint64_t kTunnelConnectResultTimeoutMs = 15000;
 constexpr uint64_t kTcpConnectTimeoutMs = 5000;
-constexpr uint64_t kInternalDnsStageTimeoutMs = 2000;
-constexpr size_t kMaxDnsTcpWireSize = 2 + 65535;
+// DNS tunnel establishment and the server-side resolver are separate
+// stages.  The response budget covers the resolver's UDP wait, TCP fallback,
+// and trying the remaining system nameservers after a timeout/TC response.
+constexpr uint64_t kInternalDnsConnectTimeoutMs = 15000;
+constexpr uint64_t kInternalDnsResponseTimeoutMs = 30000;
+constexpr uint64_t kTunDnsIdleTimeoutMs = 30000;
+// Keep one-shot TUN DNS sockets well below lwIP's 1024-UDP-PCB pool so a
+// burst of distinct source ports cannot starve ordinary UDP flows.
+constexpr size_t kMaxTunDnsFlows = 256;
+constexpr size_t kMaxTunDnsPendingQueries = 64;
 constexpr size_t kMaxUdpPendingPackets = 1024;
 constexpr size_t kMaxUdpPendingBytes = 4 * 1024 * 1024;
+// MUX increases the number of independent pending queues. Keep their total
+// budget equal to the old data-plus-DNS two-tunnel maximum.
+constexpr size_t kMaxAllUdpPendingBytes = 2 * kMaxUdpPendingBytes;
 constexpr size_t kMaxUdpPendingBytesPerFlow = 512 * 1024;
 constexpr size_t kMaxUdpTunnelWriteBacklog = 8 * 1024 * 1024;
+constexpr uint32_t kUdpTunnelRetryInitialMs = 250;
+constexpr uint32_t kUdpTunnelRetryMaxMs = 5000;
 constexpr uint64_t kQuicSniffTimeoutMs = 300;
 constexpr size_t kMaxQuicSniffPendingBytesPerFlow = 16 * 1024;
 constexpr size_t kMaxQuicSniffActiveFlows = 256;
 constexpr size_t kMaxQuicSniffPendingBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxQuicRouteCacheEntries = 1024;
 
-bool same_numeric_target(const TargetAddr& left, const TargetAddr& right) {
-    if (left.type != right.type || left.port != right.port ||
-        (left.type != AddrType::IPv4 && left.type != AddrType::IPv6)) {
-        return false;
-    }
-    return IpAddr::from_string(left.host, left.port) ==
-           IpAddr::from_string(right.host, right.port);
-}
-
 bool same_target(const TargetAddr& left, const TargetAddr& right) {
     return left.type == right.type && left.port == right.port && left.host == right.host;
+}
+
+bool build_dns_error_response(const std::vector<uint8_t>& query,
+                              std::vector<uint8_t>& response, uint8_t rcode) {
+    if (query.size() < 12 || load_be16(query.data() + 4) != 1) return false;
+    size_t pos = 12;
+    while (pos < query.size()) {
+        const uint8_t length = query[pos++];
+        if (length == 0) break;
+        if ((length & 0xc0u) != 0 || length > 63 || pos + length > query.size()) return false;
+        pos += length;
+    }
+    if (pos + 4 > query.size()) return false;
+    pos += 4;
+    response.assign(query.begin(), query.begin() + pos);
+    const uint16_t flags = static_cast<uint16_t>(0x8080u | (rcode & 0x0fu) |
+        (load_be16(query.data() + 2) & 0x0100u));
+    store_be16(response.data() + 2, flags);
+    store_be16(response.data() + 6, 0);
+    store_be16(response.data() + 8, 0);
+    store_be16(response.data() + 10, 0);
+    return true;
+}
+
+bool build_dns_servfail(const std::vector<uint8_t>& query, std::vector<uint8_t>& response) {
+    return build_dns_error_response(query, response, 2);
+}
+
+bool build_dns_refused(const std::vector<uint8_t>& query, std::vector<uint8_t>& response) {
+    return build_dns_error_response(query, response, 5);
 }
 
 bool extract_quic_long_connection_ids(const uint8_t* data, size_t len,
@@ -146,11 +180,12 @@ TargetAddr sockaddr_to_target(const sockaddr* addr) {
     return target;
 }
 
-bool is_numeric_ip_address(const std::string& host) {
+int numeric_address_family(const std::string& host) {
     in_addr v4{};
+    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) return AF_INET;
     in6_addr v6{};
-    return inet_pton(AF_INET, host.c_str(), &v4) == 1 ||
-           inet_pton(AF_INET6, host.c_str(), &v6) == 1;
+    if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) return AF_INET6;
+    return AF_UNSPEC;
 }
 
 bool target_to_sockaddr(const TargetAddr& target, sockaddr_storage& out) {
@@ -341,9 +376,15 @@ struct ClientApp::DirectUdpRelay {
     bool recv_started = false;
 };
 
+struct ClientApp::UdpTunnelRetryCtx {
+    ClientApp* app = nullptr;
+    std::weak_ptr<UdpTunnel> tunnel;
+};
+
 ClientApp::ClientApp(SocketProtectCallback socket_protector,
                      DnsResolver::HostResolveHook host_resolver,
-                     DnsResolver::QueryHook dns_query)
+                     DnsResolver::QueryHook dns_query,
+                     uint32_t android_address_family_mask)
     : owned_loop_(create_app_loop("client")),
       loop_(owned_loop_.get()),
       loop_closed_(false),
@@ -353,6 +394,7 @@ ClientApp::ClientApp(SocketProtectCallback socket_protector,
       stop_requested_(false),
       stopping_(false),
       dns_resolver_(loop_),
+      direct_dns_resolver_(loop_),
       http_server_(loop_),
       socks5_server_(loop_),
       tun_tcp_server_(loop_),
@@ -364,6 +406,7 @@ ClientApp::ClientApp(SocketProtectCallback socket_protector,
       udp_cleanup_timer_started_(false),
       internal_dns_timer_initialized_(false),
       next_session_id_(1),
+      android_address_family_mask_(android_address_family_mask),
       socket_protector_(std::move(socket_protector)),
       host_resolver_(std::move(host_resolver)),
       dns_query_(std::move(dns_query)) {}
@@ -411,33 +454,18 @@ bool ClientApp::init(const ClientConfig& config) {
     config_ = config;
 
 #if defined(TX_PLATFORM_ANDROID)
-    // Resolving a TX endpoint before its tunnel exists would require a
-    // bootstrap resolver outside the VPN.  Android deliberately has no such
-    // fallback: use an IP literal for every TX endpoint instead.
+    // A TX endpoint is the bootstrap for the tunnel itself.  Resolving it
+    // through the physical Network would leak the server hostname and make
+    // tunnel startup depend on physical DNS, so Android requires a numeric
+    // IPv4/IPv6 literal here.  Physical resolver hooks remain available only
+    // for destinations that routing explicitly sends to direct.
     for (const auto& outbound : config_.outbounds) {
         if (outbound.type == OutboundType::Tx &&
-            !is_numeric_ip_address(outbound.server_host)) {
-            TX_ERROR("Android TX outbound %s must use a numeric server host; "
-                     "physical DNS bootstrap is disabled", outbound.tag.c_str());
+            numeric_address_family(outbound.server_host) == AF_UNSPEC) {
+            TX_ERROR("Android TX outbound %s must use a numeric server host: %s",
+                     outbound.tag.c_str(), outbound.server_host.c_str());
             return false;
         }
-    }
-    if (config_.dns_upstreams.empty()) {
-        TX_ERROR("Android requires a numeric dns.upstreams entry for remote DNS");
-        return false;
-    }
-    for (const auto& upstream : config_.dns_upstreams) {
-        TargetAddr parsed;
-        if (!parse_dns_upstream(upstream, parsed)) {
-            TX_ERROR("Android DNS upstream must be numeric: %s", upstream.c_str());
-            return false;
-        }
-    }
-    const OutboundConfig* dns_outbound = find_outbound(config_.dns_outbound_tag);
-    if (!dns_outbound || dns_outbound->type != OutboundType::Tx) {
-        TX_ERROR("Android DNS outboundTag must reference a TX outbound: %s",
-                 config_.dns_outbound_tag.c_str());
-        return false;
     }
 #endif
 
@@ -445,7 +473,8 @@ bool ClientApp::init(const ClientConfig& config) {
     if (!fake_ip_dns_.configure(config_.dns_fake_ipv4_range,
                                 config_.dns_fake_ipv6_range,
                                 config_.dns_cache_ttl, dns_error,
-                                config_.dns_cache_capacity)) {
+                                config_.dns_cache_capacity,
+                                config_.dns_mapping_ttl)) {
         TX_ERROR("Failed to configure fake-IP DNS: %s", dns_error.c_str());
         return false;
     }
@@ -459,19 +488,29 @@ bool ClientApp::init(const ClientConfig& config) {
     }
 #endif
 #if defined(TX_PLATFORM_ANDROID)
-    // DNS upstreams are sent to the configured resolver by the TX server.
-    // Do not install Android's physical-network resolver hooks here.
-    dns_resolver_.configure(config_.dns_upstreams, socket_protector_,
-                            dns_bypass_mark, DnsResolver::HostResolveHook(),
+    // The client has no configured DNS upstream. dns_resolver_ is only a
+    // routing facade; direct_dns_resolver_ is the physical-Network resolver.
+    dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
+                            DnsResolver::HostResolveHook(),
                             DnsResolver::QueryHook(),
                             [this](std::vector<uint8_t> query,
                                    DnsResolver::ResolveCallback callback) {
                                 resolve_dns_via_tunnel(std::move(query),
                                                        std::move(callback));
                             });
+    direct_dns_resolver_.configure({}, socket_protector_, 0,
+                                   host_resolver_, dns_query_);
 #else
-    dns_resolver_.configure(config_.dns_upstreams, socket_protector_,
-                            dns_bypass_mark, host_resolver_, dns_query_);
+    dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
+                            DnsResolver::HostResolveHook(),
+                            DnsResolver::QueryHook(),
+                            [this](std::vector<uint8_t> query,
+                                   DnsResolver::ResolveCallback callback) {
+                                resolve_dns_via_tunnel(std::move(query),
+                                                       std::move(callback));
+                            });
+    direct_dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
+                                   host_resolver_, dns_query_);
 #endif
 
     // Load router
@@ -535,6 +574,18 @@ void ClientApp::notify_network_changed() {
     if (network_async_initialized_) uv_async_send(&network_async_);
 }
 
+void ClientApp::update_android_address_family_mask(uint32_t mask) {
+    android_address_family_mask_.store(mask, std::memory_order_release);
+}
+
+bool ClientApp::android_address_family_available(int family) const {
+    const uint32_t mask = android_address_family_mask_.load(std::memory_order_acquire);
+    if ((mask & kAndroidNetworkAddressFamilyKnown) == 0) return true;
+    if (family == AF_INET) return (mask & kAndroidNetworkAddressFamilyIPv4) != 0;
+    if (family == AF_INET6) return (mask & kAndroidNetworkAddressFamilyIPv6) != 0;
+    return true;
+}
+
 void ClientApp::on_network_async(uv_async_t* handle) {
     auto* app = static_cast<ClientApp*>(handle->data);
     if (app) app->network_changed_on_loop();
@@ -542,8 +593,10 @@ void ClientApp::on_network_async(uv_async_t* handle) {
 
 void ClientApp::network_changed_on_loop() {
     dns_resolver_.cancel_pending();
+    direct_dns_resolver_.cancel_pending();
     quic_route_cache_.clear();
     close_all_udp_tunnels();
+    close_all_tun_dns_flows();
     std::vector<std::string> flows;
     for (const auto& item : udp_flows_) flows.push_back(item.first);
     for (const auto& key : flows) remove_udp_flow(key, false);
@@ -579,6 +632,7 @@ void ClientApp::stop_on_loop() {
     stop_tun_listener();
     stop_udp_listener();
     close_all_udp_tunnels();
+    close_all_tun_dns_flows();
     http_server_.stop();
     socks5_server_.stop();
     std::vector<ProxyConnPtr> active_connections;
@@ -890,13 +944,15 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
     SessionId sid = flow.session_id;
     DnsResolver::ResolveCallback dns_callback = std::move(flow.dns_callback);
     UdpTunnelPtr tunnel;
-    if (flow.outbound) {
-        auto tunnel_it = udp_tunnels_.find(flow.outbound->tag);
+    if (!flow.udp_tunnel_key.empty()) {
+        auto tunnel_it = udp_tunnels_.find(flow.udp_tunnel_key);
         if (tunnel_it != udp_tunnels_.end() &&
             tunnel_it->second->outbound == flow.outbound) {
             tunnel = tunnel_it->second;
         }
     }
+    const bool close_dedicated_tunnel = tunnel && tunnel->dedicated &&
+        tunnel->owner_session_id == sid;
     if (notify_peer && flow.proxied && tunnel && tunnel->connected &&
         tunnel->tunnel_session && !tunnel->tunnel_session->is_closed()) {
         Buffer encoded;
@@ -918,6 +974,8 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
             if (pending->session_id == sid) {
                 tunnel->pending_bytes -= std::min(tunnel->pending_bytes,
                                                   pending->payload.size());
+                udp_tunnel_pending_bytes_ -= std::min(udp_tunnel_pending_bytes_,
+                                                       pending->payload.size());
                 pending = tunnel->pending.erase(pending);
             } else {
                 ++pending;
@@ -925,6 +983,13 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
         }
     }
     udp_flows_.erase(it);
+    if (close_dedicated_tunnel) {
+        const auto current = udp_tunnels_.find(tunnel->key);
+        if (current != udp_tunnels_.end() && current->second == tunnel) {
+            udp_tunnels_.erase(current);
+        }
+        close_udp_tunnel(tunnel);
+    }
     if (was_internal_dns || had_quic_sniff_state) arm_internal_dns_timer();
     if (dns_callback) dns_callback(std::vector<uint8_t>());
 }
@@ -950,6 +1015,29 @@ void ClientApp::cleanup_idle_udp_flows(uint64_t now_ms) {
     if (!expired.empty()) {
         TX_DEBUG("Cleaned up %zu idle UDP flows", expired.size());
     }
+    cleanup_idle_tun_dns_flows(now_ms);
+}
+
+void ClientApp::cleanup_idle_tun_dns_flows(uint64_t now_ms) {
+    std::vector<uint64_t> expired;
+    expired.reserve(tun_dns_flows_.size());
+    for (const auto& item : tun_dns_flows_) {
+        if (udp_flow_is_idle(now_ms, item.second.last_activity_ms, kTunDnsIdleTimeoutMs)) {
+            expired.push_back(item.first);
+        }
+    }
+    for (uint64_t flow_id : expired) {
+        TX_DEBUG("Closing idle TUN DNS flow=%llu", static_cast<unsigned long long>(flow_id));
+        lwip_udp_stack_.close_flow(flow_id);
+        tun_dns_flows_.erase(flow_id);
+    }
+}
+
+void ClientApp::close_all_tun_dns_flows() {
+    for (const auto& item : tun_dns_flows_) {
+        lwip_udp_stack_.close_flow(item.first);
+    }
+    tun_dns_flows_.clear();
 }
 
 void ClientApp::on_udp_cleanup_timer(uv_timer_t* timer) {
@@ -962,6 +1050,11 @@ void ClientApp::on_udp_cleanup_timer(uv_timer_t* timer) {
 
 bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
                                         int target_family) {
+    if (!android_address_family_available(target_family)) {
+        TX_WARN("[Direct][UDP] physical network has no IPv%d default route; dropping flow %s",
+                target_family == AF_INET6 ? 6 : 4, flow_key.c_str());
+        return false;
+    }
     if (flow.direct_relay) {
         return flow.direct_relay->family == target_family;
     }
@@ -1152,7 +1245,7 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
     }
 
     const SessionId session_id = flow.session_id;
-    dns_resolver_.resolve_host(target.host, AF_UNSPEC,
+    direct_dns_resolver_.resolve_host(target.host, AF_UNSPEC,
         [this, flow_key, session_id, target](std::vector<std::string> addresses) {
             auto flow_it = udp_flows_.find(flow_key);
             if (flow_it == udp_flows_.end() || flow_it->second.session_id != session_id ||
@@ -1168,8 +1261,19 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
                 current.direct_resolution_bytes = 0;
                 return;
             }
+            const auto candidate = std::find_if(addresses.begin(), addresses.end(),
+                [this](const std::string& address) {
+                    return android_address_family_available(numeric_address_family(address));
+                });
+            if (candidate == addresses.end()) {
+                TX_WARN("[Direct][UDP] physical network has no usable address family for %s",
+                        target.host.c_str());
+                current.direct_resolution_packets.clear();
+                current.direct_resolution_bytes = 0;
+                return;
+            }
             TargetAddr resolved = target;
-            resolved.host = addresses.front();
+            resolved.host = *candidate;
             resolved.type = resolved.host.find(':') == std::string::npos
                 ? AddrType::IPv4 : AddrType::IPv6;
             current.direct_send_target = resolved;
@@ -1235,14 +1339,64 @@ void ClientApp::send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr&
     record_traffic(route, false, len);
 }
 
-ClientApp::UdpTunnelPtr ClientApp::get_udp_tunnel(const OutboundConfig* outbound) {
-    if (!outbound || outbound->type != OutboundType::Tx) return UdpTunnelPtr();
-    auto it = udp_tunnels_.find(outbound->tag);
-    if (it != udp_tunnels_.end() && it->second->outbound == outbound) return it->second;
+ClientApp::UdpTunnelPtr ClientApp::get_udp_tunnel(const OutboundConfig* outbound,
+                                                  UdpTunnelKind kind,
+                                                  const std::string& requested_key) {
+    if (!outbound || outbound->type != OutboundType::Tx || !outbound->udp_over_tcp) {
+        return UdpTunnelPtr();
+    }
+    const std::string key = requested_key.empty()
+        ? outbound->tag + (kind == UdpTunnelKind::Dns ? ":dns" : ":udp")
+        : requested_key;
+    auto it = udp_tunnels_.find(key);
+    if (it != udp_tunnels_.end() && it->second->outbound == outbound &&
+        it->second->kind == kind) {
+        return it->second;
+    }
 
     UdpTunnelPtr tunnel = std::make_shared<UdpTunnel>();
     tunnel->outbound = outbound;
-    udp_tunnels_[outbound->tag] = tunnel;
+    tunnel->kind = kind;
+    tunnel->key = key;
+    udp_tunnels_[key] = tunnel;
+    return tunnel;
+}
+
+ClientApp::UdpTunnelPtr ClientApp::select_udp_tunnel(UdpFlow& flow) {
+    const OutboundConfig* outbound = flow.outbound;
+    if (!outbound || outbound->type != OutboundType::Tx || !outbound->udp_over_tcp) {
+        return UdpTunnelPtr();
+    }
+
+    if (!flow.udp_tunnel_key.empty()) {
+        const auto existing = udp_tunnels_.find(flow.udp_tunnel_key);
+        if (existing != udp_tunnels_.end() && existing->second->outbound == outbound &&
+            existing->second->kind == UdpTunnelKind::Data) {
+            return existing->second;
+        }
+    }
+
+    const bool dedicated = outbound->udp_mux_connections == -1;
+    if (!dedicated && outbound->udp_mux_connections < 1) {
+        TX_ERROR("TX outbound %s has invalid udp-mux.connections", outbound->tag.c_str());
+        return UdpTunnelPtr();
+    }
+    std::string key;
+    if (dedicated) {
+        key = outbound->tag + ":udp:flow:" + std::to_string(flow.session_id);
+    } else {
+        uint32_t& next_slot = udp_mux_next_slot_[outbound->tag];
+        const uint32_t slot = next_slot %
+            static_cast<uint32_t>(outbound->udp_mux_connections);
+        ++next_slot;
+        key = outbound->tag + ":udp:" + std::to_string(slot);
+    }
+
+    UdpTunnelPtr tunnel = get_udp_tunnel(outbound, UdpTunnelKind::Data, key);
+    if (!tunnel) return UdpTunnelPtr();
+    tunnel->dedicated = dedicated;
+    tunnel->owner_session_id = dedicated ? flow.session_id : 0;
+    flow.udp_tunnel_key = tunnel->key;
     return tunnel;
 }
 
@@ -1252,19 +1406,22 @@ bool ClientApp::ensure_udp_tunnel(const UdpTunnelPtr& tunnel) {
         return false;
     }
     if (tunnel->connected || tunnel->connecting) return true;
+    // A retry timer owns the next connection attempt. New datagrams are kept
+    // in the bounded pending queue until it fires.
+    if (tunnel->retry_timer) return true;
 
     tunnel->connecting = true;
     tunnel->handshake_buf.clear();
     tunnel->recv_buf.clear();
     TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
     std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
-    dns_resolver_.resolve_host(tunnel->outbound->server_host, AF_UNSPEC,
+    direct_dns_resolver_.resolve_host(tunnel->outbound->server_host, AF_UNSPEC,
         [this, weak_tunnel](std::vector<std::string> addresses) {
             UdpTunnelPtr current = weak_tunnel.lock();
             if (!current || !current->connecting) return;
             if (addresses.empty()) {
                 TX_ERROR("UDP tunnel DNS resolution failed");
-                close_udp_tunnel(current);
+                close_udp_tunnel(current, true);
                 return;
             }
             connect_udp_tunnel_candidates(
@@ -1276,10 +1433,17 @@ bool ClientApp::ensure_udp_tunnel(const UdpTunnelPtr& tunnel) {
 void ClientApp::connect_udp_tunnel_candidates(
     const UdpTunnelPtr& tunnel, std::shared_ptr<std::vector<std::string>> addresses,
     size_t index) {
+    while (addresses && index < addresses->size() &&
+           !android_address_family_available(numeric_address_family((*addresses)[index]))) {
+        TX_INFO("Skipping TX server IPv%d address %s: physical network has no default route",
+                numeric_address_family((*addresses)[index]) == AF_INET6 ? 6 : 4,
+                (*addresses)[index].c_str());
+        ++index;
+    }
     if (!tunnel || !tunnel->connecting || !tunnel->outbound || !addresses ||
         index >= addresses->size()) {
         TX_ERROR("UDP tunnel exhausted all resolved server addresses");
-        close_udp_tunnel(tunnel);
+        close_udp_tunnel(tunnel, true);
         return;
     }
 
@@ -1291,7 +1455,7 @@ void ClientApp::connect_udp_tunnel_candidates(
         UdpTunnelPtr current = weak_tunnel.lock();
         if (current && current->tunnel_session.get() == session_identity) {
             TX_WARN("UDP tunnel disconnected");
-            close_udp_tunnel(current);
+            close_udp_tunnel(current, true);
         }
     });
 
@@ -1309,7 +1473,7 @@ void ClientApp::connect_udp_tunnel_candidates(
                     connect_udp_tunnel_candidates(tunnel, addresses, index + 1);
                 } else {
                     TX_ERROR("UDP tunnel connect failed for every resolved address");
-                    close_udp_tunnel(tunnel);
+                    close_udp_tunnel(tunnel, true);
                 }
                 return;
             }
@@ -1341,7 +1505,8 @@ void ClientApp::send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid,
         auto key = udp_session_keys_.find(sid);
         auto flow = key == udp_session_keys_.end() ? udp_flows_.end()
                                                     : udp_flows_.find(key->second);
-        if (flow == udp_flows_.end() || flow->second.outbound != tunnel->outbound) {
+        if (flow == udp_flows_.end() || flow->second.outbound != tunnel->outbound ||
+            flow->second.udp_tunnel_key != tunnel->key) {
             return;
         }
         if (tunnel->pending.size() >= kMaxUdpPendingPackets ||
@@ -1356,11 +1521,18 @@ void ClientApp::send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid,
                     tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
             return;
         }
+        if (len > kMaxAllUdpPendingBytes ||
+            udp_tunnel_pending_bytes_ > kMaxAllUdpPendingBytes - len) {
+            TX_WARN("Dropping UDP packet while %s tunnel is connecting: global queue limit reached",
+                    tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
+            return;
+        }
         PendingUdpPacket pkt;
         pkt.session_id = sid;
         pkt.target = target;
         pkt.payload.assign(data, data + len);
         tunnel->pending_bytes += pkt.payload.size();
+        udp_tunnel_pending_bytes_ += pkt.payload.size();
         flow->second.pending_proxy_bytes += pkt.payload.size();
         tunnel->pending.push_back(std::move(pkt));
         return;
@@ -1376,80 +1548,144 @@ void ClientApp::send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid,
         return;
     }
     if (tunnel->tunnel_session->send(encoded)) {
+        TX_DEBUG("[UDP-TUNNEL-SEND] sid=%u target=%s:%u bytes=%zu outbound=%s",
+                 sid, target.host.c_str(), target.port, len,
+                 tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
         record_traffic(RouteAction::Proxy, true, len);
     }
 }
 
-bool ClientApp::parse_dns_upstream(const std::string& upstream, TargetAddr& target) const {
-    std::string host;
-    uint16_t port = 53;
-    if (upstream.empty()) return false;
+void ClientApp::send_dns_query(const UdpTunnelPtr& tunnel, SessionId sid,
+                               const uint8_t* data, size_t len) {
+    if (!tunnel || !data || len < 12 || len > TunnelCodec::kMaxDataPayloadSize ||
+        !ensure_udp_tunnel(tunnel)) return;
 
-    const auto parse_port = [](const std::string& text, uint16_t& value) {
-        if (text.empty()) return false;
-        char* end = nullptr;
-        const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
-        if (!end || *end != '\0' || parsed == 0 || parsed > 65535) return false;
-        value = static_cast<uint16_t>(parsed);
-        return true;
-    };
-
-    if (upstream.front() == '[') {
-        const size_t close = upstream.find(']');
-        if (close == std::string::npos) return false;
-        host = upstream.substr(1, close - 1);
-        if (close + 1 < upstream.size() &&
-            (upstream[close + 1] != ':' ||
-             !parse_port(upstream.substr(close + 2), port))) {
-            return false;
-        }
-    } else if (is_numeric_ip_address(upstream)) {
-        host = upstream;
-    } else {
-        const size_t colon = upstream.rfind(':');
-        if (colon == std::string::npos ||
-            !parse_port(upstream.substr(colon + 1), port)) {
-            return false;
-        }
-        host = upstream.substr(0, colon);
+    auto key = udp_session_keys_.find(sid);
+    auto flow = key == udp_session_keys_.end() ? udp_flows_.end()
+                                                : udp_flows_.find(key->second);
+    if (flow == udp_flows_.end() || flow->second.kind != UdpFlowKind::InternalDns ||
+        flow->second.outbound != tunnel->outbound ||
+        flow->second.udp_tunnel_key != tunnel->key) {
+        return;
     }
 
-    in_addr v4{};
-    in6_addr v6{};
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
-        target.type = AddrType::IPv4;
-    } else if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
-        target.type = AddrType::IPv6;
-    } else {
-        return false;
+    if (!tunnel->connected) {
+        if (tunnel->pending.size() >= kMaxUdpPendingPackets ||
+            len > kMaxUdpPendingBytes || tunnel->pending_bytes > kMaxUdpPendingBytes - len ||
+            len > kMaxUdpPendingBytesPerFlow ||
+            flow->second.pending_proxy_bytes > kMaxUdpPendingBytesPerFlow - len ||
+            len > kMaxAllUdpPendingBytes ||
+            udp_tunnel_pending_bytes_ > kMaxAllUdpPendingBytes - len) {
+            TX_WARN("Dropping DNS query while TX tunnel is connecting: queue limit reached");
+            return;
+        }
+        PendingUdpPacket packet;
+        packet.session_id = sid;
+        packet.payload.assign(data, data + len);
+        packet.dns_query = true;
+        tunnel->pending_bytes += len;
+        udp_tunnel_pending_bytes_ += len;
+        flow->second.pending_proxy_bytes += len;
+        tunnel->pending.push_back(std::move(packet));
+        return;
     }
-    target.host = host;
-    target.port = port;
-    return true;
+
+    Buffer encoded;
+    if (!tunnel->codec.encode_dns_query(sid, data, len, encoded) ||
+        !tunnel->tunnel_session || tunnel->tunnel_session->is_closed()) return;
+    if (tunnel->tunnel_session->pending_write_bytes() + encoded.readable() >
+        kMaxUdpTunnelWriteBacklog) {
+        TX_WARN("Dropping DNS query: tunnel write backlog limit reached");
+        return;
+    }
+    if (tunnel->tunnel_session->send(encoded)) {
+        // Do not start the resolver response deadline until the encrypted
+        // query has actually been handed to an established tunnel.  A DNS
+        // query can otherwise expire during tunnel handshake/retry and hide
+        // a valid response that arrives after the server's failover.
+        auto current = udp_session_keys_.find(sid);
+        if (current != udp_session_keys_.end()) {
+            auto current_flow = udp_flows_.find(current->second);
+            if (current_flow != udp_flows_.end() &&
+                current_flow->second.kind == UdpFlowKind::InternalDns) {
+                current_flow->second.dns_deadline_ms =
+                    uv_now(loop_) + kInternalDnsResponseTimeoutMs;
+            }
+        }
+        TX_DEBUG("[DNS-TUNNEL-SEND] sid=%u bytes=%zu outbound=%s", sid, len,
+                 tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
+        record_traffic(RouteAction::Proxy, true, len);
+    }
 }
 
 void ClientApp::resolve_dns_via_tunnel(std::vector<uint8_t> query,
                                        DnsResolver::ResolveCallback callback) {
     if (!callback) return;
-    if (query.size() < 12 || query.size() > 65535 || config_.dns_upstreams.empty()) {
+    if (query.size() < 12 || query.size() > 65535) {
+        std::vector<uint8_t> response;
+        if (build_dns_servfail(query, response)) callback(std::move(response));
+        else callback(std::vector<uint8_t>());
+        return;
+    }
+
+    FakeIpDns::Question question;
+    if (!FakeIpDns::parse_question(query.data(), query.size(), question)) {
+        std::vector<uint8_t> response;
+        if (build_dns_servfail(query, response)) callback(std::move(response));
+        else callback(std::vector<uint8_t>());
+        return;
+    }
+
+    TargetAddr dns_target;
+    dns_target.type = AddrType::Domain;
+    dns_target.host = question.domain;
+    dns_target.port = 53;
+    const RouteDecision decision = router_.decide_target(dns_target);
+    const OutboundConfig* outbound = find_outbound(decision.outbound_tag);
+    if (!outbound) {
+        TX_WARN("DNS route selected unknown outboundTag: %s",
+                decision.outbound_tag.c_str());
+        std::vector<uint8_t> response;
+        if (build_dns_servfail(query, response)) callback(std::move(response));
+        else callback(std::vector<uint8_t>());
+        return;
+    }
+
+    if (outbound->type == OutboundType::Direct) {
+        // This resolver is bound/protected to the physical Network on
+        // Android. It is used only after the routing rule selected direct.
+        direct_dns_resolver_.resolve(query.data(), query.size(), std::move(callback));
+        return;
+    }
+    if (outbound->type == OutboundType::Block) {
+        std::vector<uint8_t> response;
+        if (build_dns_refused(query, response)) callback(std::move(response));
+        else callback(std::vector<uint8_t>());
+        return;
+    }
+    if (outbound->type != OutboundType::Tx) {
         callback(std::vector<uint8_t>());
         return;
     }
 
-    const OutboundConfig* outbound = find_outbound(config_.dns_outbound_tag);
-    if (!outbound || outbound->type != OutboundType::Tx) {
-        TX_ERROR("Android DNS outboundTag must reference a TX outbound: %s",
-                 config_.dns_outbound_tag.c_str());
-        callback(std::vector<uint8_t>());
+    start_dns_tunnel_query(std::move(query), std::move(callback), outbound);
+}
+
+void ClientApp::start_dns_tunnel_query(std::vector<uint8_t> query,
+                                       DnsResolver::ResolveCallback callback,
+                                       const OutboundConfig* outbound) {
+    if (!callback || !outbound || outbound->type != OutboundType::Tx ||
+        query.size() < 12 || query.size() > TunnelCodec::kMaxDataPayloadSize) {
+        if (callback) callback(std::vector<uint8_t>());
         return;
     }
     if (udp_flows_.size() >= config_.udp_max_flows) {
-        TX_WARN("Dropping Android DNS query: configured UDP flow limit reached");
+        TX_WARN("Dropping DNS query: configured UDP flow limit reached");
         callback(std::vector<uint8_t>());
         return;
     }
 
-    UdpTunnelPtr tunnel = get_udp_tunnel(outbound);
+    UdpTunnelPtr tunnel = get_udp_tunnel(outbound, UdpTunnelKind::Dns);
     if (!ensure_udp_tunnel(tunnel)) {
         callback(std::vector<uint8_t>());
         return;
@@ -1468,10 +1704,10 @@ void ClientApp::resolve_dns_via_tunnel(std::vector<uint8_t> query,
     flow.kind = UdpFlowKind::InternalDns;
     flow.last_activity_ms = uv_now(loop_);
     flow.outbound = outbound;
+    flow.udp_tunnel_key = tunnel->key;
     flow.proxied = true;
     flow.dns_callback = std::move(callback);
     flow.dns_query = std::move(query);
-    flow.dns_upstream_index = 0;
     udp_flows_.emplace(flow_key, std::move(flow));
     udp_session_keys_[session_id] = flow_key;
     start_internal_dns_attempt(flow_key);
@@ -1486,6 +1722,8 @@ void ClientApp::discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionI
         }
         tunnel->pending_bytes -= std::min(tunnel->pending_bytes,
                                           pending->payload.size());
+        udp_tunnel_pending_bytes_ -= std::min(udp_tunnel_pending_bytes_,
+                                               pending->payload.size());
         auto key = udp_session_keys_.find(sid);
         if (key != udp_session_keys_.end()) {
             auto flow = udp_flows_.find(key->second);
@@ -1498,222 +1736,35 @@ void ClientApp::discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionI
     }
 }
 
-bool ClientApp::send_shared_tunnel_disconnect(const UdpTunnelPtr& tunnel,
-                                               SessionId sid) {
-    if (!tunnel || !tunnel->connected || !tunnel->tunnel_session ||
-        tunnel->tunnel_session->is_closed()) {
-        return false;
-    }
-    Buffer encoded;
-    return tunnel->codec.encode_disconnect(sid, encoded) &&
-           tunnel->tunnel_session->send(encoded);
-}
-
-bool ClientApp::rotate_internal_dns_session(const std::string& flow_key) {
-    auto it = udp_flows_.find(flow_key);
-    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) {
-        return false;
-    }
-    UdpFlow& flow = it->second;
-    udp_session_keys_.erase(flow.session_id);
-    release_session_id(flow.session_id);
-    flow.session_id = allocate_session_id();
-    if (flow.session_id == 0) {
-        TX_ERROR("Android DNS session ID space exhausted during retry");
-        return false;
-    }
-    udp_session_keys_[flow.session_id] = flow_key;
-    return true;
-}
-
 void ClientApp::start_internal_dns_attempt(const std::string& flow_key) {
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) return;
     UdpFlow& flow = it->second;
 
-    while (flow.dns_upstream_index < config_.dns_upstreams.size() &&
-           !parse_dns_upstream(config_.dns_upstreams[flow.dns_upstream_index],
-                               flow.dns_upstream)) {
-        TX_WARN("Skipping invalid Android DNS upstream: %s",
-                config_.dns_upstreams[flow.dns_upstream_index].c_str());
-        ++flow.dns_upstream_index;
-    }
-    if (flow.dns_upstream_index >= config_.dns_upstreams.size()) {
+    UdpTunnelPtr tunnel = get_udp_tunnel(flow.outbound, UdpTunnelKind::Dns);
+    if (!tunnel) {
         complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
         return;
     }
-
-    UdpTunnelPtr tunnel = get_udp_tunnel(flow.outbound);
+    flow.udp_tunnel_key = tunnel->key;
     discard_pending_udp_packets(tunnel, flow.session_id);
-    flow.dns_stage = InternalDnsStage::Udp;
-    flow.dns_tcp_response.clear();
-    flow.dns_deadline_ms = uv_now(loop_) + kInternalDnsStageTimeoutMs;
+    // This is only the connection/queueing budget.  send_dns_query() resets
+    // the deadline once the encrypted query is actually sent.
+    flow.dns_deadline_ms = uv_now(loop_) + kInternalDnsConnectTimeoutMs;
     flow.last_activity_ms = uv_now(loop_);
-    TX_DEBUG("Android DNS query via upstream %s:%u (%zu/%zu)",
-             flow.dns_upstream.host.c_str(), flow.dns_upstream.port,
-             flow.dns_upstream_index + 1, config_.dns_upstreams.size());
-    send_udp_packet(tunnel, flow.session_id, flow.dns_upstream,
-                    flow.dns_query.data(), flow.dns_query.size());
+    TX_DEBUG("DNS query via TX system resolver outbound=%s bytes=%zu",
+             flow.outbound ? flow.outbound->tag.c_str() : "unknown",
+             flow.dns_query.size());
+    send_dns_query(tunnel, flow.session_id,
+                   flow.dns_query.data(), flow.dns_query.size());
     arm_internal_dns_timer();
 }
 
 void ClientApp::retry_internal_dns(const std::string& flow_key, const char* reason) {
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) return;
-
-    UdpFlow& flow = it->second;
-    TX_WARN("Android DNS upstream %s:%u failed (%s)",
-            flow.dns_upstream.host.c_str(), flow.dns_upstream.port,
-            reason ? reason : "unknown");
-    auto tunnel_it = flow.outbound ? udp_tunnels_.find(flow.outbound->tag)
-                                   : udp_tunnels_.end();
-    UdpTunnelPtr tunnel = tunnel_it != udp_tunnels_.end() ? tunnel_it->second
-                                                           : UdpTunnelPtr();
-    discard_pending_udp_packets(tunnel, flow.session_id);
-    send_shared_tunnel_disconnect(tunnel, flow.session_id);
-    flow.dns_deadline_ms = 0;
-    flow.dns_tcp_response.clear();
-    ++flow.dns_upstream_index;
-    if (stopping_ || flow.dns_upstream_index >= config_.dns_upstreams.size()) {
-        complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
-        return;
-    }
-    if (!rotate_internal_dns_session(flow_key)) {
-        complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
-        return;
-    }
-    start_internal_dns_attempt(flow_key);
-}
-
-void ClientApp::start_internal_dns_tcp(const std::string& flow_key,
-                                       const UdpTunnelPtr& tunnel) {
-    auto it = udp_flows_.find(flow_key);
-    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns ||
-        it->second.dns_stage != InternalDnsStage::Udp || !tunnel ||
-        !tunnel->connected || !tunnel->tunnel_session ||
-        tunnel->tunnel_session->is_closed()) {
-        retry_internal_dns(flow_key, "TCP fallback unavailable");
-        return;
-    }
-
-    UdpFlow& flow = it->second;
-    discard_pending_udp_packets(tunnel, flow.session_id);
-    send_shared_tunnel_disconnect(tunnel, flow.session_id);
-    if (!rotate_internal_dns_session(flow_key)) {
-        complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
-        return;
-    }
-    auto current = udp_flows_.find(flow_key);
-    if (current == udp_flows_.end()) return;
-    UdpFlow& tcp_flow = current->second;
-    Buffer encoded;
-    if (!tunnel->codec.encode(TunnelCmd::Connect, tcp_flow.session_id,
-                              tcp_flow.dns_upstream, nullptr, 0, encoded) ||
-        tunnel->tunnel_session->pending_write_bytes() + encoded.readable() >
-            kMaxUdpTunnelWriteBacklog ||
-        !tunnel->tunnel_session->send(encoded)) {
-        retry_internal_dns(flow_key, "TCP fallback start failed");
-        return;
-    }
-    tcp_flow.dns_stage = InternalDnsStage::TcpConnect;
-    tcp_flow.dns_tcp_response.clear();
-    tcp_flow.dns_deadline_ms = uv_now(loop_) + kInternalDnsStageTimeoutMs;
-    TX_DEBUG("Android DNS UDP response was truncated; retrying %s:%u over TCP",
-             tcp_flow.dns_upstream.host.c_str(), tcp_flow.dns_upstream.port);
-    arm_internal_dns_timer();
-}
-
-void ClientApp::send_internal_dns_tcp_query(const std::string& flow_key,
-                                            const UdpTunnelPtr& tunnel) {
-    auto it = udp_flows_.find(flow_key);
-    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns ||
-        it->second.dns_stage != InternalDnsStage::TcpConnect || !tunnel ||
-        !tunnel->connected || !tunnel->tunnel_session ||
-        tunnel->tunnel_session->is_closed()) {
-        retry_internal_dns(flow_key, "TCP connect failed");
-        return;
-    }
-
-    UdpFlow& flow = it->second;
-    std::vector<uint8_t> wire(2 + flow.dns_query.size());
-    store_be16(wire.data(), static_cast<uint16_t>(flow.dns_query.size()));
-    std::copy(flow.dns_query.begin(), flow.dns_query.end(), wire.begin() + 2);
-    Buffer encoded;
-    if (!tunnel->codec.encode_data_chunks(flow.session_id, wire.data(), wire.size(), encoded) ||
-        tunnel->tunnel_session->pending_write_bytes() + encoded.readable() >
-            kMaxUdpTunnelWriteBacklog ||
-        !tunnel->tunnel_session->send(encoded)) {
-        retry_internal_dns(flow_key, "TCP query send failed");
-        return;
-    }
-    record_traffic(RouteAction::Proxy, true, flow.dns_query.size());
-    flow.dns_stage = InternalDnsStage::TcpResponse;
-    flow.dns_deadline_ms = uv_now(loop_) + kInternalDnsStageTimeoutMs;
-    arm_internal_dns_timer();
-}
-
-void ClientApp::handle_internal_dns_udp_response(const std::string& flow_key,
-                                                 const UdpTunnelPtr& tunnel,
-                                                 const TargetAddr& source,
-                                                 const uint8_t* data, size_t len) {
-    auto it = udp_flows_.find(flow_key);
-    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns ||
-        it->second.dns_stage != InternalDnsStage::Udp || !data) return;
-    UdpFlow& flow = it->second;
-    if (!same_numeric_target(source, flow.dns_upstream)) {
-        TX_DEBUG("Ignoring Android DNS response from stale upstream %s:%u",
-                 source.host.c_str(), source.port);
-        return;
-    }
-
-    std::vector<uint8_t> response(data, data + len);
-    if (!DnsResolver::response_matches_query(flow.dns_query, response)) {
-        TX_DEBUG("Ignoring Android DNS response that does not match the query");
-        return;
-    }
-    if (DnsResolver::response_is_truncated(response)) {
-        start_internal_dns_tcp(flow_key, tunnel);
-        return;
-    }
-    record_traffic(RouteAction::Proxy, false, response.size());
-    complete_internal_dns(flow_key, std::move(response), true);
-}
-
-void ClientApp::handle_internal_dns_tcp_data(const std::string& flow_key,
-                                             const uint8_t* data, size_t len) {
-    auto it = udp_flows_.find(flow_key);
-    if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns ||
-        it->second.dns_stage != InternalDnsStage::TcpResponse || !data || len == 0) return;
-    UdpFlow& flow = it->second;
-    if (len > kMaxDnsTcpWireSize ||
-        flow.dns_tcp_response.readable() > kMaxDnsTcpWireSize - len) {
-        retry_internal_dns(flow_key, "oversized TCP response");
-        return;
-    }
-    flow.dns_tcp_response.append(data, len);
-    if (flow.dns_tcp_response.readable() < 2) return;
-
-    const uint16_t response_len = load_be16(flow.dns_tcp_response.data());
-    if (response_len < 12) {
-        retry_internal_dns(flow_key, "invalid TCP response length");
-        return;
-    }
-    const size_t wire_len = 2 + static_cast<size_t>(response_len);
-    if (flow.dns_tcp_response.readable() < wire_len) return;
-    if (flow.dns_tcp_response.readable() != wire_len) {
-        retry_internal_dns(flow_key, "unexpected trailing TCP response data");
-        return;
-    }
-
-    std::vector<uint8_t> response(flow.dns_tcp_response.data() + 2,
-                                  flow.dns_tcp_response.data() + wire_len);
-    if (!DnsResolver::response_matches_query(flow.dns_query, response) ||
-        DnsResolver::response_is_truncated(response)) {
-        retry_internal_dns(flow_key, "invalid TCP response");
-        return;
-    }
-    record_traffic(RouteAction::Proxy, false, response.size());
-    complete_internal_dns(flow_key, std::move(response), true);
+    TX_WARN("TX system DNS query failed (%s)", reason ? reason : "unknown");
+    complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
 }
 
 void ClientApp::complete_internal_dns(const std::string& flow_key,
@@ -1732,6 +1783,8 @@ void ClientApp::flush_pending_udp_packets(const UdpTunnelPtr& tunnel) {
         PendingUdpPacket pkt = std::move(tunnel->pending.front());
         tunnel->pending.pop_front();
         tunnel->pending_bytes -= std::min(tunnel->pending_bytes, pkt.payload.size());
+        udp_tunnel_pending_bytes_ -= std::min(udp_tunnel_pending_bytes_,
+                                               pkt.payload.size());
         auto key = udp_session_keys_.find(pkt.session_id);
         if (key != udp_session_keys_.end()) {
             auto flow = udp_flows_.find(key->second);
@@ -1740,7 +1793,12 @@ void ClientApp::flush_pending_udp_packets(const UdpTunnelPtr& tunnel) {
                     flow->second.pending_proxy_bytes, pkt.payload.size());
             }
         }
-        send_udp_packet(tunnel, pkt.session_id, pkt.target, pkt.payload.data(), pkt.payload.size());
+        if (pkt.dns_query) {
+            send_dns_query(tunnel, pkt.session_id, pkt.payload.data(), pkt.payload.size());
+        } else {
+            send_udp_packet(tunnel, pkt.session_id, pkt.target,
+                            pkt.payload.data(), pkt.payload.size());
+        }
     }
 }
 
@@ -1768,6 +1826,8 @@ void ClientApp::on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer&
     TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
     tunnel->connecting = false;
     tunnel->connected = true;
+    tunnel->retry_delay_ms = 0;
+    cancel_udp_tunnel_retry(tunnel);
     TX_INFO("UDP tunnel handshake complete for outbound %s", tunnel->outbound->tag.c_str());
 
     if (tunnel->tunnel_session && !tunnel->tunnel_session->is_closed()) {
@@ -1806,37 +1866,28 @@ void ClientApp::on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data) {
         auto flow_it = key_it == udp_session_keys_.end() ? udp_flows_.end()
                                                          : udp_flows_.find(key_it->second);
         if (flow_it == udp_flows_.end() || !flow_it->second.proxied ||
-            flow_it->second.outbound != tunnel->outbound) {
+            flow_it->second.outbound != tunnel->outbound ||
+            flow_it->second.udp_tunnel_key != tunnel->key) {
             payload.clear();
             continue;
         }
 
         const std::string flow_key = key_it->second;
         if (flow_it->second.kind == UdpFlowKind::InternalDns) {
-            switch (cmd) {
-                case TunnelCmd::UdpPacket:
-                    flow_it->second.last_activity_ms = uv_now(loop_);
-                    handle_internal_dns_udp_response(flow_key, tunnel, target,
-                                                     payload.data(), payload.readable());
-                    break;
-                case TunnelCmd::ConnectResult:
-                    if (flow_it->second.dns_stage == InternalDnsStage::TcpConnect &&
-                        payload.readable() == 1 && payload.data()[0] == 1) {
-                        send_internal_dns_tcp_query(flow_key, tunnel);
-                    } else {
-                        retry_internal_dns(flow_key, "TCP connect rejected");
-                    }
-                    break;
-                case TunnelCmd::Data:
-                    handle_internal_dns_tcp_data(flow_key, payload.data(),
-                                                 payload.readable());
-                    break;
-                case TunnelCmd::Disconnect:
-                case TunnelCmd::HalfClose:
-                    retry_internal_dns(flow_key, "remote TCP flow closed");
-                    break;
-                case TunnelCmd::Connect:
-                    break;
+            if (cmd == TunnelCmd::DnsResponse) {
+                flow_it->second.last_activity_ms = uv_now(loop_);
+                std::vector<uint8_t> response(payload.data(),
+                                              payload.data() + payload.readable());
+                if (!response.empty() &&
+                    !DnsResolver::response_matches_query(flow_it->second.dns_query,
+                                                         response)) {
+                    retry_internal_dns(flow_key, "mismatched DNS response");
+                } else {
+                    record_traffic(RouteAction::Proxy, false, response.size());
+                    complete_internal_dns(flow_key, std::move(response), true);
+                }
+            } else if (cmd == TunnelCmd::Disconnect) {
+                retry_internal_dns(flow_key, "remote DNS session closed");
             }
             payload.clear();
             continue;
@@ -1858,37 +1909,47 @@ void ClientApp::on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data) {
     }
 }
 
-void ClientApp::close_udp_tunnel(const UdpTunnelPtr& tunnel) {
+void ClientApp::close_udp_tunnel(const UdpTunnelPtr& tunnel, bool retry_pending) {
     if (!tunnel) return;
+    if (!retry_pending) cancel_udp_tunnel_retry(tunnel);
     auto session = std::move(tunnel->tunnel_session);
     tunnel->connected = false;
     tunnel->connecting = false;
     tunnel->handshake_buf.clear();
     tunnel->recv_buf.clear();
-    for (const auto& packet : tunnel->pending) {
-        auto key = udp_session_keys_.find(packet.session_id);
-        if (key == udp_session_keys_.end()) continue;
-        auto flow = udp_flows_.find(key->second);
-        if (flow != udp_flows_.end()) {
-            flow->second.pending_proxy_bytes -= std::min(
-                flow->second.pending_proxy_bytes, packet.payload.size());
+    if (!retry_pending) {
+        for (const auto& packet : tunnel->pending) {
+            auto key = udp_session_keys_.find(packet.session_id);
+            if (key == udp_session_keys_.end()) continue;
+            auto flow = udp_flows_.find(key->second);
+            if (flow != udp_flows_.end()) {
+                flow->second.pending_proxy_bytes -= std::min(
+                    flow->second.pending_proxy_bytes, packet.payload.size());
+            }
         }
+        udp_tunnel_pending_bytes_ -= std::min(udp_tunnel_pending_bytes_,
+                                               tunnel->pending_bytes);
+        tunnel->pending.clear();
+        tunnel->pending_bytes = 0;
     }
-    tunnel->pending.clear();
-    tunnel->pending_bytes = 0;
     tunnel->codec = TunnelCodec();
     TunnelCodec::cleanse_handshake_state(tunnel->handshake_state);
-    std::vector<std::string> failed_dns_flows;
-    for (const auto& item : udp_flows_) {
-        if (item.second.kind == UdpFlowKind::InternalDns &&
-            item.second.outbound == tunnel->outbound) {
-            failed_dns_flows.push_back(item.first);
+    if (!retry_pending) {
+        std::vector<std::string> failed_dns_flows;
+        for (const auto& item : udp_flows_) {
+            if (item.second.kind == UdpFlowKind::InternalDns &&
+                item.second.udp_tunnel_key == tunnel->key) {
+                failed_dns_flows.push_back(item.first);
+            }
         }
+        for (const auto& flow_key : failed_dns_flows) remove_udp_flow(flow_key, false);
     }
-    for (const auto& flow_key : failed_dns_flows) remove_udp_flow(flow_key, false);
     if (session && !session->is_closed()) {
         session->set_close_callback(nullptr);
         session->close();
+    }
+    if (retry_pending && !tunnel->pending.empty()) {
+        schedule_udp_tunnel_retry(tunnel);
     }
 }
 
@@ -1897,7 +1958,66 @@ void ClientApp::close_all_udp_tunnels() {
     tunnels.reserve(udp_tunnels_.size());
     for (const auto& item : udp_tunnels_) tunnels.push_back(item.second);
     udp_tunnels_.clear();
+    udp_mux_next_slot_.clear();
     for (const auto& tunnel : tunnels) close_udp_tunnel(tunnel);
+    udp_tunnel_pending_bytes_ = 0;
+}
+
+void ClientApp::schedule_udp_tunnel_retry(const UdpTunnelPtr& tunnel) {
+    if (!tunnel || stopping_ || tunnel->connected || tunnel->connecting ||
+        tunnel->retry_timer || tunnel->pending.empty()) {
+        return;
+    }
+    const uint32_t delay = tunnel->retry_delay_ms == 0 ? kUdpTunnelRetryInitialMs :
+        std::min<uint32_t>(tunnel->retry_delay_ms, kUdpTunnelRetryMaxMs);
+    tunnel->retry_delay_ms = std::min<uint32_t>(delay * 2, kUdpTunnelRetryMaxMs);
+    auto* timer = new uv_timer_t;
+    auto* ctx = new UdpTunnelRetryCtx;
+    ctx->app = this;
+    ctx->tunnel = tunnel;
+    timer->data = ctx;
+    if (uv_timer_init(loop_, timer) != 0) {
+        delete ctx;
+        delete timer;
+        return;
+    }
+    if (uv_timer_start(timer, ClientApp::on_udp_tunnel_retry, delay, 0) != 0) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_udp_tunnel_retry_closed);
+        return;
+    }
+    tunnel->retry_timer = timer;
+    TX_WARN("Retrying UDP tunnel %s in %u ms (%zu pending packets)",
+            tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown", delay,
+            tunnel->pending.size());
+}
+
+void ClientApp::cancel_udp_tunnel_retry(const UdpTunnelPtr& tunnel) {
+    if (!tunnel || !tunnel->retry_timer) return;
+    uv_timer_t* timer = tunnel->retry_timer;
+    tunnel->retry_timer = nullptr;
+    uv_timer_stop(timer);
+    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_udp_tunnel_retry_closed);
+    }
+}
+
+void ClientApp::on_udp_tunnel_retry(uv_timer_t* timer) {
+    auto* ctx = static_cast<UdpTunnelRetryCtx*>(timer ? timer->data : nullptr);
+    UdpTunnelPtr tunnel = ctx ? ctx->tunnel.lock() : UdpTunnelPtr();
+    ClientApp* app = ctx ? ctx->app : nullptr;
+    if (tunnel && tunnel->retry_timer == timer) tunnel->retry_timer = nullptr;
+    if (timer && !uv_is_closing(reinterpret_cast<uv_handle_t*>(timer))) {
+        uv_close(reinterpret_cast<uv_handle_t*>(timer), ClientApp::on_udp_tunnel_retry_closed);
+    }
+    if (app && tunnel && !app->stopping_ && !tunnel->pending.empty()) {
+        app->ensure_udp_tunnel(tunnel);
+    }
+}
+
+void ClientApp::on_udp_tunnel_retry_closed(uv_handle_t* handle) {
+    if (!handle) return;
+    delete static_cast<UdpTunnelRetryCtx*>(handle->data);
+    delete reinterpret_cast<uv_timer_t*>(handle);
 }
 
 void ClientApp::on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
@@ -1968,7 +2088,8 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
 
     it->second.proxied = true;
     it->second.outbound = outbound;
-    app->send_udp_packet(app->get_udp_tunnel(outbound), it->second.session_id,
+    UdpTunnelPtr tunnel = app->select_udp_tunnel(it->second);
+    app->send_udp_packet(tunnel, it->second.session_id,
                          target, payload, payload_len);
 }
 
@@ -2264,6 +2385,11 @@ void ClientApp::on_tun_tcp_accept(SessionPtr session) {
         conn->fake_ip_target = true;
         conn->target.type = AddrType::Domain;
         conn->target.host = domain;
+    } else if (fake_ip_dns_.contains_address(conn->target.host)) {
+        TX_WARN("[TUN][TCP] rejecting stale Fake-IP target %s:%u without reverse mapping",
+                conn->target.host.c_str(), conn->target.port);
+        session->close();
+        return;
     }
     const bool sniff_tls_sni = !conn->fake_ip_target && conn->target.port == 443;
     conn->target_dispatched = !sniff_tls_sni;
@@ -2370,11 +2496,12 @@ void ClientApp::on_lwip_tcp_accept(const std::shared_ptr<LwipTcpStream>& stream,
                     }
                     if (!written) stream->reset();
                 }
-                if (!generated && dns_resolver_.can_query()) {
-                    dns_resolver_.resolve(query.data(), query.size(),
+                if (!generated) {
+                    resolve_dns_via_tunnel(std::move(query),
                         [weak_stream](std::vector<uint8_t> upstream) {
                             auto current = weak_stream.lock();
-                            if (!current || current->is_closed() || upstream.empty()) return;
+                            if (!current || current->is_closed()) return;
+                            if (upstream.empty()) return;
                             Buffer framed(upstream.size() + 2);
                             uint8_t length[2];
                             store_be16(length, static_cast<uint16_t>(upstream.size()));
@@ -2399,6 +2526,11 @@ void ClientApp::on_lwip_tcp_accept(const std::shared_ptr<LwipTcpStream>& stream,
         conn->fake_ip_target = true;
         conn->target.type = AddrType::Domain;
         conn->target.host = domain;
+    } else if (fake_ip_dns_.contains_address(conn->target.host)) {
+        TX_WARN("[TUN][TCP] rejecting stale Fake-IP target %s:%u without reverse mapping",
+                conn->target.host.c_str(), conn->target.port);
+        stream->reset();
+        return;
     }
     const bool sniff_tls_sni = !conn->fake_ip_target && conn->target.port == 443;
     conn->route = RouteAction::Proxy;
@@ -2537,6 +2669,9 @@ bool ClientApp::finalize_tun_udp_route(UdpFlow& flow, const TargetAddr& route_ta
     flow.outbound = outbound;
     flow.proxied = outbound->type == OutboundType::Tx;
     flow.route_ready = true;
+    TX_DEBUG("[TUN][UDP][ROUTE] sid=%u route=%s:%u send=%s:%u outbound=%s",
+             flow.session_id, route_target.host.c_str(), route_target.port,
+             send_target.host.c_str(), send_target.port, outbound->tag.c_str());
     return true;
 }
 
@@ -2633,9 +2768,13 @@ void ClientApp::dispatch_tun_udp_packet(const std::string& flow_key, UdpFlow& fl
         return;
     }
 
-    // Keep domain targets intact for TX.  The server resolves them through
-    // its own system resolver; dns.upstreams is only for local DNS handling.
-    send_udp_packet(get_udp_tunnel(outbound), flow.session_id, flow.send_target, data, len);
+    // A QUIC Initial can reveal a domain after the application has already
+    // chosen a numeric address. The recovered SNI is only a routing hint;
+    // keep sending to the original address so Retry tokens, connection
+    // migration, and CDN affinity stay tied to the endpoint the application
+    // selected.
+    UdpTunnelPtr tunnel = select_udp_tunnel(flow);
+    send_udp_packet(tunnel, flow.session_id, flow.send_target, data, len);
 }
 
 void ClientApp::release_tun_quic_sniffer(UdpFlow& flow) {
@@ -2759,36 +2898,102 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         static std::atomic<unsigned> dns_diagnostics{0};
         std::vector<uint8_t> query(data, data + len);
         std::vector<uint8_t> response;
+        const uint64_t now = uv_now(loop_);
+        auto dns_flow = tun_dns_flows_.find(lwip_flow_id);
+        if (dns_flow == tun_dns_flows_.end()) {
+            const size_t configured_limit = static_cast<size_t>(config_.udp_max_flows);
+            const size_t dns_flow_limit = std::min(configured_limit, kMaxTunDnsFlows);
+            if (dns_flow_limit == 0 || tun_dns_flows_.size() >= dns_flow_limit) {
+                if (build_dns_servfail(query, response)) {
+                    lwip_udp_stack_.send_response(lwip_flow_id, destination,
+                                                  response.data(), response.size());
+                }
+                TX_WARN("[DNS][TUN] rejecting new flow=%llu: flow limit reached (%zu)",
+                        static_cast<unsigned long long>(lwip_flow_id), dns_flow_limit);
+                lwip_udp_stack_.close_flow(lwip_flow_id);
+                return;
+            }
+            TunDnsFlow flow;
+            flow.generation = next_tun_dns_generation_++;
+            if (flow.generation == 0) flow.generation = next_tun_dns_generation_++;
+            flow.destination = destination;
+            flow.last_activity_ms = now;
+            dns_flow = tun_dns_flows_.emplace(lwip_flow_id, std::move(flow)).first;
+        } else {
+            dns_flow->second.destination = destination;
+            dns_flow->second.last_activity_ms = now;
+        }
+        const uint64_t dns_generation = dns_flow->second.generation;
         const bool generated = fake_ip_dns_.respond(query.data(), query.size(), response);
         const bool sent = generated && lwip_udp_stack_.send_response(
             lwip_flow_id, destination, response.data(), response.size());
         const unsigned diagnostic = dns_diagnostics.fetch_add(1);
         if (diagnostic < 12) {
-            TX_WARN("[DNS][TUN] query=%zu response=%zu generated=%d sent=%d dst=%s",
-                    query.size(), response.size(), generated ? 1 : 0, sent ? 1 : 0,
+            TX_WARN("[DNS][TUN] flow=%llu generation=%llu query=%zu response=%zu "
+                    "generated=%d sent=%d pending=%zu dst=%s",
+                    static_cast<unsigned long long>(lwip_flow_id),
+                    static_cast<unsigned long long>(dns_generation), query.size(), response.size(),
+                    generated ? 1 : 0, sent ? 1 : 0, dns_flow->second.pending_queries,
                     ipaddr_host_string(destination).c_str());
         }
         if (generated) {
-            // DNS is a one-request/one-response flow here. It is intentionally
-            // not inserted into udp_flows_, so release its lwIP PCB now.
-            lwip_udp_stack_.close_flow(lwip_flow_id);
-        } else if (dns_resolver_.can_query()) {
-            dns_resolver_.resolve(query.data(), query.size(),
-                [this, lwip_flow_id, destination](std::vector<uint8_t> upstream) {
-                    if (!upstream.empty())
-                        lwip_udp_stack_.send_response(lwip_flow_id, destination,
-                                                      upstream.data(), upstream.size());
-                    lwip_udp_stack_.close_flow(lwip_flow_id);
-                });
-        } else {
-            lwip_udp_stack_.close_flow(lwip_flow_id);
+            if (!sent) {
+                TX_WARN("[DNS][TUN] local response write failed for flow=%llu",
+                        static_cast<unsigned long long>(lwip_flow_id));
+                lwip_udp_stack_.close_flow(lwip_flow_id);
+                tun_dns_flows_.erase(lwip_flow_id);
+            }
+            return;
         }
+
+        if (dns_flow->second.pending_queries >= kMaxTunDnsPendingQueries) {
+            if (build_dns_servfail(query, response)) {
+                lwip_udp_stack_.send_response(lwip_flow_id, destination,
+                                              response.data(), response.size());
+            }
+            TX_WARN("[DNS][TUN] rejecting unresolved query flow=%llu pending=%zu",
+                    static_cast<unsigned long long>(lwip_flow_id),
+                    dns_flow->second.pending_queries);
+            return;
+        }
+
+        ++dns_flow->second.pending_queries;
+        const std::vector<uint8_t> query_for_error = query;
+        resolve_dns_via_tunnel(std::move(query),
+            [this, lwip_flow_id, dns_generation, destination,
+             query = query_for_error](std::vector<uint8_t> upstream) mutable {
+                auto current = tun_dns_flows_.find(lwip_flow_id);
+                if (current == tun_dns_flows_.end() ||
+                    current->second.generation != dns_generation) {
+                    return;
+                }
+                if (current->second.pending_queries > 0) {
+                    --current->second.pending_queries;
+                }
+                current->second.last_activity_ms = uv_now(loop_);
+                if (upstream.empty()) {
+                    build_dns_servfail(query, upstream);
+                }
+                const bool written = !upstream.empty() && lwip_udp_stack_.send_response(
+                    lwip_flow_id, destination, upstream.data(), upstream.size());
+                TX_DEBUG("[DNS][TUN] async response flow=%llu generation=%llu bytes=%zu "
+                         "written=%d pending=%zu",
+                         static_cast<unsigned long long>(lwip_flow_id),
+                         static_cast<unsigned long long>(dns_generation), upstream.size(),
+                         written ? 1 : 0, current->second.pending_queries);
+            });
         return;
     }
 
     const TargetAddr numeric_target = target;
     std::string domain;
     const bool fake_ip = fake_ip_dns_.reverse_lookup(target.host, domain);
+    if (!fake_ip && fake_ip_dns_.contains_address(target.host)) {
+        TX_WARN("[TUN][UDP] dropping stale Fake-IP target %s:%u without reverse mapping",
+                target.host.c_str(), target.port);
+        lwip_udp_stack_.close_flow(lwip_flow_id);
+        return;
+    }
     if (fake_ip) {
         target.type = AddrType::Domain;
         target.host = domain;
@@ -2855,7 +3060,9 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
 
 IpAddr ClientApp::tun_udp_response_source(const UdpFlow& flow,
                                           const TargetAddr& source) const {
-    if (flow.fake_ip_target) return flow.tun_dst_ip;
+    if (flow.fake_ip_target) {
+        return flow.tun_dst_ip;
+    }
     return IpAddr::from_string(source.host, source.port);
 }
 
@@ -3089,7 +3296,7 @@ void ClientApp::connect_direct(ProxyConnPtr conn) {
     // can retire every socket bound to the previous physical Network.
     connections_[conn->session_id] = conn;
 
-    dns_resolver_.resolve_host(conn->target.host, AF_UNSPEC,
+    direct_dns_resolver_.resolve_host(conn->target.host, AF_UNSPEC,
         [this, conn](std::vector<std::string> result) {
             if (!conn || !conn->local_session || conn->local_session->is_closed()) return;
             if (result.empty()) {
@@ -3108,7 +3315,16 @@ void ClientApp::connect_direct_candidates(
         connections_.find(conn->session_id) == connections_.end()) {
         return;
     }
+    while (addresses && index < addresses->size() &&
+           !android_address_family_available(numeric_address_family((*addresses)[index]))) {
+        TX_INFO("Skipping direct IPv%d address %s: physical network has no default route",
+                numeric_address_family((*addresses)[index]) == AF_INET6 ? 6 : 4,
+                (*addresses)[index].c_str());
+        ++index;
+    }
     if (!addresses || index >= addresses->size()) {
+        TX_WARN("[Direct] physical network has no usable address family for %s:%u",
+                conn->target.host.c_str(), conn->target.port);
         block_connection(conn);
         return;
     }
@@ -3251,7 +3467,7 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
     }
 
     const std::string server_host = conn->outbound->server_host;
-    dns_resolver_.resolve_host(server_host, AF_UNSPEC,
+    direct_dns_resolver_.resolve_host(server_host, AF_UNSPEC,
         [this, conn](std::vector<std::string> addresses) {
             if (!conn || !conn->local_session || conn->local_session->is_closed()) return;
             if (addresses.empty()) {
@@ -3267,6 +3483,13 @@ bool ClientApp::start_tunnel(ProxyConnPtr conn) {
 
 void ClientApp::connect_tunnel_candidates(
     ProxyConnPtr conn, std::shared_ptr<std::vector<std::string>> addresses, size_t index) {
+    while (addresses && index < addresses->size() &&
+           !android_address_family_available(numeric_address_family((*addresses)[index]))) {
+        TX_INFO("Skipping TX server IPv%d address %s: physical network has no default route",
+                numeric_address_family((*addresses)[index]) == AF_INET6 ? 6 : 4,
+                (*addresses)[index].c_str());
+        ++index;
+    }
     if (!conn || !addresses || index >= addresses->size() || !conn->outbound ||
         !conn->local_session || conn->local_session->is_closed()) {
         if (conn) fail_tunnel_connection(conn);

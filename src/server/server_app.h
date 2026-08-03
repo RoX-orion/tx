@@ -4,11 +4,13 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <deque>
 #include <atomic>
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
+#include "tx/net/dns_resolver.h"
 #include "tx/protocol/tunnel.h"
 #include "config.h"
 
@@ -29,6 +31,7 @@ public:
 
 private:
     friend struct ServerAppUdpTest;
+    friend struct ServerAppDnsTest;
 
     // A tunnel session from one client
     struct TunnelClient {
@@ -46,6 +49,7 @@ private:
         bool             inbound_paused = false;
         uint64_t         next_tcp_generation = 1;
         uint64_t         next_udp_generation = 1;
+        uint32_t         pending_dns_queries = 0;
 
         // Outbound connections by session ID
         struct Outbound {
@@ -73,6 +77,7 @@ private:
         };
         std::unordered_map<SessionId, Outbound> outbounds;
         std::unordered_map<SessionId, UdpOutbound> udp_outbounds;
+        std::unordered_set<SessionId> dns_queries;
     };
     using TunnelClientPtr = std::shared_ptr<TunnelClient>;
 
@@ -105,6 +110,7 @@ private:
     void handle_data(TunnelClientPtr client, SessionId sid, Buffer& payload);
     void handle_udp_packet(TunnelClientPtr client, SessionId sid,
                            const TargetAddr& target, Buffer& payload);
+    void handle_dns_query(TunnelClientPtr client, SessionId sid, Buffer& payload);
     bool ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
                                     TunnelClient::UdpOutbound& outbound, int family);
     uv_udp_t* udp_outbound_socket(TunnelClient::UdpOutbound& outbound, int family) const;
@@ -128,6 +134,8 @@ private:
     void tunnel_send_udp_packet(TunnelClientPtr client, SessionId sid,
                                 const TargetAddr& target,
                                 const uint8_t* data, size_t len);
+    void tunnel_send_dns_response(TunnelClientPtr client, SessionId sid,
+                                  const uint8_t* data, size_t len);
     void tunnel_send_disconnect(TunnelClientPtr client, SessionId sid);
     void tunnel_send_half_close(TunnelClientPtr client, SessionId sid);
     void tunnel_send_connect_result(TunnelClientPtr client, SessionId sid, bool success);
@@ -150,6 +158,7 @@ private:
     bool               loop_closed_;
     ServerConfig       config_;
     TcpServer          server_;
+    DnsResolver        dns_resolver_;
     uv_timer_t         udp_cleanup_timer_;
     bool               udp_cleanup_timer_started_;
     uv_async_t         stop_async_;

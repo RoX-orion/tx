@@ -22,6 +22,13 @@ struct OutboundConfig {
     uint16_t    server_port = 443;
     std::vector<uint8_t> psk;
     AeadCipherKind cipher = AeadCipherKind::Aes256Gcm;
+    // UDP currently travels inside the authenticated TX TCP tunnel. Keeping
+    // this explicit prevents an unsupported native UDP transport from being
+    // selected silently.
+    bool udp_over_tcp = true;
+    // Number of business-UDP TCP tunnels for this outbound. -1 disables the
+    // shared mux and assigns one tunnel to each UDP flow.
+    int32_t udp_mux_connections = 1;
 };
 
 struct ClientConfig {
@@ -57,13 +64,10 @@ struct ClientConfig {
     std::string dns_mode = "fake-ip";
     std::string dns_fake_ipv4_range = "198.18.0.0/16";
     std::string dns_fake_ipv6_range = "fd00:198:18::/96";
-    std::vector<std::string> dns_upstreams;
-    // Android sends local fake-IP DNS queries to these numeric upstreams
-    // through this TX outbound rather than asking the physical resolver.
-    // Ordinary targets sent through a TX outbound retain their domains and
-    // are resolved by the TX server.
-    std::string dns_outbound_tag = "proxy-out-tx";
     uint32_t dns_cache_ttl = 60;
+    // Keep the fake-IP reverse mapping beyond the DNS answer TTL so clients
+    // that briefly retain an old address can never be routed as real IPs.
+    uint32_t dns_mapping_ttl = 1800;
     uint32_t dns_cache_capacity = 4096;
 
     // UDP flows are removed after this much inactivity.

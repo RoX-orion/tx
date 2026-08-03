@@ -42,6 +42,8 @@ struct TunnelTrafficKeys {
 //
 // Wire format (before encryption, inside payload):
 //   [Version:1][Command:1][SessionID:4][AddrType:1][TargetAddr:var][Payload:var]
+// DnsQuery/DnsResponse omit AddrType/TargetAddr and carry only the raw DNS
+// message as Payload. This prevents a client from selecting a DNS server.
 //
 // After encryption, each message is:
 //   [TotalLen:4][Ciphertext:var][Tag:16]
@@ -52,7 +54,7 @@ struct TunnelTrafficKeys {
 
 class TunnelCodec {
 public:
-    static constexpr uint8_t kVersion = 0x02;
+    static constexpr uint8_t kVersion = 0x03;
     static constexpr size_t kLenPrefixSize = 4;    // big-endian length prefix
     static constexpr size_t kMinFrameSize = kLenPrefixSize + AeadCipher::kOverhead;
     static constexpr size_t kMaxPlaintextSize = 66000;
@@ -90,6 +92,15 @@ public:
                            const TargetAddr& target,
                            const uint8_t* payload, size_t payload_len,
                            Buffer& out);
+
+    // Encode a raw DNS query/response. These commands deliberately have no
+    // target address; the server chooses its configured system resolver.
+    bool encode_dns_query(SessionId session_id,
+                          const uint8_t* payload, size_t payload_len,
+                          Buffer& out);
+    bool encode_dns_response(SessionId session_id,
+                             const uint8_t* payload, size_t payload_len,
+                             Buffer& out);
 
     // Encode DISCONNECT message
     bool encode_disconnect(SessionId session_id, Buffer& out);

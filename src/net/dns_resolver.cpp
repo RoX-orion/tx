@@ -22,6 +22,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+#if defined(TX_PLATFORM_WINDOWS)
+#include <iphlpapi.h>
+#endif
 
 namespace tx {
 
@@ -244,6 +247,46 @@ bool upstream_address(const std::string& host, int socktype,
     freeaddrinfo(result);
     return true;
 }
+
+#if defined(TX_PLATFORM_WINDOWS)
+std::vector<std::string> load_windows_dns_upstreams() {
+    ULONG buffer_size = 15000;
+    std::vector<uint8_t> buffer;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        buffer.resize(buffer_size);
+        auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                            GAA_FLAG_SKIP_FRIENDLY_NAME;
+        const ULONG status = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                                                  adapters, &buffer_size);
+        if (status == ERROR_BUFFER_OVERFLOW) continue;
+        if (status != NO_ERROR) return std::vector<std::string>();
+
+        std::vector<std::string> upstreams;
+        for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
+            if (adapter->OperStatus != IfOperStatusUp) continue;
+            for (auto* dns = adapter->FirstDnsServerAddress; dns; dns = dns->Next) {
+                if (!dns->Address.lpSockaddr ||
+                    (dns->Address.lpSockaddr->sa_family != AF_INET &&
+                     dns->Address.lpSockaddr->sa_family != AF_INET6)) {
+                    continue;
+                }
+                char host[NI_MAXHOST] = {};
+                if (getnameinfo(dns->Address.lpSockaddr,
+                                static_cast<DnsSocklen>(dns->Address.iSockaddrLength),
+                                host, sizeof(host), nullptr, 0,
+                                NI_NUMERICHOST) != 0 || host[0] == '\0') {
+                    continue;
+                }
+                if (std::find(upstreams.begin(), upstreams.end(), host) == upstreams.end())
+                    upstreams.emplace_back(host);
+            }
+        }
+        return upstreams;
+    }
+    return std::vector<std::string>();
+}
+#endif
 
 bool operation_cancelled(const std::atomic<bool>* cancelled) {
     return cancelled && cancelled->load(std::memory_order_acquire);
@@ -641,6 +684,9 @@ void DnsResolver::configure(std::vector<std::string> upstreams,
                 upstreams.push_back(address);
         }
     }
+#else
+    if (upstreams.empty() && !query_hook && !async_query_hook)
+        upstreams = load_windows_dns_upstreams();
 #endif
     upstreams_ = std::move(upstreams);
     protector_ = std::move(protector);

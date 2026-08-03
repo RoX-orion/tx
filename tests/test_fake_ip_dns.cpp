@@ -39,6 +39,10 @@ int main() {
     std::string domain;
     assert(dns.reverse_lookup(address, domain));
     assert(domain == "example.com");
+    assert(dns.contains_address(address));
+    assert(dns.contains_address("fd00:198:18::42"));
+    assert(!dns.contains_address("fd01:198:18::42"));
+    assert(!dns.contains_address("203.0.113.42"));
 
     assert(std::string(address) == "198.18.0.4");
 

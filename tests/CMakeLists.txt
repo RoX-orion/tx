@@ -63,3 +63,9 @@ target_sources(test_client_quic_routing PRIVATE
     ../src/client/config.cpp
     ../src/client/platform_tun.cpp)
 target_include_directories(test_client_quic_routing PRIVATE ../src/client)
+tx_add_test(client_udp_mux)
+target_sources(test_client_udp_mux PRIVATE
+    ../src/client/client_app.cpp
+    ../src/client/config.cpp
+    ../src/client/platform_tun.cpp)
+target_include_directories(test_client_udp_mux PRIVATE ../src/client)

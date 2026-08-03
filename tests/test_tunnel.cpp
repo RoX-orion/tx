@@ -225,6 +225,37 @@ static void test_udp_packet_round_trip_domain() {
     printf("OK\n");
 }
 
+static void test_dns_query_round_trip_without_target() {
+    printf("  test_dns_query_round_trip_without_target... ");
+    auto encoder = make_client_codec();
+    auto decoder = make_server_codec();
+    const uint8_t query[] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    tx::Buffer encoded;
+    TX_ASSERT(encoder.encode_dns_query(77, query, sizeof(query), encoded));
+
+    tx::TunnelCmd cmd;
+    tx::SessionId session_id = 0;
+    tx::TargetAddr target;
+    tx::Buffer payload;
+    TX_ASSERT(decoder.decode(encoded, cmd, session_id, target, payload));
+    TX_ASSERT(cmd == tx::TunnelCmd::DnsQuery);
+    TX_ASSERT(session_id == 77);
+    TX_ASSERT(target.port == 0);
+    TX_ASSERT(payload.readable() == sizeof(query));
+    TX_ASSERT(memcmp(payload.data(), query, sizeof(query)) == 0);
+
+    tx::Buffer response_frame;
+    TX_ASSERT(encoder.encode_dns_response(77, query, sizeof(query), response_frame));
+    TX_ASSERT(decoder.decode(response_frame, cmd, session_id, target, payload));
+    TX_ASSERT(cmd == tx::TunnelCmd::DnsResponse);
+    TX_ASSERT(session_id == 77);
+    TX_ASSERT(payload.readable() == sizeof(query));
+    printf("OK\n");
+}
+
 static void test_data_disconnect_and_connect_result() {
     printf("  test_data_disconnect_and_connect_result... ");
     auto encoder = make_client_codec();
@@ -400,6 +431,7 @@ int main() {
     test_connect_round_trip_domain();
     test_connect_round_trip_ip_addresses();
     test_udp_packet_round_trip_domain();
+    test_dns_query_round_trip_without_target();
     test_data_disconnect_and_connect_result();
     test_partial_frame_waits_for_more_data();
     test_data_chunking();

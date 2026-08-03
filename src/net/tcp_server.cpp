@@ -316,6 +316,8 @@ void TcpSession::connect(const std::string& host, uint16_t port, uint64_t timeou
     dns_req->data = resolve_ctx;
     delete req;
 
+    TX_DEBUG("TCP resolving %s:%u before connect", host.c_str(), port);
+
     int r = uv_getaddrinfo(loop_, dns_req, on_resolved,
                             host.c_str(), nullptr, nullptr);
     if (r != 0) {
@@ -627,6 +629,8 @@ void TcpSession::on_connect_timeout(uv_timer_t* timer) {
 
 void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
     auto* ctx = static_cast<DnsResolveCtx*>(req->data);
+
+    TX_DEBUG("TCP resolution completed status=%d for port %u", status, ctx ? ctx->port : 0);
 
     if (ctx->session->is_closed()) {
         ctx->cb(false);

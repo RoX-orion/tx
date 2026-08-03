@@ -30,6 +30,7 @@
 ├── CMakeLists.txt          # 顶层构建脚本
 ├── cmake/                  # CMake 辅助模块和依赖查找逻辑
 ├── config/                 # 客户端 / 服务端配置示例
+├── docs/                   # 架构与维护文档
 ├── include/tx/             # 公共头文件
 ├── src/
 │   ├── client/             # tx_client 入口、配置和应用逻辑
@@ -42,6 +43,11 @@
 │   └── router/             # 路由决策
 └── tests/                  # 单元测试
 ```
+
+## 架构图
+
+- [C++ 核心架构](docs/architecture-cpp.md)
+- Android 工程中的 [`docs/architecture-android.md`](../../android/txz/docs/architecture-android.md)
 
 ## 依赖
 
@@ -216,7 +222,7 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-当前共有 21 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
+当前共有 23 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
 tunnel、TUN packet、HEV lwIP TCP / UDP、fake-IP DNS、DNS resolver、TX 隧道 DNS、
 客户端/服务端配置、TLS SNI、QUIC SNI、QUIC 路由、socket protector、TCP 回调和 UDP
 flow timeout。
@@ -325,8 +331,8 @@ cp config/client.json.example client.json
         "mode": "fake-ip",
         "fake_ipv4_range": "198.18.0.0/16",
         "fake_ipv6_range": "fd00:198:18::/96",
-        "upstreams": [],
         "cache_ttl": 60,
+        "mapping_ttl": 1800,
         "cache_capacity": 4096
     },
     "outbounds": [
@@ -341,6 +347,8 @@ cp config/client.json.example client.json
         {
             "tag": "proxy-out-tx",
             "type": "tx",
+            "udp-over-tcp": true,
+            "udp-mux": {"connections": 1},
             "server": {
                 "host": "your-server.example.com",
                 "port": 443,
@@ -375,9 +383,11 @@ cp config/client.json.example client.json
   SNI，默认 `true`。嗅探无法得到 SNI 时仍按原始 IP 路由。
 - `limits.max_proxy_connections`：本地 HTTP / SOCKS / TUN TCP 连接总上限，范围 1～1000000。
 - `tun`：原生 TUN 配置；启用时 `tcp_stack` 可为 `lwip` 或 Linux 专用的 `system`，`udp_stack` 当前必须为 `lwip`。
-- `dns`：当前仅支持 `mode: "fake-ip"`；`upstreams` 为数值 DNS 上游地址列表，`cache_ttl` 和 `cache_capacity` 分别控制映射存活时间和 LRU 容量。
+- `dns`：当前仅支持 `mode: "fake-ip"`；客户端不配置 DNS 上游地址。A/AAAA 由 fake-IP 本地回答，未命中的查询按路由规则选择 direct（物理网络 DNS）、tx（通过隧道交由服务端系统 DNS）或 block；`cache_ttl` 控制回答缓存，`mapping_ttl` 控制反向映射保留时间，`cache_capacity` 控制 LRU 容量。
 - `outbounds`：具名出站列表。每个 `tag` 必须唯一，`type` 可选 `direct`、`tx` 或 `block`。
 - `outbounds[*].server`：仅 `tx` 出站使用，指定远端地址、端口、PSK 和 AEAD 算法。
+- `outbounds[*].udp-over-tcp`：仅 `tx` 出站可用，当前必须为 `true`。`false`（原生 UDP / QUIC DATAGRAM）尚未实现，会在加载配置时明确拒绝。
+- `outbounds[*].udp-mux.connections`：仅 `tx` 出站可用，范围为 `1`～`64` 或 `-1`，默认 `1`。`N` 表示业务 UDP flow 轮询分配到 `N` 条 TCP 隧道并固定绑定；`-1` 表示关闭共享 MUX，每个业务 UDP flow 独占一条 TCP 隧道并在 flow 回收时关闭。内部 DNS 始终使用独立隧道，不受此项影响。
 - `routing.geoip_path`：GeoIP 数据文件路径。
 - `routing.geosite_path`：GeoSite 数据文件路径。
 - `routing.rules`：从上到下匹配；规则的 `outboundTag` 仅引用某个出站，不直接表示处理方式。
@@ -405,20 +415,19 @@ netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由�
 - 当前 Linux redirect 不是网关/旁路由的 `PREROUTING TPROXY` 实现；TUN 和 nftables 配置通常需要 root 或 `CAP_NET_ADMIN`。
 - Windows 使用 Wintun 后端；其编译与运行验证仍应在真实 Windows 环境进行。
 - Android 由 `VpnService` 提供真实 TUN fd，txlib 接管 fd 所有权并直接运行 lwIP。未启用 Linux `auto_redirect` 时，HTTP / SOCKS5 监听器会保留，因而仍可选用 tun2socks 兼容路径。所有 native 出站 socket 都必须通过 `VpnService.protect(fd)`。
-- 内置 fake-IP DNS 支持 UDP/TCP A、AAAA、HTTPS/SVCB NODATA、稳定正反映射和 LRU 容量控制；其他 DNS 类型转发至上游。默认池为 `198.18.0.0/16` 与 `fd00:198:18::/96`。
-- 对 fake-IP 映射缺失的 TCP/443，客户端会尝试从 TLS ClientHello 提取 SNI 以恢复域名；对真实 IP 的 UDP/443，`udp.quic_sniff`（默认开启）会尝试从 QUIC Initial 提取 SNI 用于路由，但仍向原始 IP 发送 UDP。SNI 不可用、嗅探关闭或达到资源上限时会正常按 IP 路由，不再主动丢弃该流。ICMP 当前丢弃；DoH/DoT 的非 QUIC 流量仍通常只能按目标 IP 路由。
+- 内置 fake-IP DNS 支持 UDP/TCP A、AAAA、HTTPS/SVCB NODATA、稳定正反映射和 LRU 容量控制；`cache_ttl` 控制 DNS Answer，`mapping_ttl` 单独控制反向映射保留期。默认池为 `198.18.0.0/16` 与 `fd00:198:18::/96`。
+- Fake-IP 地址池内但缺少反向映射的 TCP/UDP 流会被拒绝，绝不会按私网地址进入 `direct`。对真实 IP 的 UDP/443，`udp.quic_sniff`（默认开启）会尝试从 QUIC Initial 提取 SNI 用于路由，但仍向原始 IP 发送 UDP。SNI 不可用、嗅探关闭或达到资源上限时会正常按 IP 路由，不再主动丢弃该流。ICMP 当前丢弃；DoH/DoT 的非 QUIC 流量仍通常只能按目标 IP 路由。
 
 Android 共享库提供以下启动接口：
 
 - `tx_client_start_with_tun_fd()`：使用 `VpnService` 提供的 TUN fd 启动客户端。
-- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。Android 配置必须提供至少一个数值 `dns.upstreams`；查询由 TX 隧道送到远端服务器后再访问该 DNS，不能回退到物理网络 DNS。调用方应在启动前通过选定的物理网络解析服务器主机名，并把数值地址写入配置，避免 DNS 引导泄漏或循环。
-- `tx_client_start_android_ex()`：接受带版本的 Android 网络 hooks 结构；Android 上仅使用 `protect_socket`，`resolve_host` 与 `query_dns` 字段保留 ABI 兼容但不会被调用。
+- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。客户端不再配置 DNS 地址；TX 入口域名和 direct DNS 使用选定的物理 Network，TX DNS 经加密隧道交由服务端系统 DNS 解析。
+- `tx_client_start_android_ex()`：接受带版本的 Android 网络 hooks 结构；`resolve_host` 与 `query_dns` 用于物理 Network 上的 TX 引导解析以及已选中 `direct-out` 的 DNS/目标，以恢复本地 CDN 亲和性。Fake-IP A/AAAA 仍由客户端本地回答，TX 路由的其他 DNS 类型通过无目标地址的 `DnsQuery` 命令发送到服务端。
 
-Android 隧道 DNS 按 `dns.upstreams` 顺序尝试，每个 UDP/TCP 阶段的超时为 2 秒；
-收到 UDP TC 响应时会在同一 TX 加密连接上改用标准 DNS-over-TCP。
+服务端不接受客户端指定的 DNS 上游地址，启动时从系统 resolver（通常为 `/etc/resolv.conf`）读取配置。
 
-TX 客户端与服务端隧道帧协议已升级为 v2，并通过 `HalfClose` 命令传播双向 TCP
-FIN。v1 帧会明确作为版本不匹配拒绝，升级时必须同步部署客户端和服务端。
+TX 客户端与服务端隧道帧协议已升级为 v3，并通过 `DnsQuery`/`DnsResponse` 传递远端 DNS、通过 `HalfClose` 命令传播双向 TCP
+FIN。v1/v2 帧会明确作为版本不匹配拒绝，升级时必须同步部署客户端和服务端。
 
 ## 运行
 

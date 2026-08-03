@@ -1,4 +1,6 @@
 #include "client_app.h"
+#include "tx/common/endian.h"
+#include "tx/net/tun_packet.h"
 
 #include <cassert>
 #include <cstdio>
@@ -115,7 +117,7 @@ struct ClientAppQuicTest {
         assert(app.quic_sniff_active_flows_ == 0);
     }
 
-    static void fake_ip_response_rewrites_tun_source() {
+    static void domain_route_keeps_numeric_send_target() {
         ClientApp app;
         ClientApp::UdpFlow flow;
         flow.kind = ClientApp::UdpFlowKind::Tun;
@@ -133,6 +135,141 @@ struct ClientAppQuicTest {
         flow.fake_ip_target = false;
         assert(app.tun_udp_response_source(flow, actual) ==
                IpAddr::from_string("142.250.1.2", 443));
+
+        flow.route_target.type = AddrType::Domain;
+        flow.route_target.host = "youtubei.googleapis.com";
+        flow.route_target.port = 443;
+        flow.send_target.type = AddrType::IPv6;
+        flow.send_target.host = "2607:f8b0:4004:c1d::5e";
+        flow.send_target.port = 443;
+        assert(app.tun_udp_response_source(flow, actual) ==
+               IpAddr::from_string(actual.host, actual.port));
+    }
+
+    static void stale_fake_ipv6_is_not_routed_as_private() {
+        ClientApp app;
+        app.config_.udp_quic_sniff = false;
+
+        OutboundConfig direct;
+        direct.tag = "direct-out";
+        direct.type = OutboundType::Direct;
+        app.config_.outbound_index[direct.tag] = 0;
+        app.config_.outbounds.push_back(std::move(direct));
+        RouteRule private_rule;
+        private_rule.ips.push_back("geoip:private");
+        private_rule.outbound_tag = "direct-out";
+        app.config_.router.rules.push_back(std::move(private_rule));
+        RouteRule fallback;
+        fallback.outbound_tag = "direct-out";
+        app.config_.router.rules.push_back(std::move(fallback));
+        assert(app.router_.load(app.config_.router));
+
+        std::string error;
+        assert(app.fake_ip_dns_.configure("198.18.0.0/16", "fd00:198:18::/96",
+                                          60, error));
+        const uint8_t packet[] = {0x01};
+        app.handle_lwip_udp_datagram(9, IpAddr::from_string("fd00:198:18::1", 10006),
+                                     IpAddr::from_string("fd00:198:18::999", 443),
+                                     packet, sizeof(packet));
+        assert(app.udp_flows_.empty());
+    }
+
+    static std::vector<uint8_t> dns_query(uint16_t id, uint16_t type) {
+        std::vector<uint8_t> query = {
+            static_cast<uint8_t>(id >> 8), static_cast<uint8_t>(id),
+            0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+            0x03, 'c', 'o', 'm', 0x00,
+            static_cast<uint8_t>(type >> 8), static_cast<uint8_t>(type), 0x00, 0x01,
+        };
+        return query;
+    }
+
+    static void tun_dns_flow_handles_multiple_queries() {
+        ClientApp app;
+        std::string error;
+        assert(app.fake_ip_dns_.configure("198.18.0.0/16", "fd00:198:18::/96",
+                                          60, error));
+        std::vector<std::vector<uint8_t>> outputs;
+        assert(app.lwip_udp_stack_.initialize(
+            "198.18.0.1/30", 1500,
+            [&app](uint64_t id, const IpAddr& source, const IpAddr& destination,
+                   const uint8_t* payload, size_t payload_len) {
+                app.handle_lwip_udp_datagram(id, source, destination, payload, payload_len);
+            },
+            [&outputs](const uint8_t* packet, size_t packet_len) {
+                outputs.emplace_back(packet, packet + packet_len);
+                return true;
+            }, error));
+
+        const IpAddr source = IpAddr::from_string("198.18.0.3", 53000);
+        const IpAddr dns = IpAddr::from_string("198.18.0.2", 53);
+        Buffer first;
+        const auto a = dns_query(0x1234, 1);
+        assert(build_udp_tun_packet(source, source.port, dns, dns.port,
+                                    a.data(), a.size(), first));
+        assert(app.lwip_udp_stack_.input(first.data(), first.readable()));
+        Buffer second;
+        const auto aaaa = dns_query(0x4321, 28);
+        assert(build_udp_tun_packet(source, source.port, dns, dns.port,
+                                    aaaa.data(), aaaa.size(), second));
+        assert(app.lwip_udp_stack_.input(second.data(), second.readable()));
+        assert(outputs.size() == 2);
+        for (const auto& packet : outputs) {
+            TunPacketView view;
+            assert(parse_tun_packet(packet.data(), packet.size(), view));
+            assert(view.protocol == TunL4Protocol::Udp);
+            assert(view.src_ip == dns);
+            assert(view.dst_ip == source);
+            assert(view.payload_len >= 12);
+            assert(load_be16(view.payload + 6) == 1);
+        }
+        assert(app.tun_dns_flows_.size() == 1);
+        app.lwip_udp_stack_.shutdown();
+    }
+
+    static void tun_dns_flow_limit_reclaims_excess_pcbs() {
+        ClientApp app;
+        configure(app);
+        std::vector<std::vector<uint8_t>> outputs;
+        std::string error;
+        assert(app.lwip_udp_stack_.initialize(
+            "198.18.0.1/30", 1500,
+            [&app](uint64_t id, const IpAddr& source, const IpAddr& destination,
+                   const uint8_t* payload, size_t payload_len) {
+                app.handle_lwip_udp_datagram(id, source, destination,
+                                             payload, payload_len);
+            },
+            [&outputs](const uint8_t* packet, size_t packet_len) {
+                outputs.emplace_back(packet, packet + packet_len);
+                return true;
+            }, error));
+
+        const IpAddr dns = IpAddr::from_string("198.18.0.2", 53);
+        const auto query = dns_query(0x1000, 1);
+        for (uint16_t port = 53000; port < 53300; ++port) {
+            const IpAddr source = IpAddr::from_string("198.18.0.3", port);
+            Buffer packet;
+            assert(build_udp_tun_packet(source, source.port, dns, dns.port,
+                                        query.data(), query.size(), packet));
+            assert(app.lwip_udp_stack_.input(packet.data(), packet.readable()));
+        }
+        // The fixed cap is below lwIP's MEMP_NUM_UDP_PCB=1024 pool.  The
+        // excess queries receive a bounded failure and their PCBs are closed
+        // immediately instead of lingering for the idle timer.
+        assert(app.tun_dns_flows_.size() <= 256);
+        assert(app.tun_dns_flows_.size() == 256);
+
+        app.close_all_tun_dns_flows();
+        assert(app.tun_dns_flows_.empty());
+        const IpAddr source = IpAddr::from_string("198.18.0.3", 60000);
+        Buffer packet;
+        assert(build_udp_tun_packet(source, source.port, dns, dns.port,
+                                    query.data(), query.size(), packet));
+        assert(app.lwip_udp_stack_.input(packet.data(), packet.readable()));
+        assert(app.tun_dns_flows_.size() == 1);
+        app.lwip_udp_stack_.shutdown();
     }
 
     static void domain_udp_resolves_once_and_pins_peer() {
@@ -158,6 +295,8 @@ struct ClientAppQuicTest {
         assert(app.router_.load(app.config_.router));
         app.dns_resolver_.configure({}, DnsResolver::ProtectCallback(), 0,
                                     app.host_resolver_);
+        app.direct_dns_resolver_.configure({}, DnsResolver::ProtectCallback(), 0,
+                                           app.host_resolver_);
 
         std::string error;
         assert(app.fake_ip_dns_.configure("198.18.0.0/16", "fd00:198:18::/96",
@@ -273,7 +412,10 @@ int main() {
     tx::ClientAppQuicTest::non_quic_falls_back_to_ip();
     tx::ClientAppQuicTest::disabled_sniff_routes_immediately_by_ip();
     tx::ClientAppQuicTest::fake_ip_keeps_domain_and_skips_sniff();
-    tx::ClientAppQuicTest::fake_ip_response_rewrites_tun_source();
+    tx::ClientAppQuicTest::domain_route_keeps_numeric_send_target();
+    tx::ClientAppQuicTest::stale_fake_ipv6_is_not_routed_as_private();
+    tx::ClientAppQuicTest::tun_dns_flow_handles_multiple_queries();
+    tx::ClientAppQuicTest::tun_dns_flow_limit_reclaims_excess_pcbs();
     tx::ClientAppQuicTest::domain_udp_resolves_once_and_pins_peer();
     tx::ClientAppQuicTest::domain_route_and_ip_send_target_stay_separate();
     tx::ClientAppQuicTest::migrated_quic_short_header_inherits_cached_route();

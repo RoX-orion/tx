@@ -27,9 +27,9 @@ constexpr size_t TunnelCodec::kHandshakeSize;
 
 namespace {
 
-// v2 uses a distinct handshake marker so a v1 peer is rejected before keys
+// v3 uses a distinct handshake marker so an older peer is rejected before keys
 // are established rather than after the first encrypted frame.
-static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'V', '2'};
+static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'V', '3'};
 static constexpr uint8_t kClientHello = 0x01;
 static constexpr uint8_t kServerHello = 0x02;
 static constexpr size_t kNoncePrefixLen = 4;
@@ -72,7 +72,7 @@ void append_server_mac_input(const TunnelPeerHello& client_hello,
                              std::vector<uint8_t>& out) {
     out.clear();
     static const uint8_t label[] = {
-        't', 'x', '-', 'h', 's', '-', 's', 'e', 'r', 'v', 'e', 'r', '-', 'v', '2'
+        't', 'x', '-', 'h', 's', '-', 's', 'e', 'r', 'v', 'e', 'r', '-', 'v', '3'
     };
     append_bytes(out, label, sizeof(label));
     append_hello_fields(kClientHello, client_hello.cipher,
@@ -165,7 +165,7 @@ bool derive_traffic_keys(const std::vector<uint8_t>& psk,
                          AeadCipherKind cipher,
                          TunnelTrafficKeys& keys) {
     std::vector<uint8_t> info;
-    static const uint8_t label[] = {'t', 'x', '-', 't', 'r', 'a', 'f', 'f', 'i', 'c', '-', 'v', '2'};
+    static const uint8_t label[] = {'t', 'x', '-', 't', 'r', 'a', 'f', 'f', 'i', 'c', '-', 'v', '3'};
     append_bytes(info, label, sizeof(label));
     info.push_back(static_cast<uint8_t>(cipher));
     info.insert(info.end(), client_nonce.begin(), client_nonce.end());
@@ -386,6 +386,28 @@ bool TunnelCodec::encode_udp_packet(SessionId session_id,
     return encode(TunnelCmd::UdpPacket, session_id, target, payload, payload_len, out);
 }
 
+bool TunnelCodec::encode_dns_query(SessionId session_id,
+                                   const uint8_t* payload, size_t payload_len,
+                                   Buffer& out) {
+    if (!payload || payload_len < 12 || payload_len > kMaxDataPayloadSize) {
+        TX_ERROR("Tunnel DNS query has invalid size: %zu bytes", payload_len);
+        return false;
+    }
+    TargetAddr dummy;
+    return encode(TunnelCmd::DnsQuery, session_id, dummy, payload, payload_len, out);
+}
+
+bool TunnelCodec::encode_dns_response(SessionId session_id,
+                                      const uint8_t* payload, size_t payload_len,
+                                      Buffer& out) {
+    if (payload_len > kMaxDataPayloadSize || (payload_len != 0 && !payload)) {
+        TX_ERROR("Tunnel DNS response has invalid size: %zu bytes", payload_len);
+        return false;
+    }
+    TargetAddr dummy;
+    return encode(TunnelCmd::DnsResponse, session_id, dummy, payload, payload_len, out);
+}
+
 bool TunnelCodec::encode_disconnect(SessionId session_id, Buffer& out) {
     TargetAddr dummy;
     return encode(TunnelCmd::Disconnect, session_id, dummy, nullptr, 0, out);
@@ -480,7 +502,9 @@ bool TunnelCodec::decode(Buffer& in,
         cmd != TunnelCmd::Disconnect &&
         cmd != TunnelCmd::HalfClose &&
         cmd != TunnelCmd::ConnectResult &&
-        cmd != TunnelCmd::UdpPacket) {
+        cmd != TunnelCmd::UdpPacket &&
+        cmd != TunnelCmd::DnsQuery &&
+        cmd != TunnelCmd::DnsResponse) {
         TX_ERROR("Unknown tunnel command: %u", static_cast<unsigned>(cmd));
         protocol_error_ = true;
         in.clear();

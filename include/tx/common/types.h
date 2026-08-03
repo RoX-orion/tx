@@ -66,6 +66,10 @@ enum class TunnelCmd : uint8_t {
     ConnectResult = 0x04,
     UdpPacket     = 0x05,
     HalfClose     = 0x06,
+    // Carries a raw DNS question to the server without a client-selected
+    // resolver address. The server answers it with its own system resolver.
+    DnsQuery      = 0x07,
+    DnsResponse    = 0x08,
 };
 
 // Route decision

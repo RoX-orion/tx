@@ -41,8 +41,7 @@ void apply_log_level(const std::string& value) {
 }
 
 tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
-                         const tx_android_network_hooks_t* hooks,
-                         bool require_explicit_dns) {
+                         const tx_android_network_hooks_t* hooks) {
     if (!config || !config->config_path) return nullptr;
 
     tx::SocketProtectCallback socket_protector;
@@ -53,7 +52,9 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
             return hooks.protect_socket(fd, hooks.user_data) != 0;
         };
     }
-#if !defined(TX_PLATFORM_ANDROID)
+    // Android supplies Network-bound resolver hooks. ClientApp uses them for
+    // TX bootstrap and DNS/targets that the router selected as direct; TX DNS
+    // itself remains inside the encrypted tunnel.
     if (hooks && hooks->resolve_host) {
         host_resolver = [hooks = *hooks](const std::string& host, int family) {
             tx_android_address_t output[TX_ANDROID_MAX_RESOLVED_ADDRESSES]{};
@@ -78,24 +79,15 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
             return response;
         };
     }
-#endif
 
     auto* handle = new TxClientHandle;
     handle->app = std::make_unique<tx::ClientApp>(std::move(socket_protector),
                                                   std::move(host_resolver),
-                                                  std::move(dns_query));
+                                                  std::move(dns_query),
+                                                  hooks ? hooks->address_family_mask : 0);
 
     tx::ClientConfig cfg;
     if (!tx::load_client_config(config->config_path, cfg)) {
-#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
-        if (tun_fd >= 0) ::close(tun_fd);
-#endif
-        delete handle;
-        return nullptr;
-    }
-
-    if (require_explicit_dns && cfg.dns_upstreams.empty()) {
-        TX_ERROR("tx_client_start_android requires at least one dns.upstreams entry");
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
         if (tun_fd >= 0) ::close(tun_fd);
 #endif
@@ -131,11 +123,11 @@ tx_handle_t start_client(const tx_client_config_t* config, int tun_fd,
 extern "C" {
 
 tx_handle_t tx_client_start(const tx_client_config_t* config) {
-    return start_client(config, -1, nullptr, false);
+    return start_client(config, -1, nullptr);
 }
 
 tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) {
-    return start_client(config, tun_fd, nullptr, false);
+    return start_client(config, tun_fd, nullptr);
 }
 
 tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
@@ -147,25 +139,36 @@ tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd
     hooks.version = TX_ANDROID_NETWORK_HOOKS_VERSION;
     hooks.protect_socket = protect_fn;
     hooks.user_data = protect_user_data;
-    return start_client(config, tun_fd, &hooks, true);
+    return start_client(config, tun_fd, &hooks);
 }
 
 tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
                                        const tx_android_network_hooks_t* hooks) {
     if (tun_fd < 0 || !hooks || hooks->struct_size < sizeof(tx_android_network_hooks_t) ||
-        hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket) {
+        hooks->version != TX_ANDROID_NETWORK_HOOKS_VERSION || !hooks->protect_socket ||
+        !hooks->resolve_host || !hooks->query_dns) {
+        TX_ERROR("Android extended client requires protect_socket, resolve_host and query_dns");
         return nullptr;
     }
-    // On Android, host and DNS hooks used to call the physical system
-    // resolver.  The native client now carries configured DNS queries through
-    // the TX tunnel, so accept old hook structs but never invoke those fields.
-    return start_client(config, tun_fd, hooks, true);
+    // Host/DNS hooks are used only for a route that has already selected a
+    // direct outbound. Fake-IP DNS and TX-bound traffic remain inside the
+    // encrypted tunnel, avoiding bootstrap leaks and VPN routing loops.
+    return start_client(config, tun_fd, hooks);
 }
 
 void tx_client_notify_network_changed(tx_handle_t handle) {
     if (!handle) return;
     auto* h = static_cast<TxClientHandle*>(handle);
     if (h->app) h->app->notify_network_changed();
+}
+
+void tx_client_update_android_network_state(tx_handle_t handle,
+                                            unsigned int address_family_mask) {
+    if (!handle) return;
+    auto* h = static_cast<TxClientHandle*>(handle);
+    if (!h->app) return;
+    h->app->update_android_address_family_mask(address_family_mask);
+    h->app->notify_network_changed();
 }
 
 void tx_client_stop(tx_handle_t handle) {

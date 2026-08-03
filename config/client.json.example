@@ -33,6 +33,7 @@
         "fake_ipv4_range": "198.18.0.0/16",
         "fake_ipv6_range": "fd00:198:18::/96",
         "cache_ttl": 60,
+        "mapping_ttl": 1800,
         "cache_capacity": 4096
     },
     "outbounds": [
@@ -47,6 +48,8 @@
         {
             "tag": "proxy-out-tx",
             "type": "tx",
+            "udp-over-tcp": true,
+            "udp-mux": {"connections": 1},
             "server": {
                 "host": "your-host",
                 "port": 443,

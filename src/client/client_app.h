@@ -24,6 +24,14 @@
 
 namespace tx {
 
+// Android reports whether the selected physical Network has a usable default
+// route for each address family. A zero mask means "unknown" for backwards
+// compatibility, while the known bit distinguishes that from a network which
+// currently has no usable IP egress route.
+constexpr uint32_t kAndroidNetworkAddressFamilyIPv4 = 1u << 0;
+constexpr uint32_t kAndroidNetworkAddressFamilyIPv6 = 1u << 1;
+constexpr uint32_t kAndroidNetworkAddressFamilyKnown = 1u << 31;
+
 struct ClientTrafficStats {
     uint64_t direct_upload_bytes;
     uint64_t direct_download_bytes;
@@ -36,7 +44,8 @@ class ClientApp {
 public:
     explicit ClientApp(SocketProtectCallback socket_protector = SocketProtectCallback(),
                        DnsResolver::HostResolveHook host_resolver = DnsResolver::HostResolveHook(),
-                       DnsResolver::QueryHook dns_query = DnsResolver::QueryHook());
+                       DnsResolver::QueryHook dns_query = DnsResolver::QueryHook(),
+                       uint32_t android_address_family_mask = 0);
     ~ClientApp();
 
     // Initialize with configuration
@@ -52,15 +61,19 @@ public:
     // Stop the event loop
     void stop();
     void notify_network_changed();
+    void update_android_address_family_mask(uint32_t mask);
 
     ClientTrafficStats traffic_stats() const;
 
 private:
     friend struct ClientAppDnsTest;
+    friend struct ClientAppUdpMuxTest;
     friend struct ClientAppQuicTest;
+    friend struct ClientAppNetworkTest;
 
     struct TunnelTimerCtx;
     struct DirectUdpRelay;
+    struct UdpTunnelRetryCtx;
 
     // ---- Proxy connection handling ----
 
@@ -102,6 +115,7 @@ private:
         SessionId session_id;
         TargetAddr target;
         std::vector<uint8_t> payload;
+        bool dns_query = false;
     };
 
     enum class UdpFlowKind {
@@ -110,10 +124,12 @@ private:
         InternalDns,
     };
 
-    enum class InternalDnsStage {
-        Udp,
-        TcpConnect,
-        TcpResponse,
+    // DNS must not wait behind QUIC or other bulk UDP frames on the shared
+    // TCP transport. Each TX outbound therefore owns a data tunnel and a
+    // separate DNS tunnel.
+    enum class UdpTunnelKind {
+        Data,
+        Dns,
     };
 
     struct UdpFlow {
@@ -139,10 +155,12 @@ private:
         size_t direct_resolution_bytes = 0;
         uint64_t last_activity_ms = 0;
         const OutboundConfig* outbound = nullptr;
+        std::string udp_tunnel_key;
         size_t pending_proxy_bytes = 0;
         bool proxied = false;
         // TUN QUIC routing can use a recovered domain while retaining the
-        // original numeric destination for the actual UDP send.
+        // original numeric destination. SNI is a routing hint only; packets
+        // continue to use send_target on the wire.
         TargetAddr route_target;
         TargetAddr send_target;
         bool route_ready = false;
@@ -153,26 +171,37 @@ private:
         uint64_t quic_sniff_deadline_ms = 0;
         DnsResolver::ResolveCallback dns_callback;
         std::vector<uint8_t> dns_query;
-        size_t dns_upstream_index = 0;
-        TargetAddr dns_upstream;
-        InternalDnsStage dns_stage = InternalDnsStage::Udp;
         uint64_t dns_deadline_ms = 0;
-        Buffer dns_tcp_response;
     };
 
     struct UdpTunnel {
         SessionPtr tunnel_session;
         const OutboundConfig* outbound = nullptr;
+        UdpTunnelKind kind = UdpTunnelKind::Data;
+        std::string key;
+        bool dedicated = false;
+        SessionId owner_session_id = 0;
         TunnelCodec codec;
         TunnelHandshakeState handshake_state;
         Buffer handshake_buf;
         Buffer recv_buf;
         bool connected = false;
         bool connecting = false;
+        uv_timer_t* retry_timer = nullptr;
+        uint32_t retry_delay_ms = 0;
         std::deque<PendingUdpPacket> pending;
         size_t pending_bytes = 0;
     };
     using UdpTunnelPtr = std::shared_ptr<UdpTunnel>;
+
+    // DNS UDP sockets are long lived on Android. Multiple queries can share
+    // one lwIP PCB, so their lifetimes must not be tied to the first reply.
+    struct TunDnsFlow {
+        uint64_t generation = 0;
+        IpAddr destination;
+        uint64_t last_activity_ms = 0;
+        size_t pending_queries = 0;
+    };
 
     struct QuicRouteCacheEntry {
         TargetAddr route_target;
@@ -197,6 +226,7 @@ private:
     void connect_direct_candidates(ProxyConnPtr conn,
                                    std::shared_ptr<std::vector<std::string>> addresses,
                                    size_t index);
+    bool android_address_family_available(int family) const;
     void connect_via_tunnel(ProxyConnPtr conn);
     const OutboundConfig* find_outbound(const std::string& tag) const;
     bool apply_route_decision(ProxyConnPtr conn, const RouteDecision& decision);
@@ -235,34 +265,29 @@ private:
     bool start_proxy_listeners();
     bool start_udp_listener();
     void stop_udp_listener();
-    UdpTunnelPtr get_udp_tunnel(const OutboundConfig* outbound);
+    UdpTunnelPtr get_udp_tunnel(const OutboundConfig* outbound,
+                                UdpTunnelKind kind = UdpTunnelKind::Data,
+                                const std::string& key = std::string());
+    UdpTunnelPtr select_udp_tunnel(UdpFlow& flow);
     bool ensure_udp_tunnel(const UdpTunnelPtr& tunnel);
     void connect_udp_tunnel_candidates(
         const UdpTunnelPtr& tunnel,
         std::shared_ptr<std::vector<std::string>> addresses, size_t index);
     void send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid, const TargetAddr& target,
                          const uint8_t* data, size_t len);
+    void send_dns_query(const UdpTunnelPtr& tunnel, SessionId sid,
+                        const uint8_t* data, size_t len);
     void resolve_dns_via_tunnel(std::vector<uint8_t> query,
                                 DnsResolver::ResolveCallback callback);
-    bool parse_dns_upstream(const std::string& upstream, TargetAddr& target) const;
+    void start_dns_tunnel_query(std::vector<uint8_t> query,
+                                DnsResolver::ResolveCallback callback,
+                                const OutboundConfig* outbound);
     void start_internal_dns_attempt(const std::string& flow_key);
     void retry_internal_dns(const std::string& flow_key, const char* reason);
-    void start_internal_dns_tcp(const std::string& flow_key,
-                                const UdpTunnelPtr& tunnel);
-    void send_internal_dns_tcp_query(const std::string& flow_key,
-                                     const UdpTunnelPtr& tunnel);
-    void handle_internal_dns_udp_response(const std::string& flow_key,
-                                          const UdpTunnelPtr& tunnel,
-                                          const TargetAddr& source,
-                                          const uint8_t* data, size_t len);
-    void handle_internal_dns_tcp_data(const std::string& flow_key,
-                                      const uint8_t* data, size_t len);
     void complete_internal_dns(const std::string& flow_key,
                                std::vector<uint8_t> response,
                                bool notify_peer);
-    bool rotate_internal_dns_session(const std::string& flow_key);
     void discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionId sid);
-    bool send_shared_tunnel_disconnect(const UdpTunnelPtr& tunnel, SessionId sid);
     void arm_internal_dns_timer();
     void stop_internal_dns_timer();
     bool ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
@@ -274,6 +299,8 @@ private:
     bool start_udp_cleanup_timer();
     void stop_udp_cleanup_timer();
     void cleanup_idle_udp_flows(uint64_t now_ms);
+    void cleanup_idle_tun_dns_flows(uint64_t now_ms);
+    void close_all_tun_dns_flows();
     void remove_udp_flow(const std::string& flow_key, bool notify_peer);
     void send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr& source,
                                    const uint8_t* data, size_t len,
@@ -281,8 +308,12 @@ private:
     void flush_pending_udp_packets(const UdpTunnelPtr& tunnel);
     void on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer& data);
     void on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data);
-    void close_udp_tunnel(const UdpTunnelPtr& tunnel);
+    void close_udp_tunnel(const UdpTunnelPtr& tunnel, bool retry_pending = false);
     void close_all_udp_tunnels();
+    void schedule_udp_tunnel_retry(const UdpTunnelPtr& tunnel);
+    void cancel_udp_tunnel_retry(const UdpTunnelPtr& tunnel);
+    static void on_udp_tunnel_retry(uv_timer_t* timer);
+    static void on_udp_tunnel_retry_closed(uv_handle_t* handle);
     static void on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
     static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
                             const struct sockaddr* addr, unsigned flags);
@@ -351,7 +382,12 @@ private:
     ClientConfig       config_;
     Router             router_;
     FakeIpDns          fake_ip_dns_;
+    // Routes application DNS to the physical resolver, TX tunnel, or block
+    // decision. Direct target/bootstrap resolution uses direct_dns_resolver_.
     DnsResolver         dns_resolver_;
+    // Resolves only direct targets via the selected physical Network on
+    // Android, retaining device-local CDN affinity.
+    DnsResolver         direct_dns_resolver_;
 
     // Listeners
     TcpServer          http_server_;
@@ -369,12 +405,16 @@ private:
     LwipUdpStack       lwip_udp_stack_;
     std::vector<uint8_t> tun_read_buf_;
     std::unordered_map<std::string, UdpTunnelPtr> udp_tunnels_;
+    std::unordered_map<std::string, uint32_t> udp_mux_next_slot_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;
+    std::unordered_map<uint64_t, TunDnsFlow> tun_dns_flows_;
+    uint64_t            next_tun_dns_generation_ = 1;
     uv_timer_t         udp_cleanup_timer_;
     bool               udp_cleanup_timer_started_;
     uv_timer_t         internal_dns_timer_;
     bool               internal_dns_timer_initialized_;
+    size_t             udp_tunnel_pending_bytes_ = 0;
     size_t             quic_sniff_active_flows_ = 0;
     size_t             quic_sniff_pending_bytes_ = 0;
     std::unordered_map<std::string, QuicRouteCacheEntry> quic_route_cache_;
@@ -389,6 +429,7 @@ private:
     std::atomic<uint64_t> direct_download_bytes_;
     std::atomic<uint64_t> proxy_upload_bytes_;
     std::atomic<uint64_t> proxy_download_bytes_;
+    std::atomic<uint32_t> android_address_family_mask_;
     SocketProtectCallback socket_protector_;
     DnsResolver::HostResolveHook host_resolver_;
     DnsResolver::QueryHook dns_query_;

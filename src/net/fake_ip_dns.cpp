@@ -39,6 +39,39 @@ uint64_t now_seconds() {
 
 } // namespace
 
+bool FakeIpDns::parse_question(const uint8_t* query, size_t query_len,
+                               Question& question) {
+    question = Question();
+    if (!query || query_len < 12 || (load_be16(query + 2) & 0x8000u) != 0 ||
+        (load_be16(query + 2) & 0x7800u) != 0 || load_be16(query + 4) != 1) {
+        return false;
+    }
+    size_t pos = 12;
+    while (pos < query_len) {
+        const uint8_t label_len = query[pos++];
+        if (label_len == 0) break;
+        if ((label_len & 0xc0u) != 0 || label_len > 63 ||
+            pos + label_len > query_len) {
+            return false;
+        }
+        if (!question.domain.empty()) question.domain.push_back('.');
+        question.domain.append(reinterpret_cast<const char*>(query + pos), label_len);
+        pos += label_len;
+        if (question.domain.size() > 253) return false;
+    }
+    if (pos == 12 || pos + 4 > query_len || query[pos - 1] != 0) return false;
+    question.type = load_be16(query + pos);
+    question.klass = load_be16(query + pos + 2);
+    if (question.klass != 1 || question.domain.empty()) return false;
+    std::transform(question.domain.begin(), question.domain.end(), question.domain.begin(),
+                   [](unsigned char value) {
+                       return static_cast<char>(std::tolower(value));
+                   });
+    if (!question.domain.empty() && question.domain.back() == '.')
+        question.domain.pop_back();
+    return !question.domain.empty();
+}
+
 FakeIpDns::FakeIpDns() {
     std::string error;
     configure("198.18.0.0/16", "fd00:198:18::/96", 60, error);
@@ -47,7 +80,8 @@ FakeIpDns::FakeIpDns() {
 bool FakeIpDns::configure(const std::string& ipv4_range,
                           const std::string& ipv6_range,
                           uint32_t ttl_seconds,
-                          std::string& error, size_t capacity) {
+                          std::string& error, size_t capacity,
+                          uint32_t mapping_ttl_seconds) {
     std::string host;
     long prefix = 0;
     in_addr address4;
@@ -72,7 +106,8 @@ bool FakeIpDns::configure(const std::string& ipv4_range,
     ipv4_network_ = ntohl(address4.s_addr) & mask;
     std::memcpy(ipv6_prefix_, &address6, 16);
     ipv6_prefix_bits_ = static_cast<uint8_t>(prefix6);
-    ttl_ = ttl_seconds ? ttl_seconds : 60;
+    dns_ttl_ = ttl_seconds ? ttl_seconds : 60;
+    mapping_ttl_ = mapping_ttl_seconds ? mapping_ttl_seconds : 1800;
     capacity_ = capacity;
     // The network address, TUN gateway (.1), DNS (.2), and .3 are reserved.
     next_ipv4_ = 4;
@@ -152,7 +187,7 @@ void FakeIpDns::expire_mappings(uint64_t now) {
 
 void FakeIpDns::touch_mapping(std::unordered_map<std::string, Mapping>::iterator mapping,
                               uint64_t now) {
-    mapping->second.expires_at = now + ttl_;
+    mapping->second.expires_at = now + mapping_ttl_;
     lru_.splice(lru_.end(), lru_, mapping->second.lru_position);
     mapping->second.lru_position = std::prev(lru_.end());
     if (!mapping->second.ipv4.empty())
@@ -242,7 +277,7 @@ bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
             } else {
                 lru_.push_back(domain);
                 Mapping mapping;
-                mapping.expires_at = now + ttl_;
+                mapping.expires_at = now + mapping_ttl_;
                 mapping.lru_position = std::prev(lru_.end());
                 mapping_it = forward_.emplace(domain, std::move(mapping)).first;
             }
@@ -274,7 +309,7 @@ bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
     append_u16(response, 0xc00c);
     append_u16(response, type);
     append_u16(response, 1);
-    append_u32(response, ttl_);
+    append_u32(response, dns_ttl_);
     uint8_t wire[16];
     const int family = type == 1 ? AF_INET : AF_INET6;
     const uint16_t wire_len = type == 1 ? 4 : 16;
@@ -294,6 +329,26 @@ bool FakeIpDns::reverse_lookup(const std::string& address, std::string& domain) 
     touch_mapping(mapping, now);
     domain = mapping->first;
     return true;
+}
+
+bool FakeIpDns::contains_address(const std::string& address) const {
+    in_addr address4;
+    if (inet_pton(AF_INET, address.c_str(), &address4) == 1) {
+        const uint32_t value = ntohl(address4.s_addr);
+        const uint32_t mask = ipv4_prefix_ == 0 ? 0 :
+            0xffffffffu << (32 - ipv4_prefix_);
+        return (value & mask) == ipv4_network_;
+    }
+
+    in6_addr address6;
+    if (inet_pton(AF_INET6, address.c_str(), &address6) != 1) return false;
+    const uint8_t* value = reinterpret_cast<const uint8_t*>(&address6);
+    const size_t full_bytes = ipv6_prefix_bits_ / 8;
+    const uint8_t partial_bits = static_cast<uint8_t>(ipv6_prefix_bits_ % 8);
+    if (full_bytes && std::memcmp(value, ipv6_prefix_, full_bytes) != 0) return false;
+    if (!partial_bits) return true;
+    const uint8_t mask = static_cast<uint8_t>(0xffu << (8 - partial_bits));
+    return (value[full_bytes] & mask) == (ipv6_prefix_[full_bytes] & mask);
 }
 
 } // namespace tx

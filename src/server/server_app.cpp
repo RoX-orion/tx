@@ -17,6 +17,8 @@ constexpr size_t kMaxTunnelWriteBacklog = 16 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
 constexpr size_t kMaxUdpResolutionPendingPackets = 1024;
 constexpr size_t kMaxUdpResolutionPendingBytes = 512 * 1024;
+constexpr size_t kMaxDnsQueriesPerClient = 64;
+constexpr size_t kMaxDnsQuerySize = 65535;
 
 std::unique_ptr<uv_loop_t> create_server_loop() {
     std::unique_ptr<uv_loop_t> loop(new uv_loop_t);
@@ -110,6 +112,7 @@ ServerApp::ServerApp()
       loop_(owned_loop_.get()),
       loop_closed_(false),
       server_(loop_),
+      dns_resolver_(loop_),
       udp_cleanup_timer_started_(false),
       stop_async_initialized_(false),
       ready_to_run_(false),
@@ -135,6 +138,15 @@ bool ServerApp::init(const ServerConfig& config) {
         stop_async_initialized_ = true;
     }
     config_ = config;
+
+    // An empty upstream list makes DnsResolver read the server's system
+    // resolver configuration (normally /etc/resolv.conf). The client never
+    // supplies a DNS server address in the tunnel request.
+    dns_resolver_.configure({}, DnsResolver::ProtectCallback(), 0);
+    if (!dns_resolver_.can_query()) {
+        TX_ERROR("No system DNS resolver is available for tunnel DNS queries");
+        return false;
+    }
 
     server_.set_accept_callback([this](SessionPtr s) { on_tunnel_accept(s); });
     if (!server_.listen(config.listen_host, config.listen_port)) {
@@ -182,6 +194,7 @@ void ServerApp::stop_on_loop() {
     stopping_ = true;
 
     stop_udp_cleanup_timer();
+    dns_resolver_.cancel_pending();
     server_.stop();
 
     std::vector<TunnelClientPtr> clients;
@@ -466,6 +479,9 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
             case TunnelCmd::UdpPacket:
                 handle_udp_packet(client, session_id, target, payload);
                 break;
+            case TunnelCmd::DnsQuery:
+                handle_dns_query(client, session_id, payload);
+                break;
             case TunnelCmd::Disconnect:
                 handle_disconnect(client, session_id);
                 break;
@@ -474,6 +490,9 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
                 break;
             case TunnelCmd::ConnectResult:
                 TX_DEBUG("Unexpected CONNECT_RESULT from client for session %u", session_id);
+                break;
+            case TunnelCmd::DnsResponse:
+                TX_DEBUG("Unexpected DNS_RESPONSE from client for session %u", session_id);
                 break;
         }
     }
@@ -667,6 +686,9 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
         return;
     }
 
+    TX_DEBUG("[UDP-SERVER] sid=%u target=%s:%u bytes=%zu", sid,
+             target.host.c_str(), target.port, payload.readable());
+
     auto it = client->udp_outbounds.find(sid);
     if (it == client->udp_outbounds.end()) {
         if (client->udp_outbounds.size() >= config_.max_udp_flows_per_client) {
@@ -759,6 +781,60 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
     payload.clear();
 }
 
+void ServerApp::handle_dns_query(TunnelClientPtr client, SessionId sid, Buffer& payload) {
+    if (!client || client->closed) {
+        payload.clear();
+        return;
+    }
+    if (sid == 0 || payload.readable() < 12 || payload.readable() > kMaxDnsQuerySize) {
+        TX_WARN("Rejecting invalid DNS query session %u (%zu bytes)", sid,
+                payload.readable());
+        payload.clear();
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+    if (client->outbounds.find(sid) != client->outbounds.end() ||
+        client->udp_outbounds.find(sid) != client->udp_outbounds.end() ||
+        client->dns_queries.find(sid) != client->dns_queries.end()) {
+        TX_ERROR("DNS query reuses session ID %u from tunnel client", sid);
+        payload.clear();
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+    if (client->pending_dns_queries >= kMaxDnsQueriesPerClient) {
+        TX_WARN("Dropping DNS query session %u: per-client limit reached", sid);
+        payload.clear();
+        return;
+    }
+
+    // Keep the query bytes in stable storage before entering resolve().  In
+    // C++14 the order in which the call arguments and the lambda capture are
+    // evaluated is unspecified; moving the vector in the capture can
+    // otherwise leave query.data()/query.size() empty on GCC.
+    const auto query_holder = std::make_shared<std::vector<uint8_t>>(
+        payload.data(), payload.data() + payload.readable());
+    payload.clear();
+    client->dns_queries.insert(sid);
+    ++client->pending_dns_queries;
+    const std::weak_ptr<TunnelClient> weak_client = client;
+    dns_resolver_.resolve(query_holder->data(), query_holder->size(),
+        [this, weak_client, sid, query_holder]
+        (std::vector<uint8_t> response) mutable {
+            auto current = weak_client.lock();
+            if (!current || current->closed) return;
+            auto pending = current->dns_queries.find(sid);
+            if (pending == current->dns_queries.end()) return;
+            current->dns_queries.erase(pending);
+            if (current->pending_dns_queries > 0) --current->pending_dns_queries;
+            if (!response.empty() &&
+                !DnsResolver::response_matches_query(*query_holder, response)) {
+                TX_WARN("Dropping DNS response with mismatched query ID for session %u", sid);
+                response.clear();
+            }
+            tunnel_send_dns_response(current, sid, response.data(), response.size());
+        });
+}
+
 bool ServerApp::ensure_udp_outbound_socket(TunnelClientPtr client, SessionId sid,
                                            TunnelClient::UdpOutbound& outbound,
                                            int family) {
@@ -847,7 +923,11 @@ bool ServerApp::send_udp_datagram(uv_udp_t* udp, const sockaddr_storage& target,
     const int status = uv_udp_send(&wr->req, udp, &wr->buf, 1,
                                    reinterpret_cast<const sockaddr*>(&target),
                                    ServerApp::on_udp_send_done);
-    if (status == 0) return true;
+    if (status == 0) {
+        TX_DEBUG("[UDP-SERVER-SEND] bytes=%zu family=%s", len,
+                 target.ss_family == AF_INET6 ? "IPv6" : "IPv4");
+        return true;
+    }
     TX_WARN("UDP send failed: %s", uv_strerror(status));
     delete[] wr->data;
     delete wr;
@@ -867,6 +947,11 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
     if (udp_it != client->udp_outbounds.end()) {
         close_udp_outbound(udp_it->second);
         client->udp_outbounds.erase(udp_it);
+    }
+    auto dns_it = client->dns_queries.find(sid);
+    if (dns_it != client->dns_queries.end()) {
+        client->dns_queries.erase(dns_it);
+        if (client->pending_dns_queries > 0) --client->pending_dns_queries;
     }
 }
 
@@ -914,6 +999,19 @@ void ServerApp::tunnel_send_udp_packet(TunnelClientPtr client, SessionId sid,
         if (!client->session->send(encoded)) {
             TX_ERROR("Failed to send UDP packet to tunnel for session %u", sid);
         }
+    }
+}
+
+void ServerApp::tunnel_send_dns_response(TunnelClientPtr client, SessionId sid,
+                                          const uint8_t* data, size_t len) {
+    if (!client || !client->session || client->session->is_closed()) return;
+    Buffer encoded;
+    if (!client->codec.encode_dns_response(sid, data, len, encoded)) {
+        TX_ERROR("Failed to encode DNS response for session %u", sid);
+        return;
+    }
+    if (!client->session->send(encoded)) {
+        TX_ERROR("Failed to send DNS response for session %u", sid);
     }
 }
 
@@ -1178,6 +1276,8 @@ void ServerApp::on_tunnel_close(TunnelClientPtr client) {
     for (auto& kv : udp_outbounds_copy) {
         close_udp_outbound(kv.second);
     }
+    client->dns_queries.clear();
+    client->pending_dns_queries = 0;
 
     clients_.erase(client->session->handle());
 }

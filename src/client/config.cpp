@@ -16,6 +16,12 @@ using json = nlohmann::json;
 
 namespace tx {
 
+namespace {
+
+constexpr int32_t kMaxUdpMuxConnections = 64;
+
+} // namespace
+
 static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char value) {
         return static_cast<char>(std::tolower(value));
@@ -194,6 +200,10 @@ bool ClientConfig::validate() const {
         TX_ERROR("dns.cache_ttl must be between 1 and 86400 seconds");
         return false;
     }
+    if (dns_mapping_ttl == 0 || dns_mapping_ttl > 604800) {
+        TX_ERROR("dns.mapping_ttl must be between 1 and 604800 seconds");
+        return false;
+    }
     if (dns_cache_capacity == 0 || dns_cache_capacity > 1000000) {
         TX_ERROR("dns.cache_capacity must be between 1 and 1000000");
         return false;
@@ -215,6 +225,18 @@ bool ClientConfig::validate() const {
             }
             if (outbound.psk.size() != Secret::kPskLen) {
                 TX_ERROR("TX outbound %s has no valid high-entropy secret", outbound.tag.c_str());
+                return false;
+            }
+            if (!outbound.udp_over_tcp) {
+                TX_ERROR("TX outbound %s sets udp-over-tcp=false, but native UDP transport is not implemented",
+                         outbound.tag.c_str());
+                return false;
+            }
+            if (outbound.udp_mux_connections == 0 ||
+                outbound.udp_mux_connections < -1 ||
+                outbound.udp_mux_connections > kMaxUdpMuxConnections) {
+                TX_ERROR("TX outbound %s udp-mux.connections must be -1 or between 1 and %d",
+                         outbound.tag.c_str(), kMaxUdpMuxConnections);
                 return false;
             }
         }
@@ -280,7 +302,22 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
                     return false;
                 }
 
+                if (outbound.type != OutboundType::Tx &&
+                    (item.contains("udp-over-tcp") || item.contains("udp-mux"))) {
+                    TX_ERROR("udp-over-tcp and udp-mux are only supported by TX outbounds");
+                    return false;
+                }
                 if (outbound.type == OutboundType::Tx) {
+                    outbound.udp_over_tcp = item.value("udp-over-tcp", outbound.udp_over_tcp);
+                    if (item.contains("udp-mux")) {
+                        const auto& udp_mux = item["udp-mux"];
+                        if (!udp_mux.is_object()) {
+                            TX_ERROR("TX outbound udp-mux must be an object");
+                            return false;
+                        }
+                        outbound.udp_mux_connections = udp_mux.value(
+                            "connections", outbound.udp_mux_connections);
+                    }
                     auto& server = item.contains("server") ? item["server"] : item;
                     if (server.contains("host")) outbound.server_host = server["host"].get<std::string>();
                     if (server.contains("port")) outbound.server_port = server["port"].get<uint16_t>();
@@ -417,13 +454,8 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
             config.dns_fake_ipv4_range = dns.value("fake_ipv4_range", config.dns_fake_ipv4_range);
             config.dns_fake_ipv6_range = dns.value("fake_ipv6_range", config.dns_fake_ipv6_range);
             config.dns_cache_ttl = dns.value("cache_ttl", config.dns_cache_ttl);
+            config.dns_mapping_ttl = dns.value("mapping_ttl", config.dns_mapping_ttl);
             config.dns_cache_capacity = dns.value("cache_capacity", config.dns_cache_capacity);
-            config.dns_outbound_tag = dns.value("outboundTag", config.dns_outbound_tag);
-            if (dns.contains("upstreams")) {
-                config.dns_upstreams.clear();
-                for (const auto& upstream : dns["upstreams"])
-                    config.dns_upstreams.push_back(upstream.get<std::string>());
-            }
         }
 
         if (j.contains("geo") || j.contains("server")) {

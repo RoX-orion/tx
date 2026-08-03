@@ -27,8 +27,14 @@ typedef void* tx_handle_t;
 // succeeded and the selected Network remained current.
 typedef int (*tx_socket_protect_fn)(int socket_fd, void* user_data);
 
-#define TX_ANDROID_NETWORK_HOOKS_VERSION 1u
+#define TX_ANDROID_NETWORK_HOOKS_VERSION 2u
 #define TX_ANDROID_MAX_RESOLVED_ADDRESSES 16u
+// When KNOWN is set, only the listed address families have a usable default
+// route on the selected physical Android Network. A zero mask means
+// "unknown", which defers filtering while LinkProperties is not ready.
+#define TX_ANDROID_NETWORK_FAMILY_IPV4  (1u << 0)
+#define TX_ANDROID_NETWORK_FAMILY_IPV6  (1u << 1)
+#define TX_ANDROID_NETWORK_FAMILY_KNOWN (1u << 31)
 
 typedef struct {
     int family;                 // AF_INET or AF_INET6
@@ -52,6 +58,7 @@ typedef struct {
     tx_socket_protect_fn protect_socket;
     tx_android_resolve_host_fn resolve_host;
     tx_android_query_dns_fn query_dns;
+    unsigned int address_family_mask;
     void* user_data;
 } tx_android_network_hooks_t;
 
@@ -82,18 +89,19 @@ TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
 TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd);
 
 // Start the Android client with a physical-network bind + VPN-exemption callback.
-// This API requires at least one numeric dns.upstreams entry. Android sends
-// queries to it through the configured TX outbound; it never uses the
-// physical network's DNS resolver.
+// TX endpoint and direct DNS use the selected physical Network. TX-routed DNS
+// is resolved by the remote server's system resolver; no DNS address is
+// required in the client configuration.
 // Native code takes ownership of tun_fd, including startup-failure paths.
 // protect_user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
                                            tx_socket_protect_fn protect_fn,
                                            void* protect_user_data);
 
-// Versioned Android network integration. Only protect_socket is used on
-// Android. resolve_host/query_dns are retained for ABI compatibility and are
-// intentionally ignored so DNS cannot fall back to the physical resolver.
+// Versioned Android network integration. protect_socket is used for every
+// outbound socket. resolve_host/query_dns provide physical-Network DNS for TX
+// bootstrap and targets routed to direct. TX-routed DNS uses the encrypted
+// tunnel and the server's system resolver.
 // hooks->user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
                                               const tx_android_network_hooks_t* hooks);
@@ -101,6 +109,11 @@ TX_API tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, 
 // Cancel work tied to the previous Android Network and close existing outbound
 // sockets. Applications reconnect while fake-IP mappings remain intact.
 TX_API void tx_client_notify_network_changed(tx_handle_t handle);
+
+// Update the selected Android Network's usable IP families, then close work
+// tied to the previous network state. See TX_ANDROID_NETWORK_FAMILY_*.
+TX_API void tx_client_update_android_network_state(tx_handle_t handle,
+                                                   unsigned int address_family_mask);
 
 // Stop the client.
 TX_API void tx_client_stop(tx_handle_t handle);

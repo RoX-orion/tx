@@ -3,17 +3,15 @@
 #include "tx/common/endian.h"
 
 #include <arpa/inet.h>
-#include <cassert>
 #include <atomic>
-#include <cerrno>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
-#include <fcntl.h>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace tx {
@@ -23,71 +21,139 @@ struct ClientAppDnsTest {
                         DnsResolver::ResolveCallback callback) {
         app.resolve_dns_via_tunnel(std::move(query), std::move(callback));
     }
+
+    static bool dns_tunnel_is_separate(ClientApp& app, const OutboundConfig* outbound) {
+        const auto data = app.get_udp_tunnel(outbound, ClientApp::UdpTunnelKind::Data);
+        const auto dns = app.get_udp_tunnel(outbound, ClientApp::UdpTunnelKind::Dns);
+        return data && dns && data != dns && data->key != dns->key &&
+               data->kind == ClientApp::UdpTunnelKind::Data &&
+               dns->kind == ClientApp::UdpTunnelKind::Dns;
+    }
+
+    static bool dns_query_is_pending(ClientApp& app) {
+        for (const auto& item : app.udp_tunnels_) {
+            if (item.second->kind == ClientApp::UdpTunnelKind::Dns &&
+                !item.second->pending.empty() && item.second->pending.front().dns_query) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+struct ClientAppNetworkTest {
+    static bool family_available(const ClientApp& app, int family) {
+        return app.android_address_family_available(family);
+    }
+};
+
+struct ServerAppDnsTest {
+    static void configure_query_hook(ServerApp& app, DnsResolver::QueryHook hook) {
+        app.dns_resolver_.configure({}, DnsResolver::ProtectCallback(), 0,
+                                    DnsResolver::HostResolveHook(), std::move(hook));
+    }
+
+    static void query_bytes_survive_cxx14_argument_evaluation() {
+        ServerApp app;
+        const std::vector<uint8_t> expected = {
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        std::vector<uint8_t> observed;
+        app.dns_resolver_.configure(
+            {}, DnsResolver::ProtectCallback(), 0, DnsResolver::HostResolveHook(),
+            [&expected, &observed](const uint8_t* data, size_t len) {
+                observed.assign(data, data + len);
+                return expected;
+            });
+
+        auto client = std::make_shared<ServerApp::TunnelClient>();
+        Buffer payload;
+        payload.append(expected.data(), expected.size());
+        app.handle_dns_query(client, 77, payload);
+        assert(payload.empty());
+        uv_run(app.loop(), UV_RUN_DEFAULT);
+        assert(observed == expected);
+        assert(client->dns_queries.empty());
+        assert(client->pending_dns_queries == 0);
+    }
 };
 
 } // namespace tx
 
 namespace {
 
-struct DnsSockets {
-    int udp = -1;
-    int tcp = -1;
-    uint16_t port = 0;
-};
-
-std::vector<uint8_t> make_query(uint16_t id) {
-    return std::vector<uint8_t>{
-        static_cast<uint8_t>(id >> 8), static_cast<uint8_t>(id),
-        0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+std::vector<uint8_t> make_query(const char* host, uint16_t type = 16) {
+    std::vector<uint8_t> query{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
-        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
-        0x03, 'c', 'o', 'm', 0x00,
-        0x00, 0x01, 0x00, 0x01,
     };
+    const std::string name(host);
+    size_t begin = 0;
+    while (begin < name.size()) {
+        const size_t end = name.find('.', begin);
+        const size_t length = (end == std::string::npos ? name.size() : end) - begin;
+        query.push_back(static_cast<uint8_t>(length));
+        query.insert(query.end(), name.begin() + begin, name.begin() + begin + length);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    query.push_back(0);
+    query.push_back(static_cast<uint8_t>(type >> 8));
+    query.push_back(static_cast<uint8_t>(type));
+    query.push_back(0);
+    query.push_back(1);
+    return query;
 }
 
-std::vector<uint8_t> make_response(const std::vector<uint8_t>& query, bool truncated) {
+std::vector<uint8_t> response_for(const std::vector<uint8_t>& query) {
     std::vector<uint8_t> response = query;
-    response[2] = truncated ? 0x83 : 0x81;
+    response[2] = 0x81;
     response[3] = 0x80;
     return response;
 }
 
-void set_receive_timeout(int fd, int seconds) {
-    timeval timeout{seconds, 0};
-    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-}
+tx::ClientConfig config_for(const char* domain_route,
+                            tx::OutboundType route_type = tx::OutboundType::Tx,
+                            uint16_t tx_port = 1) {
+    tx::ClientConfig config;
+    config.http_port = 0;
+    config.socks5_port = 0;
 
-DnsSockets open_dns_sockets(bool with_tcp) {
-    DnsSockets sockets;
-    sockets.udp = socket(AF_INET, SOCK_DGRAM, 0);
-    assert(sockets.udp >= 0);
+    tx::OutboundConfig direct;
+    direct.tag = "direct-out";
+    direct.type = tx::OutboundType::Direct;
+    config.outbound_index[direct.tag] = config.outbounds.size();
+    config.outbounds.push_back(direct);
 
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    assert(bind(sockets.udp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    socklen_t length = sizeof(address);
-    assert(getsockname(sockets.udp, reinterpret_cast<sockaddr*>(&address), &length) == 0);
-    sockets.port = ntohs(address.sin_port);
-    set_receive_timeout(sockets.udp, 8);
+    tx::OutboundConfig block;
+    block.tag = "block-out";
+    block.type = tx::OutboundType::Block;
+    config.outbound_index[block.tag] = config.outbounds.size();
+    config.outbounds.push_back(block);
 
-    if (with_tcp) {
-        sockets.tcp = socket(AF_INET, SOCK_STREAM, 0);
-        assert(sockets.tcp >= 0);
-        int one = 1;
-        assert(setsockopt(sockets.tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0);
-        address.sin_port = htons(sockets.port);
-        assert(bind(sockets.tcp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-        assert(listen(sockets.tcp, 4) == 0);
-        set_receive_timeout(sockets.tcp, 8);
-    }
-    return sockets;
+    tx::OutboundConfig tx_out;
+    tx_out.tag = "tx-out";
+    tx_out.type = tx::OutboundType::Tx;
+    tx_out.server_host = "127.0.0.1";
+    tx_out.server_port = tx_port;
+    tx_out.psk.assign(32, 0x42);
+    config.outbound_index[tx_out.tag] = config.outbounds.size();
+    config.outbounds.push_back(tx_out);
+
+    tx::RouteRule rule;
+    rule.domains.push_back(domain_route);
+    rule.outbound_tag = route_type == tx::OutboundType::Direct ? "direct-out" :
+                        route_type == tx::OutboundType::Block ? "block-out" : "tx-out";
+    config.router.rules.push_back(rule);
+    tx::RouteRule fallback;
+    fallback.outbound_tag = "tx-out";
+    config.router.rules.push_back(fallback);
+    return config;
 }
 
 uint16_t reserve_tcp_port() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -101,81 +167,29 @@ uint16_t reserve_tcp_port() {
     return port;
 }
 
-int open_tcp_listener(uint16_t& port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd >= 0);
-    int one = 1;
-    assert(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0);
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    assert(listen(fd, 4) == 0);
-    socklen_t length = sizeof(address);
-    assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0);
-    port = ntohs(address.sin_port);
-    set_receive_timeout(fd, 4);
-    return fd;
-}
-
-bool read_all(int fd, uint8_t* data, size_t size) {
-    while (size != 0) {
-        const ssize_t received = recv(fd, data, size, 0);
-        if (received <= 0) return false;
-        data += received;
-        size -= static_cast<size_t>(received);
-    }
-    return true;
-}
-
-bool write_all(int fd, const uint8_t* data, size_t size) {
-    while (size != 0) {
-        const ssize_t sent = send(fd, data, size, 0);
-        if (sent <= 0) return false;
-        data += sent;
-        size -= static_cast<size_t>(sent);
-    }
-    return true;
-}
-
-tx::ClientConfig client_config(uint16_t server_port,
-                               std::vector<std::string> upstreams,
-                               const std::vector<uint8_t>& psk) {
-    tx::ClientConfig config;
-    config.http_port = 0;
-    config.socks5_port = 0;
-    config.dns_upstreams = std::move(upstreams);
-    config.dns_outbound_tag = "tx-out";
-
-    tx::OutboundConfig outbound;
-    outbound.tag = "tx-out";
-    outbound.type = tx::OutboundType::Tx;
-    outbound.server_host = "127.0.0.1";
-    outbound.server_port = server_port;
-    outbound.psk = psk;
-    config.outbound_index[outbound.tag] = 0;
-    config.outbounds.push_back(std::move(outbound));
-
-    tx::RouteRule fallback;
-    fallback.outbound_tag = "tx-out";
-    config.router.rules.push_back(std::move(fallback));
-    return config;
-}
-
-std::vector<uint8_t> run_query(uint16_t server_port,
-                               const std::vector<uint8_t>& psk,
-                               std::vector<std::string> upstreams,
-                               const std::vector<uint8_t>& query,
-                               long long* elapsed_ms = nullptr) {
+void test_block_dns_is_local() {
     tx::ClientApp app;
-    const tx::ClientConfig config = client_config(server_port, std::move(upstreams), psk);
-    assert(app.init(config));
-
+    assert(app.init(config_for("blocked.example", tx::OutboundType::Block)));
     std::vector<uint8_t> result;
     unsigned callbacks = 0;
-    const auto started = std::chrono::steady_clock::now();
+    tx::ClientAppDnsTest::resolve(app, make_query("blocked.example"),
+        [&](std::vector<uint8_t> response) {
+            ++callbacks;
+            result = std::move(response);
+        });
+    assert(callbacks == 1);
+    assert(result.size() >= 12);
+    assert((tx::load_be16(result.data() + 2) & 0x0f) == 5); // REFUSED
+}
+
+void test_direct_dns_uses_physical_hook() {
+    const auto query = make_query("cn.example");
+    const auto expected = response_for(query);
+    tx::ClientApp app(tx::SocketProtectCallback(), tx::DnsResolver::HostResolveHook(),
+                      [expected](const uint8_t*, size_t) { return expected; });
+    assert(app.init(config_for("cn.example", tx::OutboundType::Direct)));
+    std::vector<uint8_t> result;
+    unsigned callbacks = 0;
     tx::ClientAppDnsTest::resolve(app, query,
         [&](std::vector<uint8_t> response) {
             ++callbacks;
@@ -184,245 +198,104 @@ std::vector<uint8_t> run_query(uint16_t server_port,
         });
     app.run();
     assert(callbacks == 1);
-    if (elapsed_ms) {
-        *elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count();
-    }
-    return result;
-}
-
-void test_upstream_failover(uint16_t server_port, const std::vector<uint8_t>& psk) {
-    DnsSockets blackhole = open_dns_sockets(false);
-    DnsSockets answering = open_dns_sockets(false);
-    const std::vector<uint8_t> query = make_query(0x1234);
-    const std::vector<uint8_t> expected = make_response(query, false);
-
-    std::thread first([blackhole]() {
-        uint8_t buffer[512];
-        recv(blackhole.udp, buffer, sizeof(buffer), 0);
-        close(blackhole.udp);
-    });
-    std::thread second([answering, expected]() {
-        sockaddr_storage peer{};
-        socklen_t peer_len = sizeof(peer);
-        uint8_t buffer[512];
-        const ssize_t received = recvfrom(answering.udp, buffer, sizeof(buffer), 0,
-                                          reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (received > 0) {
-            sendto(answering.udp, expected.data(), expected.size(), 0,
-                   reinterpret_cast<sockaddr*>(&peer), peer_len);
-        }
-        close(answering.udp);
-    });
-
-    long long elapsed_ms = 0;
-    const auto result = run_query(
-        server_port, psk,
-        {"127.0.0.1:" + std::to_string(blackhole.port),
-         "127.0.0.1:" + std::to_string(answering.port)},
-        query, &elapsed_ms);
-    first.join();
-    second.join();
-    assert(result == expected);
-    assert(elapsed_ms >= 1500 && elapsed_ms < 6000);
-}
-
-void test_all_upstreams_fail(uint16_t server_port, const std::vector<uint8_t>& psk) {
-    DnsSockets blackhole = open_dns_sockets(false);
-    const std::vector<uint8_t> query = make_query(0x3456);
-    std::thread server([blackhole]() {
-        uint8_t buffer[512];
-        recv(blackhole.udp, buffer, sizeof(buffer), 0);
-        close(blackhole.udp);
-    });
-
-    long long elapsed_ms = 0;
-    const auto result = run_query(
-        server_port, psk,
-        {"127.0.0.1:" + std::to_string(blackhole.port)},
-        query, &elapsed_ms);
-    server.join();
-    assert(result.empty());
-    assert(elapsed_ms >= 1500 && elapsed_ms < 5000);
-}
-
-void test_truncated_tcp_fallback(uint16_t server_port,
-                                 const std::vector<uint8_t>& psk) {
-    DnsSockets dns = open_dns_sockets(true);
-    const std::vector<uint8_t> query = make_query(0x5678);
-    const std::vector<uint8_t> expected = make_response(query, false);
-
-    std::thread udp([dns, query]() {
-        sockaddr_storage peer{};
-        socklen_t peer_len = sizeof(peer);
-        uint8_t buffer[512];
-        const ssize_t received = recvfrom(dns.udp, buffer, sizeof(buffer), 0,
-                                          reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (received > 0) {
-            const auto truncated = make_response(query, true);
-            sendto(dns.udp, truncated.data(), truncated.size(), 0,
-                   reinterpret_cast<sockaddr*>(&peer), peer_len);
-        }
-        close(dns.udp);
-    });
-    std::thread tcp([dns, query, expected]() {
-        int client = accept(dns.tcp, nullptr, nullptr);
-        if (client >= 0) {
-            set_receive_timeout(client, 8);
-            uint8_t length[2];
-            if (read_all(client, length, sizeof(length))) {
-                const uint16_t query_len = tx::load_be16(length);
-                std::vector<uint8_t> received(query_len);
-                if (read_all(client, received.data(), received.size()) && received == query) {
-                    tx::store_be16(length, static_cast<uint16_t>(expected.size()));
-                    write_all(client, length, 1);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                    write_all(client, length + 1, 1);
-                    write_all(client, expected.data(), 7);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                    write_all(client, expected.data() + 7, expected.size() - 7);
-                }
-            }
-            close(client);
-        }
-        close(dns.tcp);
-    });
-
-    const auto result = run_query(
-        server_port, psk,
-        {"127.0.0.1:" + std::to_string(dns.port)}, query);
-    udp.join();
-    tcp.join();
     assert(result == expected);
 }
 
-void test_tcp_failure_uses_next_upstream(uint16_t server_port,
-                                         const std::vector<uint8_t>& psk) {
-    DnsSockets truncated_only = open_dns_sockets(false);
-    DnsSockets answering = open_dns_sockets(false);
-    const std::vector<uint8_t> query = make_query(0x789a);
-    const std::vector<uint8_t> expected = make_response(query, false);
-
-    std::thread first([truncated_only, query]() {
-        sockaddr_storage peer{};
-        socklen_t peer_len = sizeof(peer);
-        uint8_t buffer[512];
-        const ssize_t received = recvfrom(truncated_only.udp, buffer, sizeof(buffer), 0,
-                                          reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (received > 0) {
-            const auto truncated = make_response(query, true);
-            sendto(truncated_only.udp, truncated.data(), truncated.size(), 0,
-                   reinterpret_cast<sockaddr*>(&peer), peer_len);
-        }
-        close(truncated_only.udp);
-    });
-    std::thread second([answering, expected]() {
-        sockaddr_storage peer{};
-        socklen_t peer_len = sizeof(peer);
-        uint8_t buffer[512];
-        const ssize_t received = recvfrom(answering.udp, buffer, sizeof(buffer), 0,
-                                          reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (received > 0) {
-            sendto(answering.udp, expected.data(), expected.size(), 0,
-                   reinterpret_cast<sockaddr*>(&peer), peer_len);
-        }
-        close(answering.udp);
-    });
-
-    const auto result = run_query(
-        server_port, psk,
-        {"127.0.0.1:" + std::to_string(truncated_only.port),
-         "127.0.0.1:" + std::to_string(answering.port)}, query);
-    first.join();
-    second.join();
-    assert(result == expected);
-}
-
-void test_tx_target_domain_uses_server_resolver(uint16_t server_port,
-                                                const std::vector<uint8_t>& psk) {
-    // Any Android-side pre-resolution of the target would send a packet here.
-    // It intentionally has no responder.
-    DnsSockets blackhole = open_dns_sockets(false);
-    uint16_t target_port = 0;
-    const int target_listener = open_tcp_listener(target_port);
-    std::atomic<bool> target_connected(false);
-    std::atomic<bool> release_target(false);
-    std::thread target([target_listener, &target_connected, &release_target]() {
-        int peer = accept(target_listener, nullptr, nullptr);
-        if (peer >= 0) {
-            target_connected.store(true);
-            while (!release_target.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            close(peer);
-        }
-        close(target_listener);
-    });
-
+void test_tx_dns_has_no_resolver_target() {
     tx::ClientApp app;
-    tx::ClientConfig config = client_config(
-        server_port, {"127.0.0.1:" + std::to_string(blackhole.port)}, psk);
-    config.http_port = reserve_tcp_port();
-    config.socks5_port = reserve_tcp_port();
+    tx::ClientConfig config = config_for("foreign.example");
     assert(app.init(config));
-    std::thread client_loop([&app]() { app.run(); });
-
-    int client = socket(AF_INET, SOCK_STREAM, 0);
-    assert(client >= 0);
-    set_receive_timeout(client, 4);
-    sockaddr_in proxy{};
-    proxy.sin_family = AF_INET;
-    proxy.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    proxy.sin_port = htons(config.http_port);
-    assert(connect(client, reinterpret_cast<sockaddr*>(&proxy), sizeof(proxy)) == 0);
-
-    const std::string request = "CONNECT localhost:" + std::to_string(target_port) +
-        " HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    assert(write_all(client, reinterpret_cast<const uint8_t*>(request.data()), request.size()));
-    uint8_t response[256]{};
-    const ssize_t response_len = recv(client, response, sizeof(response), 0);
-    assert(response_len > 0);
-    const std::string response_text(reinterpret_cast<const char*>(response),
-                                    static_cast<size_t>(response_len));
-    assert(response_text.find("HTTP/1.1 200") == 0);
-    assert(target_connected.load());
-    close(client);
-
-    release_target.store(true);
-    target.join();
+    tx::ClientAppDnsTest::resolve(app, make_query("foreign.example"),
+                                  [](std::vector<uint8_t>) {});
+    assert(tx::ClientAppDnsTest::dns_query_is_pending(app));
     app.stop();
-    client_loop.join();
+}
 
-    assert(fcntl(blackhole.udp, F_SETFL, O_NONBLOCK) == 0);
-    uint8_t query[512];
-    assert(recv(blackhole.udp, query, sizeof(query), 0) == -1);
-    assert(errno == EAGAIN || errno == EWOULDBLOCK);
-    close(blackhole.udp);
+void test_android_tx_server_requires_numeric_host() {
+    tx::ClientConfig config = config_for("foreign.example");
+    config.outbounds[2].server_host = "tx.example.com";
+    tx::ClientApp app;
+    assert(!app.init(config));
+}
+
+void test_dns_tunnel_is_separate() {
+    tx::ClientApp app;
+    tx::OutboundConfig outbound;
+    outbound.tag = "tx-out";
+    outbound.type = tx::OutboundType::Tx;
+    assert(tx::ClientAppDnsTest::dns_tunnel_is_separate(app, &outbound));
+}
+
+void test_dns_waits_for_server_failover() {
+    const uint16_t port = reserve_tcp_port();
+    const auto query = make_query("delayed.example");
+    const auto expected = response_for(query);
+
+    tx::ServerApp server;
+    tx::ServerConfig server_config;
+    server_config.listen_host = "127.0.0.1";
+    server_config.listen_port = port;
+    server_config.psk.assign(32, 0x42);
+    assert(server.init(server_config));
+    tx::ServerAppDnsTest::configure_query_hook(server,
+        [expected](const uint8_t*, size_t) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            return expected;
+        });
+    std::thread server_thread([&server]() { server.run(); });
+
+    tx::ClientApp client;
+    assert(client.init(config_for("delayed.example", tx::OutboundType::Tx, port)));
+    std::vector<uint8_t> result;
+    unsigned callbacks = 0;
+    std::atomic<bool> done(false);
+    tx::ClientAppDnsTest::resolve(client, query,
+        [&client, &result, &callbacks, &done](std::vector<uint8_t> response) {
+            result = std::move(response);
+            ++callbacks;
+            done.store(true);
+            client.stop();
+        });
+    std::thread client_thread([&client]() { client.run(); });
+
+    for (unsigned i = 0; i < 100 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!done.load()) client.stop();
+    client_thread.join();
+    server.stop();
+    server_thread.join();
+    assert(done.load());
+    assert(callbacks == 1);
+    assert(result == expected);
+}
+
+void test_android_physical_network_address_family_filter() {
+    tx::ClientApp app(tx::SocketProtectCallback(), tx::DnsResolver::HostResolveHook(),
+                      tx::DnsResolver::QueryHook(),
+                      tx::kAndroidNetworkAddressFamilyKnown |
+                          tx::kAndroidNetworkAddressFamilyIPv4);
+    assert(tx::ClientAppNetworkTest::family_available(app, AF_INET));
+    assert(!tx::ClientAppNetworkTest::family_available(app, AF_INET6));
+    app.update_android_address_family_mask(
+        tx::kAndroidNetworkAddressFamilyKnown | tx::kAndroidNetworkAddressFamilyIPv6);
+    assert(!tx::ClientAppNetworkTest::family_available(app, AF_INET));
+    assert(tx::ClientAppNetworkTest::family_available(app, AF_INET6));
+    app.update_android_address_family_mask(0);
+    assert(tx::ClientAppNetworkTest::family_available(app, AF_INET));
+    assert(tx::ClientAppNetworkTest::family_available(app, AF_INET6));
 }
 
 } // namespace
 
 int main() {
-    const uint16_t server_port = reserve_tcp_port();
-    std::vector<uint8_t> psk(32);
-    for (size_t i = 0; i < psk.size(); ++i) psk[i] = static_cast<uint8_t>(i);
-
-    tx::ServerConfig server_config;
-    server_config.listen_host = "127.0.0.1";
-    server_config.listen_port = server_port;
-    server_config.psk = psk;
-    tx::ServerApp server;
-    assert(server.init(server_config));
-    std::thread server_thread([&server]() { server.run(); });
-
-    test_upstream_failover(server_port, psk);
-    test_all_upstreams_fail(server_port, psk);
-    test_truncated_tcp_fallback(server_port, psk);
-    test_tcp_failure_uses_next_upstream(server_port, psk);
-    test_tx_target_domain_uses_server_resolver(server_port, psk);
-
-    server.stop();
-    server_thread.join();
+    tx::ServerAppDnsTest::query_bytes_survive_cxx14_argument_evaluation();
+    test_block_dns_is_local();
+    test_direct_dns_uses_physical_hook();
+    test_tx_dns_has_no_resolver_target();
+    test_android_tx_server_requires_numeric_host();
+    test_dns_tunnel_is_separate();
+    test_dns_waits_for_server_failover();
+    test_android_physical_network_address_family_filter();
     std::printf("client tunnel DNS tests passed\n");
     return 0;
 }

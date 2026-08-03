@@ -29,6 +29,81 @@ cmake --build build -j$(nproc)
 ./build/bin/tx_client -c config/client.json.example
 ```
 
+## CC 服务器 systemd 部署
+
+当前 CC 服务器使用 SSH 主机别名 `cc`，优先通过 IPv6 和私钥连接：
+
+```sh
+ssh -6 -i ~/.ssh/id_rsa cc
+```
+
+远端部署约定如下：
+
+- 远端工作目录：`/home/code/cpp/tx`。
+- 服务端程序：`/home/code/cpp/tx/tx_server`。
+- 服务端配置：`/home/code/cpp/tx/server.json.example`；部署程序时不得覆盖该文件，尤其不能覆盖真实密钥。
+- systemd 单元：`/etc/systemd/system/tx-server.service`。
+- 服务以 root 运行，监听配置文件指定的 TCP 端口（当前为 IPv6 `::`:443）。
+- 服务端不配置客户端 DNS 上游地址；DNS 使用服务器系统 resolver。
+
+发布服务端程序时，必须先在本机构建并校验，再上传临时文件、校验 SHA256、备份旧程序后原子替换：
+
+```sh
+cmake --build build -j$(nproc)
+sha256sum build/bin/tx_server
+scp -6 -i ~/.ssh/id_rsa build/bin/tx_server \
+  cc:/home/code/cpp/tx/tx_server.deploy-<timestamp>
+ssh -6 -i ~/.ssh/id_rsa cc
+```
+
+在远端执行替换（将 `<timestamp>` 替换为本次发布标识）：
+
+```sh
+set -eu
+base=/home/code/cpp/tx
+new="$base/tx_server.deploy-<timestamp>"
+old="$base/tx_server"
+backup="$base/deploy-backups/tx_server-<timestamp>"
+install -d -m 0755 "$base/deploy-backups"
+sha256sum "$new"
+systemctl stop tx-server.service
+cp -a "$old" "$backup"
+mv "$new" "$old"
+chown root:root "$old"
+chmod 0755 "$old"
+systemctl daemon-reload
+systemctl start tx-server.service
+systemctl is-active --quiet tx-server.service
+systemctl status tx-server.service --no-pager -l
+ss -ltnp | grep ':443'
+```
+
+发布后应核对运行进程、监听端口和最近日志：
+
+```sh
+pgrep -a tx_server
+journalctl -u tx-server.service -n 50 --no-pager
+```
+
+若启动失败，先停止服务，将 `deploy-backups/tx_server-<timestamp>` 复制回
+`tx_server`，再启动服务完成回滚；不得删除备份文件。
+
+## Android APK 安装
+
+Android 工程位于 `/home/andre/code/android/txz`。构建并安装 arm64 Debug APK：
+
+```sh
+cmake --build build-android-arm64 -j$(nproc)
+cp build-android-arm64/lib/libtx.so \
+  /home/andre/code/android/txz/app/src/main/jniLibs/arm64-v8a/libtx.so
+cd /home/andre/code/android/txz
+./gradlew :app:assembleDebug
+adb devices
+adb -s <serial> install -r -d app/build/outputs/apk/debug/app-debug.apk
+```
+
+安装前必须确认 `adb devices` 中的设备序列号，禁止在未确认目标设备时使用通配设备参数。
+
 非 Android 平台默认启用测试：
 
 ```sh
@@ -143,11 +218,12 @@ VpnService TUN fd -> HEV lwIP TCP/UDP -> tx router -> direct / tx tunnel / block
 - 原生 direct、TX 和受控 DNS socket 都支持 protector 回调。JNI 层必须调用
   `VpnService.protect(fd)`，必要时再将 fd 绑定至选定的物理 `Network`；失败必须让该
   流失败，不能冒险造成 VPN 路由环路。
-- `tx_client_start_android()` 要求非空的数值 `dns.upstreams`，DNS 查询经已配置的 TX
-  出站转发到远端，不得回退到物理网络 DNS。
-- `tx_client_start_android_ex()` 的 `resolve_host` 与 `query_dns` 字段仅为 ABI 兼容而
-  保留；Android 上不会调用它们，只有 `protect_socket` 生效。需要在 Android 启动前
-  解析服务器主机名时，应用应通过选定的物理网络自行解析，再把数值地址写入配置。
+- `tx_client_start_android()` 要求非空的数值 `dns.upstreams`。应用 DNS、Fake-IP 无法
+  本地处理的 DNS 以及 TX 出站 DNS 经已配置的 TX 出站转发到远端。仅当路由已经明确
+  选中 `direct` 时，`dns.direct_resolver: "physical"` 才可使用已 protect/bind 的物理
+  Network 解析目标域名，以保留本地 CDN 亲和性。
+- `tx_client_start_android_ex()` 的 `resolve_host` 与 `query_dns` 仅供上述已选中 direct
+  的目标使用；TX server 必须仍在启动前解析为数值地址，Fake-IP/TX DNS 不得调用它们。
 
 ## UDP 与 QUIC 状态
 

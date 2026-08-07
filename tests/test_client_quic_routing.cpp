@@ -367,6 +367,62 @@ struct ClientAppQuicTest {
         assert(!result.quic_sniffer);
     }
 
+    static void ambiguous_short_header_falls_back_to_ip() {
+        ClientApp app;
+        configure(app);
+        ClientApp::UdpFlow flow;
+        const uint64_t now = uv_now(app.loop());
+        for (const auto& cid : {std::string("\x91\x92", 2),
+                                std::string("\x91\x92\x93\x94", 4)}) {
+            ClientApp::QuicRouteCacheEntry entry;
+            entry.route_target.type = AddrType::Domain;
+            entry.route_target.host = "sniffed.example";
+            entry.route_target.port = 443;
+            entry.outbound = app.find_outbound("block-out");
+            entry.expires_at_ms = now + 60000;
+            entry.last_used_at_ms = now;
+            app.quic_route_cache_[cid] = entry;
+        }
+        const uint8_t short_header[] = {0x40, 0x91, 0x92, 0x93, 0x94, 0x00};
+        assert(!app.inherit_tun_quic_route(flow, short_header, sizeof(short_header)));
+        assert(!flow.route_ready);
+    }
+
+    static void quic_cache_hit_refreshes_expiry() {
+        ClientApp app;
+        configure(app);
+        const std::string cid("\x91\x92\x93\x94", 4);
+        ClientApp::QuicRouteCacheEntry entry;
+        entry.route_target.type = AddrType::Domain;
+        entry.route_target.host = "sniffed.example";
+        entry.route_target.port = 443;
+        entry.outbound = app.find_outbound("block-out");
+        entry.expires_at_ms = uv_now(app.loop()) + 1000;
+        app.quic_route_cache_[cid] = entry;
+        const uint64_t before = app.quic_route_cache_[cid].expires_at_ms;
+
+        ClientApp::UdpFlow flow;
+        const uint8_t short_header[] = {0x40, 0x91, 0x92, 0x93, 0x94, 0x00};
+        assert(app.inherit_tun_quic_route(flow, short_header, sizeof(short_header)));
+        assert(app.quic_route_cache_[cid].last_used_at_ms != 0);
+        assert(app.quic_route_cache_[cid].expires_at_ms > before);
+    }
+
+    static void network_change_keeps_live_quic_cache() {
+        ClientApp app;
+        configure(app);
+        const std::string cid("\x91\x92\x93\x94", 4);
+        ClientApp::QuicRouteCacheEntry entry;
+        entry.route_target.type = AddrType::Domain;
+        entry.route_target.host = "sniffed.example";
+        entry.route_target.port = 443;
+        entry.outbound = app.find_outbound("block-out");
+        entry.expires_at_ms = uv_now(app.loop()) + 60000;
+        app.quic_route_cache_[cid] = entry;
+        app.network_changed_on_loop();
+        assert(app.quic_route_cache_.find(cid) != app.quic_route_cache_.end());
+    }
+
     static void oversized_first_packet_falls_back_without_buffering() {
         ClientApp app;
         configure(app);
@@ -419,6 +475,9 @@ int main() {
     tx::ClientAppQuicTest::domain_udp_resolves_once_and_pins_peer();
     tx::ClientAppQuicTest::domain_route_and_ip_send_target_stay_separate();
     tx::ClientAppQuicTest::migrated_quic_short_header_inherits_cached_route();
+    tx::ClientAppQuicTest::ambiguous_short_header_falls_back_to_ip();
+    tx::ClientAppQuicTest::quic_cache_hit_refreshes_expiry();
+    tx::ClientAppQuicTest::network_change_keeps_live_quic_cache();
     tx::ClientAppQuicTest::oversized_first_packet_falls_back_without_buffering();
     tx::ClientAppQuicTest::flow_removal_releases_quic_resources();
     std::printf("client QUIC routing tests passed\n");

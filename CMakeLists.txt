@@ -64,7 +64,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Collect common sources
 file(GLOB COMMON_SOURCES src/common/*.cpp)
-file(GLOB NET_SOURCES src/net/*.cpp)
+file(GLOB NET_SOURCES CONFIGURE_DEPENDS src/net/*.cpp)
 file(GLOB LWIP_NET_SOURCES src/net/lwip/*.cpp)
 file(GLOB CRYPTO_SOURCES src/crypto/*.cpp)
 file(GLOB PROTOCOL_SOURCES src/protocol/*.cpp)

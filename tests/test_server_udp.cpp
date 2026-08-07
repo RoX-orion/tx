@@ -3,10 +3,64 @@
 #include <cassert>
 #include <cstdio>
 #include <memory>
+#include <vector>
+
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || defined(TX_PLATFORM_APPLE)
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace tx {
 
 struct ServerAppUdpTest {
+    static tx::TunnelTrafficKeys fixed_keys() {
+        tx::TunnelTrafficKeys keys;
+        keys.client_to_server_key.assign(tx::AeadCipher::kKeyLen, 0x11);
+        keys.server_to_client_key.assign(tx::AeadCipher::kKeyLen, 0x22);
+        keys.client_to_server_nonce_prefix = {0xa1, 0xa2, 0xa3, 0xa4};
+        keys.server_to_client_nonce_prefix = {0xb1, 0xb2, 0xb3, 0xb4};
+        return keys;
+    }
+
+    static void udp_backlog_drop_keeps_sequence() {
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || defined(TX_PLATFORM_APPLE)
+        ServerApp app;
+        auto client = std::make_shared<ServerApp::TunnelClient>();
+        const auto keys = fixed_keys();
+        client->codec = tx::TunnelCodec(keys, false);
+
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        client->session = std::make_shared<TcpSession>(app.loop());
+        assert(uv_tcp_open(client->session->handle(), sockets[0]) == 0);
+        std::vector<uint8_t> backlog(TcpSession::kDefaultWriteHardLimit - 1, 0);
+        assert(client->session->send(backlog.data(), backlog.size()));
+
+        TargetAddr target;
+        target.type = AddrType::IPv4;
+        target.host = "192.0.2.1";
+        target.port = 53;
+        const uint8_t payload[] = {1, 2, 3};
+        app.tunnel_send_udp_packet(client, 401, target, payload, sizeof(payload));
+
+        Buffer next;
+        const uint8_t next_payload[] = {4, 5, 6};
+        assert(client->codec.encode_udp_packet(401, target, next_payload,
+                                                sizeof(next_payload), next));
+        TunnelCodec peer(keys, true);
+        TunnelCmd cmd;
+        SessionId sid = 0;
+        TargetAddr decoded_target;
+        Buffer decoded_payload;
+        assert(peer.decode(next, cmd, sid, decoded_target, decoded_payload));
+        assert(sid == 401);
+
+        client->session->close();
+        uv_run(app.loop(), UV_RUN_DEFAULT);
+        close(sockets[1]);
+#endif
+    }
+
     static Buffer packet(const uint8_t value) {
         Buffer result;
         result.append(&value, 1);
@@ -49,6 +103,7 @@ struct ServerAppUdpTest {
 } // namespace tx
 
 int main() {
+    tx::ServerAppUdpTest::udp_backlog_drop_keeps_sequence();
     tx::ServerAppUdpTest::domain_udp_resolves_once_and_pins_peer();
     std::printf("server UDP tests passed\n");
     return 0;

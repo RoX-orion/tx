@@ -3,6 +3,7 @@
 #include "tx/net/udp_flow_timeout.h"
 
 #include "tx/common/network.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
@@ -17,6 +18,12 @@ constexpr size_t kMaxTunnelWriteBacklog = 16 * 1024 * 1024;
 constexpr size_t kMaxPendingTargetData = 4 * 1024 * 1024;
 constexpr size_t kMaxUdpResolutionPendingPackets = 1024;
 constexpr size_t kMaxUdpResolutionPendingBytes = 512 * 1024;
+constexpr size_t kMaxUdpPendingSendPacketsPerFlow = 1024;
+constexpr size_t kMaxUdpPendingSendBytesPerFlow = 1 * 1024 * 1024;
+constexpr size_t kMaxUdpPendingSendBytesPerClient = 8 * 1024 * 1024;
+constexpr size_t kMaxUdpPendingSendPacketsPerClient = 8192;
+constexpr size_t kMaxUdpPendingSendBytes = 256 * 1024 * 1024;
+constexpr size_t kMaxUdpPendingSendPackets = 262144;
 constexpr size_t kMaxDnsQueriesPerClient = 64;
 constexpr size_t kMaxDnsQuerySize = 65535;
 
@@ -52,7 +59,12 @@ void drain_and_close_loop(uv_loop_t* loop) {
 struct UdpSendReq {
     uv_udp_send_t req;
     uv_buf_t buf;
-    char* data;
+    char* data = nullptr;
+    ServerApp* app = nullptr;
+    std::shared_ptr<void> client;
+    SessionId sid = 0;
+    uint64_t generation = 0;
+    size_t len = 0;
 };
 
 TargetAddr sockaddr_to_target(const sockaddr* addr) {
@@ -527,14 +539,65 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
     }
     TX_INFO("CONNECT session %u → %s:%u", sid, target.host.c_str(), target.port);
 
-    auto remote = std::make_shared<TcpSession>(loop_);
     TunnelClient::Outbound ob;
-    ob.remote_session = remote;
     ob.session_id = sid;
     ob.generation = client->next_tcp_generation++;
     ob.connected = false;
     const uint64_t generation = ob.generation;
     client->outbounds.emplace(sid, std::move(ob));
+
+    std::shared_ptr<std::vector<std::string>> addresses;
+    if (target.type == AddrType::IPv4 || target.type == AddrType::IPv6) {
+        addresses = std::make_shared<std::vector<std::string>>();
+        addresses->push_back(target.host);
+    } else if (target.type == AddrType::Domain) {
+        auto* resolve_ctx = new TcpResolveCtx;
+        resolve_ctx->app = this;
+        resolve_ctx->client = client;
+        resolve_ctx->sid = sid;
+        resolve_ctx->generation = generation;
+        resolve_ctx->target = target;
+        auto* req = new uv_getaddrinfo_t;
+        req->data = resolve_ctx;
+        const int status = uv_getaddrinfo(loop_, req, ServerApp::on_tcp_resolved,
+                                          target.host.c_str(), nullptr, nullptr);
+        if (status != 0) {
+            delete resolve_ctx;
+            delete req;
+            TX_WARN("Failed to resolve TCP target %s: %s",
+                    target.host.c_str(), uv_strerror(status));
+            tunnel_send_connect_result(client, sid, false);
+            client->outbounds.erase(sid);
+        }
+        return;
+    } else {
+        tunnel_send_connect_result(client, sid, false);
+        client->outbounds.erase(sid);
+        return;
+    }
+
+    connect_tcp_candidates(client, sid, generation, target, addresses, 0);
+}
+
+void ServerApp::connect_tcp_candidates(
+    TunnelClientPtr client, SessionId sid, uint64_t generation,
+    const TargetAddr& target, std::shared_ptr<std::vector<std::string>> addresses,
+    size_t index) {
+    if (!client) return;
+    auto it = client->outbounds.find(sid);
+    if (client->closed || it == client->outbounds.end() ||
+        it->second.generation != generation || !addresses) {
+        return;
+    }
+    if (index >= addresses->size()) {
+        TX_ERROR("Failed to connect to every resolved address for session %u", sid);
+        tunnel_send_connect_result(client, sid, false);
+        client->outbounds.erase(it);
+        return;
+    }
+
+    auto remote = std::make_shared<TcpSession>(loop_);
+    it->second.remote_session = remote;
 
     // Use weak_ptr to avoid capturing remote in its own close callback
     std::weak_ptr<TcpSession> weak_remote = remote;
@@ -548,6 +611,7 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
             it->second.remote_session.get() == weak_remote.lock().get()) {
             tunnel_send_disconnect(client, sid);
             client->outbounds.erase(it);
+            resume_inbound_read_if_possible(client);
         }
     });
     remote->set_eof_callback([this, client, sid, generation, weak_remote](SessionPtr) {
@@ -569,8 +633,9 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
         }
     });
 
-    remote->connect(target.host, target.port, config_.connect_timeout_ms,
-        [this, client, sid, generation, remote, target, weak_remote](bool success) {
+    remote->connect((*addresses)[index], target.port, config_.connect_timeout_ms,
+        [this, client, sid, generation, remote, target, addresses, index,
+         weak_remote](bool success) {
             auto it = client->outbounds.find(sid);
             const bool current = it != client->outbounds.end() &&
                 it->second.generation == generation && it->second.remote_session == remote;
@@ -579,15 +644,22 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
                 return;
             }
             if (!success) {
-                TX_ERROR("Failed to connect to target for session %u: %s:%u",
-                         sid, target.host.c_str(), target.port);
-                tunnel_send_connect_result(client, sid, false);
-                client->outbounds.erase(it);
+                TX_WARN("Failed to connect to candidate %s for session %u",
+                        (*addresses)[index].c_str(), sid);
+                remote->set_close_callback(nullptr);
+                it->second.remote_session.reset();
+                if (index + 1 < addresses->size()) {
+                    connect_tcp_candidates(client, sid, generation, target,
+                                           addresses, index + 1);
+                } else {
+                    tunnel_send_connect_result(client, sid, false);
+                    client->outbounds.erase(it);
+                }
                 return;
             }
 
             TX_INFO("Connected to target for session %u: %s:%u",
-                    sid, target.host.c_str(), target.port);
+                    sid, (*addresses)[index].c_str(), target.port);
 
             // Mark as connected and flush pending data
             it->second.connected = true;
@@ -723,7 +795,8 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
             payload.clear();
             return;
         }
-        send_udp_datagram(udp_outbound_socket(it->second, addr.ss_family), addr,
+        send_udp_datagram(client, sid, it->second,
+                          udp_outbound_socket(it->second, addr.ss_family), addr,
                           payload.data(), payload.readable());
     } else if (target.type == AddrType::Domain) {
         if (it->second.peer_ready) {
@@ -736,7 +809,8 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
                 return;
             }
             uv_udp_t* udp = udp_outbound_socket(it->second, it->second.peer.ss_family);
-            if (udp) send_udp_datagram(udp, it->second.peer, payload.data(), payload.readable());
+            if (udp) send_udp_datagram(client, sid, it->second, udp, it->second.peer,
+                                       payload.data(), payload.readable());
             payload.clear();
             return;
         }
@@ -913,17 +987,61 @@ bool ServerApp::queue_udp_resolution_packet(TunnelClient::UdpOutbound& outbound,
     return true;
 }
 
-bool ServerApp::send_udp_datagram(uv_udp_t* udp, const sockaddr_storage& target,
-                                  const uint8_t* data, size_t len) {
-    if (!udp || !data || len == 0) return false;
-    auto* wr = new UdpSendReq;
-    wr->data = new char[len];
+bool ServerApp::send_udp_datagram(TunnelClientPtr client, SessionId sid,
+                                  TunnelClient::UdpOutbound& outbound, uv_udp_t* udp,
+                                  const sockaddr_storage& target, const uint8_t* data,
+                                  size_t len) {
+    if (!client || client->closed || !udp || !data || len == 0) return false;
+    const size_t socket_queue_bytes = uv_udp_get_send_queue_size(udp);
+    const size_t socket_queue_count = uv_udp_get_send_queue_count(udp);
+    if (len > kMaxUdpPendingSendBytesPerFlow ||
+        outbound.pending_send_bytes > kMaxUdpPendingSendBytesPerFlow - len ||
+        outbound.pending_send_count >= kMaxUdpPendingSendPacketsPerFlow ||
+        len > kMaxUdpPendingSendBytesPerClient ||
+        client->pending_udp_send_bytes > kMaxUdpPendingSendBytesPerClient - len ||
+        client->pending_udp_send_count >= kMaxUdpPendingSendPacketsPerClient ||
+        len > kMaxUdpPendingSendBytes ||
+        pending_udp_send_bytes_ > kMaxUdpPendingSendBytes - len ||
+        pending_udp_send_count_ >= kMaxUdpPendingSendPackets ||
+        socket_queue_bytes > kMaxUdpPendingSendBytesPerFlow - len ||
+        socket_queue_count >= kMaxUdpPendingSendPacketsPerFlow) {
+        TX_WARN("Dropping UDP datagram: send queue limit reached sid=%u bytes=%zu "
+                "flow_pending=%zu client_pending=%zu server_pending=%zu",
+                sid, len, outbound.pending_send_bytes,
+                client->pending_udp_send_bytes, pending_udp_send_bytes_);
+        return false;
+    }
+
+    UdpSendReq* wr = nullptr;
+    try {
+        wr = new UdpSendReq;
+        wr->app = this;
+        wr->client = client;
+        wr->sid = sid;
+        wr->generation = outbound.generation;
+        wr->len = len;
+        wr->data = new char[len];
+    } catch (const std::exception& e) {
+        TX_WARN("Dropping UDP datagram because allocation failed: %s", e.what());
+        if (wr) delete wr;
+        return false;
+    } catch (...) {
+        TX_WARN("Dropping UDP datagram because allocation failed");
+        if (wr) delete wr;
+        return false;
+    }
     memcpy(wr->data, data, len);
     wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
     const int status = uv_udp_send(&wr->req, udp, &wr->buf, 1,
                                    reinterpret_cast<const sockaddr*>(&target),
                                    ServerApp::on_udp_send_done);
     if (status == 0) {
+        ++outbound.pending_send_count;
+        outbound.pending_send_bytes += len;
+        ++client->pending_udp_send_count;
+        client->pending_udp_send_bytes += len;
+        ++pending_udp_send_count_;
+        pending_udp_send_bytes_ += len;
         TX_DEBUG("[UDP-SERVER-SEND] bytes=%zu family=%s", len,
                  target.ss_family == AF_INET6 ? "IPv6" : "IPv4");
         return true;
@@ -953,6 +1071,7 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
         client->dns_queries.erase(dns_it);
         if (client->pending_dns_queries > 0) --client->pending_dns_queries;
     }
+    resume_inbound_read_if_possible(client);
 }
 
 void ServerApp::handle_half_close(TunnelClientPtr client, SessionId sid) {
@@ -965,25 +1084,41 @@ void ServerApp::handle_half_close(TunnelClientPtr client, SessionId sid) {
     }
 }
 
+bool ServerApp::send_tunnel_frame(TunnelClientPtr client, Buffer& encoded,
+                                  const char* frame_name) {
+    if (!client || !client->session || client->session->is_closed() || encoded.empty()) {
+        return false;
+    }
+    const size_t len = encoded.readable();
+    const size_t pending = client->session->pending_write_bytes();
+    if (len > kMaxTunnelWriteBacklog || pending > kMaxTunnelWriteBacklog - len) {
+        TX_ERROR("Tunnel write backlog too large for %s: pending=%zu frame=%zu limit=%zu",
+                 frame_name ? frame_name : "frame", pending, len,
+                 kMaxTunnelWriteBacklog);
+        client->session->close();
+        return false;
+    }
+    if (!client->session->send(encoded)) {
+        TX_WARN("Failed to send %s of %zu bytes to tunnel", frame_name ? frame_name : "frame",
+                len);
+        if (!client->session->is_closed()) {
+            client->session->close();
+        }
+        return false;
+    }
+    if (client->session->pending_write_bytes() > kTunnelPauseWriteBacklog) {
+        pause_outbound_reads(client);
+    }
+    return true;
+}
+
 void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
                                    const uint8_t* data, size_t len) {
-    if (!client->session || client->session->is_closed()) return;
-
-    if (client->session->pending_write_bytes() > kMaxTunnelWriteBacklog) {
-        TX_ERROR("Tunnel write backlog too large (%zu bytes), closing tunnel",
-                 client->session->pending_write_bytes());
-        client->session->close();
-        return;
-    }
+    if (!client || !client->session || client->session->is_closed()) return;
 
     Buffer encoded;
     if (client->codec.encode_data_chunks(sid, data, len, encoded)) {
-        if (!client->session->send(encoded)) {
-            TX_ERROR("Failed to send %zu encoded bytes to tunnel for session %u",
-                     encoded.readable(), sid);
-        } else if (client->session->pending_write_bytes() > kTunnelPauseWriteBacklog) {
-            pause_outbound_reads(client);
-        }
+        send_tunnel_frame(client, encoded, "TCP data");
     } else {
         TX_ERROR("Failed to encode %zu bytes for tunnel session %u", len, sid);
     }
@@ -992,13 +1127,25 @@ void ServerApp::tunnel_send_data(TunnelClientPtr client, SessionId sid,
 void ServerApp::tunnel_send_udp_packet(TunnelClientPtr client, SessionId sid,
                                        const TargetAddr& target,
                                        const uint8_t* data, size_t len) {
-    if (!client->session || client->session->is_closed()) return;
+    if (!client || !client->session || client->session->is_closed()) return;
+
+    size_t frame_size = 0;
+    if (!TunnelCodec::encoded_frame_size(TunnelCmd::UdpPacket, target, len, frame_size)) {
+        TX_WARN("Dropping UDP packet for session %u: frame is too large", sid);
+        return;
+    }
+    const size_t pending = client->session->pending_write_bytes();
+    if (frame_size > kMaxTunnelWriteBacklog ||
+        pending > kMaxTunnelWriteBacklog - frame_size) {
+        TX_WARN("Dropping UDP packet because tunnel write backlog reached %zu bytes", pending);
+        return;
+    }
 
     Buffer encoded;
     if (client->codec.encode_udp_packet(sid, target, data, len, encoded)) {
-        if (!client->session->send(encoded)) {
-            TX_ERROR("Failed to send UDP packet to tunnel for session %u", sid);
-        }
+        // The backlog check must happen before encoding: encode() consumes the
+        // per-direction AEAD sequence number.
+        send_tunnel_frame(client, encoded, "UDP packet");
     }
 }
 
@@ -1010,35 +1157,29 @@ void ServerApp::tunnel_send_dns_response(TunnelClientPtr client, SessionId sid,
         TX_ERROR("Failed to encode DNS response for session %u", sid);
         return;
     }
-    if (!client->session->send(encoded)) {
-        TX_ERROR("Failed to send DNS response for session %u", sid);
-    }
+    send_tunnel_frame(client, encoded, "DNS response");
 }
 
 void ServerApp::tunnel_send_disconnect(TunnelClientPtr client, SessionId sid) {
-    if (!client->session || client->session->is_closed()) return;
+    if (!client || !client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_disconnect(sid, encoded)) {
-        if (!client->session->send(encoded)) {
-            TX_ERROR("Failed to send DISCONNECT for session %u", sid);
-        }
+        send_tunnel_frame(client, encoded, "DISCONNECT");
     } else {
         TX_ERROR("Failed to encode DISCONNECT for session %u", sid);
     }
 }
 
 void ServerApp::tunnel_send_half_close(TunnelClientPtr client, SessionId sid) {
-    if (!client->session || client->session->is_closed()) return;
+    if (!client || !client->session || client->session->is_closed()) return;
     Buffer encoded;
-    if (client->codec.encode_half_close(sid, encoded) &&
-        !client->session->send(encoded)) {
-        TX_ERROR("Failed to send HALF_CLOSE for session %u", sid);
-    }
+    if (client->codec.encode_half_close(sid, encoded))
+        send_tunnel_frame(client, encoded, "HALF_CLOSE");
 }
 
 void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid,
                                              bool success) {
-    if (!client->session || client->session->is_closed()) return;
+    if (!client || !client->session || client->session->is_closed()) return;
     Buffer encoded;
     if (client->codec.encode_connect_result(sid, success, encoded)) {
         if (success) {
@@ -1046,9 +1187,7 @@ void ServerApp::tunnel_send_connect_result(TunnelClientPtr client, SessionId sid
         } else {
             TX_WARN("CONNECT_RESULT session %u → failure", sid);
         }
-        if (!client->session->send(encoded)) {
-            TX_ERROR("Failed to send CONNECT_RESULT for session %u", sid);
-        }
+        send_tunnel_frame(client, encoded, "CONNECT_RESULT");
     } else {
         TX_ERROR("Failed to encode CONNECT_RESULT for session %u", sid);
     }
@@ -1112,6 +1251,22 @@ void ServerApp::resume_outbound_reads(TunnelClientPtr client) {
              client->session->pending_write_bytes());
 }
 
+void ServerApp::resume_inbound_read_if_possible(TunnelClientPtr client) {
+    if (!client || !client->inbound_paused || !client->session ||
+        client->session->is_closed()) {
+        return;
+    }
+    for (const auto& item : client->outbounds) {
+        const auto& outbound = item.second;
+        if (outbound.remote_session && !outbound.remote_session->is_closed() &&
+            outbound.remote_session->pending_write_bytes() >= kTunnelPauseWriteBacklog) {
+            return;
+        }
+    }
+    client->inbound_paused = false;
+    client->session->resume_read();
+}
+
 void ServerApp::udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     auto* data = static_cast<char*>(malloc(suggested_size));
     *buf = uv_buf_init(data, static_cast<unsigned int>(suggested_size));
@@ -1152,6 +1307,56 @@ void ServerApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
                                      static_cast<size_t>(nread));
 }
 
+void ServerApp::on_tcp_resolved(uv_getaddrinfo_t* req, int status,
+                                struct addrinfo* res) {
+    auto* ctx = static_cast<TcpResolveCtx*>(req ? req->data : nullptr);
+    std::shared_ptr<std::vector<std::string>> addresses;
+    if (status == 0 && res && ctx && ctx->app && ctx->client && !ctx->client->closed) {
+        auto v4 = std::make_shared<std::vector<std::string>>();
+        auto v6 = std::make_shared<std::vector<std::string>>();
+        for (const auto* ai = res; ai; ai = ai->ai_next) {
+            if (!ai->ai_addr || (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)) {
+                continue;
+            }
+            char host[INET6_ADDRSTRLEN] = {};
+            std::vector<std::string>* target_list = nullptr;
+            if (ai->ai_family == AF_INET) {
+                const auto* address = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+                if (!inet_ntop(AF_INET, &address->sin_addr, host, sizeof(host))) continue;
+                target_list = v4.get();
+            } else {
+                const auto* address = reinterpret_cast<const sockaddr_in6*>(ai->ai_addr);
+                if (!inet_ntop(AF_INET6, &address->sin6_addr, host, sizeof(host))) continue;
+                target_list = v6.get();
+            }
+            if (std::find(target_list->begin(), target_list->end(), host) == target_list->end()) {
+                target_list->emplace_back(host);
+            }
+        }
+        addresses = std::make_shared<std::vector<std::string>>();
+        addresses->insert(addresses->end(), v4->begin(), v4->end());
+        addresses->insert(addresses->end(), v6->begin(), v6->end());
+    }
+
+    if (res) uv_freeaddrinfo(res);
+    if (ctx && ctx->app && ctx->client && !ctx->client->closed && addresses &&
+        !addresses->empty()) {
+        ctx->app->connect_tcp_candidates(ctx->client, ctx->sid, ctx->generation,
+                                         ctx->target, addresses, 0);
+    } else if (ctx && ctx->app && ctx->client && !ctx->client->closed) {
+        TX_WARN("TCP DNS lookup failed for %s: %s", ctx->target.host.c_str(),
+                status < 0 ? uv_strerror(status) : "no addresses");
+        auto it = ctx->client->outbounds.find(ctx->sid);
+        if (it != ctx->client->outbounds.end() &&
+            it->second.generation == ctx->generation) {
+            ctx->app->tunnel_send_connect_result(ctx->client, ctx->sid, false);
+            ctx->client->outbounds.erase(it);
+        }
+    }
+    delete ctx;
+    delete req;
+}
+
 void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
     auto* ctx = static_cast<UdpResolveCtx*>(req->data);
     if (status == 0 && res && ctx && ctx->app && ctx->client && !ctx->client->closed) {
@@ -1161,16 +1366,26 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
             it->second.resolution_target.host == ctx->target.host &&
             it->second.resolution_target.port == ctx->target.port) {
             it->second.last_activity_ms = uv_now(ctx->app->loop_);
-            const struct addrinfo* selected = nullptr;
+            std::vector<const struct addrinfo*> candidates4;
+            std::vector<const struct addrinfo*> candidates6;
             for (auto* ai = res; ai; ai = ai->ai_next) {
                 if (ai->ai_family == AF_INET) {
-                    selected = ai;
-                    break;
-                }
-                if (!selected && ai->ai_family == AF_INET6) {
-                    selected = ai;
+                    candidates4.push_back(ai);
+                } else if (ai->ai_family == AF_INET6) {
+                    candidates6.push_back(ai);
                 }
             }
+            std::vector<const struct addrinfo*> candidates;
+            candidates.reserve(candidates4.size() + candidates6.size());
+            candidates.insert(candidates.end(), candidates4.begin(), candidates4.end());
+            candidates.insert(candidates.end(), candidates6.begin(), candidates6.end());
+            // UDP has no connect handshake that can reliably distinguish a
+            // black-holed peer from ordinary loss.  Keep the selected peer
+            // pinned for this flow, but rotate the initial candidate for a
+            // newly-created flow so repeated flow creation can escape a bad
+            // first DNS answer without migrating a live QUIC flow.
+            const struct addrinfo* selected = candidates.empty()
+                ? nullptr : candidates[it->second.generation % candidates.size()];
 
             sockaddr_storage addr;
             memset(&addr, 0, sizeof(addr));
@@ -1213,7 +1428,8 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
             pending.swap(it->second.pending_resolution_packets);
             it->second.pending_resolution_bytes = 0;
             for (const auto& packet : pending) {
-                ctx->app->send_udp_datagram(udp, addr, packet.data(), packet.size());
+                ctx->app->send_udp_datagram(ctx->client, ctx->sid, it->second,
+                                            udp, addr, packet.data(), packet.size());
             }
         }
     } else if (ctx && ctx->client && !ctx->client->closed) {
@@ -1236,6 +1452,37 @@ void ServerApp::on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrin
 
 void ServerApp::on_udp_send_done(uv_udp_send_t* req, int status) {
     auto* wr = reinterpret_cast<UdpSendReq*>(req);
+    if (!wr) return;
+    if (wr && wr->app && wr->client) {
+        auto client = std::static_pointer_cast<TunnelClient>(wr->client);
+        if (client->pending_udp_send_count > 0) --client->pending_udp_send_count;
+        if (client->pending_udp_send_bytes >= wr->len) {
+            client->pending_udp_send_bytes -= wr->len;
+        } else {
+            client->pending_udp_send_bytes = 0;
+        }
+        auto it = client->udp_outbounds.find(wr->sid);
+        if (it != client->udp_outbounds.end() &&
+            it->second.generation == wr->generation) {
+            if (it->second.pending_send_count > 0) --it->second.pending_send_count;
+            if (it->second.pending_send_bytes >= wr->len) {
+                it->second.pending_send_bytes -= wr->len;
+            } else {
+                it->second.pending_send_bytes = 0;
+            }
+        }
+        if (wr->app->pending_udp_send_count_ > 0) {
+            --wr->app->pending_udp_send_count_;
+        }
+        if (wr->app->pending_udp_send_bytes_ >= wr->len) {
+            wr->app->pending_udp_send_bytes_ -= wr->len;
+        } else {
+            wr->app->pending_udp_send_bytes_ = 0;
+        }
+    }
+    if (status < 0 && status != UV_ECANCELED) {
+        TX_DEBUG("UDP send completed with error: %s", uv_strerror(status));
+    }
     delete[] wr->data;
     delete wr;
 }

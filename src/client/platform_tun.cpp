@@ -323,15 +323,56 @@ private:
         const std::string priority = std::to_string(policy_priority_);
         const std::string catch_priority = std::to_string(policy_priority_ + 1);
         const std::string mark = std::to_string(policy_mark_);
-        run_ip({"rule", "del", "priority", priority, "fwmark", mark, "lookup", "main"});
-        run_ip({"rule", "del", "priority", catch_priority, "lookup", table});
+        bool need_ipv4 = false;
+        bool need_ipv6 = false;
+        for (const auto& route : routes) {
+            if (route.find(':') != std::string::npos) need_ipv6 = true;
+            else need_ipv4 = true;
+        }
+        if (need_ipv4) {
+            run_ip({"-4", "rule", "del", "priority", priority, "fwmark", mark,
+                    "lookup", "main"});
+            run_ip({"-4", "rule", "del", "priority", catch_priority,
+                    "lookup", table});
+        }
+        if (need_ipv6) {
+            run_ip({"-6", "rule", "del", "priority", priority, "fwmark", mark,
+                    "lookup", "main"});
+            run_ip({"-6", "rule", "del", "priority", catch_priority,
+                    "lookup", table});
+        }
         policy_installed_ = true;
-        if (!run_ip({"rule", "add", "priority", priority, "fwmark", mark,
-                     "lookup", "main"}) ||
-            !run_ip({"rule", "add", "priority", catch_priority, "lookup", table})) {
-            error = "failed to install Linux TUN policy rules";
-            remove_policy_routes();
-            return false;
+        policy_ipv4_rules_installed_ = false;
+        policy_ipv6_rules_installed_ = false;
+        if (need_ipv4) {
+            if (!run_ip({"-4", "rule", "add", "priority", priority, "fwmark", mark,
+                         "lookup", "main"})) {
+                error = "failed to install Linux IPv4 TUN policy rules";
+                remove_policy_routes();
+                return false;
+            }
+            policy_ipv4_rules_installed_ = true;
+            if (!run_ip({"-4", "rule", "add", "priority", catch_priority,
+                         "lookup", table})) {
+                error = "failed to install Linux IPv4 TUN policy rules";
+                remove_policy_routes();
+                return false;
+            }
+        }
+        if (need_ipv6) {
+            if (!run_ip({"-6", "rule", "add", "priority", priority, "fwmark", mark,
+                         "lookup", "main"})) {
+                error = "failed to install Linux IPv6 TUN policy rules";
+                remove_policy_routes();
+                return false;
+            }
+            policy_ipv6_rules_installed_ = true;
+            if (!run_ip({"-6", "rule", "add", "priority", catch_priority,
+                         "lookup", table})) {
+                error = "failed to install Linux IPv6 TUN policy rules";
+                remove_policy_routes();
+                return false;
+            }
         }
         for (const auto& route : routes) {
             const bool ipv6 = route.find(':') != std::string::npos;
@@ -355,11 +396,21 @@ private:
             run_ip({ipv6 ? "-6" : "-4", "route", "del", "table", table,
                     route, "dev", name_});
         }
-        run_ip({"rule", "del", "priority", std::to_string(policy_priority_),
-                "fwmark", std::to_string(policy_mark_), "lookup", "main"});
-        run_ip({"rule", "del", "priority", std::to_string(policy_priority_ + 1),
-                "lookup", table});
+        if (policy_ipv4_rules_installed_) {
+            run_ip({"-4", "rule", "del", "priority", std::to_string(policy_priority_),
+                    "fwmark", std::to_string(policy_mark_), "lookup", "main"});
+            run_ip({"-4", "rule", "del", "priority", std::to_string(policy_priority_ + 1),
+                    "lookup", table});
+        }
+        if (policy_ipv6_rules_installed_) {
+            run_ip({"-6", "rule", "del", "priority", std::to_string(policy_priority_),
+                    "fwmark", std::to_string(policy_mark_), "lookup", "main"});
+            run_ip({"-6", "rule", "del", "priority", std::to_string(policy_priority_ + 1),
+                    "lookup", table});
+        }
         policy_routes_.clear();
+        policy_ipv4_rules_installed_ = false;
+        policy_ipv6_rules_installed_ = false;
         policy_installed_ = false;
     }
 #endif
@@ -373,6 +424,8 @@ private:
     uint32_t policy_priority_ = 10000;
     uint32_t policy_mark_ = 0x2024;
     std::vector<std::string> policy_routes_;
+    bool policy_ipv4_rules_installed_ = false;
+    bool policy_ipv6_rules_installed_ = false;
 #endif
 };
 
@@ -506,7 +559,7 @@ public:
 
     void close() override {
         stop_reader();
-        TcpSession::set_outbound_interfaces(0, 0);
+        socket_policy_ = OutboundSocketPolicy();
         for (const auto& route : installed_routes_) {
             DeleteIpForwardEntry2(&route);
         }
@@ -530,6 +583,9 @@ public:
     }
 
     const std::string& name() const override { return name_; }
+    OutboundSocketPolicy outbound_socket_policy() const override {
+        return socket_policy_;
+    }
 
     bool start_async_reader(uv_loop_t* loop, std::function<void()> callback,
                             std::string& error) override {
@@ -617,7 +673,8 @@ private:
         InetPtonA(AF_INET6, "2001:4860:4860::8888", &destination6.sin6_addr);
         DWORD ipv6 = 0;
         GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination6), &ipv6);
-        TcpSession::set_outbound_interfaces(ipv4, ipv6);
+        socket_policy_.ipv4_interface = ipv4;
+        socket_policy_.ipv6_interface = ipv6;
     }
 
     void reader_loop() {
@@ -725,6 +782,7 @@ private:
     WINTUN_SESSION_HANDLE session_ = nullptr;
     NET_LUID luid_{};
     std::string name_;
+    OutboundSocketPolicy socket_policy_;
 
     WintunCreateAdapterFn create_adapter_ = nullptr;
     WintunCloseAdapterFn close_adapter_ = nullptr;

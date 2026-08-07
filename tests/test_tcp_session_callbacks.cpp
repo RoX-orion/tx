@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || defined(TX_PLATFORM_APPLE)
 #include <sys/socket.h>
@@ -103,6 +104,18 @@ static void test_unlistened_server_closes_its_handle() {
     uv_run(&loop, UV_RUN_DEFAULT);
     assert(uv_loop_close(&loop) == 0);
 }
+
+static void test_write_hard_limit_rejects_before_allocation() {
+    uv_loop_t loop;
+    assert(uv_loop_init(&loop) == 0);
+    auto session = std::make_shared<TcpSession>(&loop);
+    std::vector<uint8_t> oversized(TcpSession::kDefaultWriteHardLimit + 1, 0);
+    assert(!session->send(oversized.data(), oversized.size()));
+    session->close();
+    uv_run(&loop, UV_RUN_DEFAULT);
+    session.reset();
+    assert(uv_loop_close(&loop) == 0);
+}
 #endif
 
 int main() {
@@ -134,6 +147,7 @@ int main() {
     assert(uv_loop_close(&loop) == 0);
     test_half_close_flushes_pending_response();
     test_unlistened_server_closes_its_handle();
+    test_write_hard_limit_rejects_before_allocation();
 #endif
 
     std::printf("tcp session callback lifecycle tests passed\n");

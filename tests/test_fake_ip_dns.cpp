@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -22,11 +23,21 @@ static std::vector<uint8_t> query(uint16_t type, const char* label = "example") 
     return q;
 }
 
+static void assert_question_preserved(const std::vector<uint8_t>& query,
+                                      const std::vector<uint8_t>& response,
+                                      size_t question_end) {
+    assert(question_end >= 12 && question_end <= query.size());
+    assert(response.size() >= question_end);
+    assert(std::memcmp(response.data() + 12, query.data() + 12,
+                       question_end - 12) == 0);
+}
+
 int main() {
     tx::FakeIpDns dns;
     std::vector<uint8_t> response;
     auto a = query(1);
     assert(dns.respond(a.data(), a.size(), response));
+    assert_question_preserved(a, response, a.size());
     assert(tx::load_be16(response.data()) == 0x1234);
     assert((tx::load_be16(response.data() + 2) & 0x0080) != 0);
     assert((tx::load_be16(response.data() + 2) & 0x0400) == 0);
@@ -45,14 +56,27 @@ int main() {
     assert(!dns.contains_address("203.0.113.42"));
 
     assert(std::string(address) == "198.18.0.4");
+    assert(tx::load_be16(response.data() + a.size()) == 0xc00c);
+    assert(tx::load_be32(response.data() + a.size() + 6) == 60);
 
     auto aaaa = query(28);
     assert(dns.respond(aaaa.data(), aaaa.size(), response));
+    assert_question_preserved(aaaa, response, aaaa.size());
     assert(tx::load_be16(response.data() + 6) == 1);
 
     auto https = query(65);
     assert(dns.respond(https.data(), https.size(), response));
+    assert_question_preserved(https, response, https.size());
     assert(tx::load_be16(response.data() + 6) == 0);
+
+    auto with_opt = query(1, "Example");
+    const size_t question_end = with_opt.size();
+    tx::store_be16(with_opt.data() + 10, 1);
+    with_opt.insert(with_opt.end(), {0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0});
+    assert(dns.respond(with_opt.data(), with_opt.size(), response));
+    assert_question_preserved(with_opt, response, question_end);
+    assert(tx::load_be16(response.data() + 10) == 0);
+
     auto txt = query(16);
     assert(!dns.respond(txt.data(), txt.size(), response));
 

@@ -22,11 +22,18 @@ using EofCallback = std::function<void(SessionPtr session)>;
 using SessionErrorCallback = std::function<void(SessionPtr session, int error)>;
 using SocketProtectCallback = std::function<bool(int fd)>;
 
+struct OutboundSocketPolicy {
+    uint32_t mark = 0;
+    uint32_t ipv4_interface = 0;
+    uint32_t ipv6_interface = 0;
+};
+
 // A single TCP connection session
 class TcpSession : public TcpStream, public std::enable_shared_from_this<TcpSession> {
 public:
     explicit TcpSession(uv_loop_t* loop,
-                        SocketProtectCallback socket_protector = SocketProtectCallback());
+                        SocketProtectCallback socket_protector = SocketProtectCallback(),
+                        OutboundSocketPolicy socket_policy = OutboundSocketPolicy());
     ~TcpSession();
 
     // Initialize from an accepted handle
@@ -77,9 +84,10 @@ public:
     bool local_addr(std::string& host, uint16_t& port) const;
     size_t pending_write_bytes() const override { return pending_write_bytes_; }
 
-    static void set_outbound_mark(uint32_t mark);
-    static void set_outbound_interfaces(uint32_t ipv4_index, uint32_t ipv6_index);
-    static uint32_t outbound_interface(int family);
+    // Final memory-safety limit for libuv write requests.  Callers may apply
+    // a lower protocol-specific limit, but send() never queues beyond this
+    // bound.
+    static constexpr size_t kDefaultWriteHardLimit = 16 * 1024 * 1024;
 
 private:
     static void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
@@ -110,8 +118,10 @@ private:
     size_t       pending_write_bytes_;
     size_t       write_high_watermark_;
     size_t       write_low_watermark_;
+    size_t       write_hard_limit_;
     bool         paused_for_write_;
     SocketProtectCallback socket_protector_;
+    OutboundSocketPolicy socket_policy_;
     uint64_t     socket_sequence_;
 
     struct WriteReq {

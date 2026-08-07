@@ -220,6 +220,36 @@ TunnelCodec::TunnelCodec(const TunnelTrafficKeys& keys, bool client_side)
     recv_cipher_ = std::make_shared<AeadCipher>(keys.cipher, recv_key.data(), recv_key.size());
 }
 
+bool TunnelCodec::encoded_frame_size(TunnelCmd cmd, const TargetAddr& target,
+                                     size_t payload_len, size_t& out_size) {
+    if (payload_len > kMaxPlaintextSize) return false;
+
+    size_t message_size = kDataHeaderSize;
+    if (cmd == TunnelCmd::Connect || cmd == TunnelCmd::UdpPacket) {
+        size_t address_size = 0;
+        switch (target.type) {
+            case AddrType::IPv4:
+                address_size = 1 + 4 + 2; // type + address + port
+                break;
+            case AddrType::IPv6:
+                address_size = 1 + 16 + 2;
+                break;
+            case AddrType::Domain:
+                address_size = 1 + 1 + std::min<size_t>(target.host.size(), 255) + 2;
+                break;
+            default:
+                return false;
+        }
+        if (message_size > kMaxPlaintextSize - address_size) return false;
+        message_size += address_size;
+    }
+    if (message_size > kMaxPlaintextSize - payload_len) return false;
+    message_size += payload_len;
+
+    out_size = kLenPrefixSize + message_size + AeadCipher::kOverhead;
+    return true;
+}
+
 size_t TunnelCodec::build_message(TunnelCmd cmd, SessionId session_id,
                                    const TargetAddr* target,
                                    const uint8_t* payload, size_t payload_len,
@@ -310,6 +340,12 @@ bool TunnelCodec::encode(TunnelCmd cmd, SessionId session_id,
     }
     if (payload_len > kMaxPlaintextSize) {
         TX_ERROR("Tunnel payload too large: %zu bytes", payload_len);
+        return false;
+    }
+
+    size_t expected_frame_size = 0;
+    if (!encoded_frame_size(cmd, target, payload_len, expected_frame_size)) {
+        TX_ERROR("Tunnel message is too large for command %u", static_cast<unsigned>(cmd));
         return false;
     }
 

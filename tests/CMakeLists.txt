@@ -69,3 +69,16 @@ target_sources(test_client_udp_mux PRIVATE
     ../src/client/config.cpp
     ../src/client/platform_tun.cpp)
 target_include_directories(test_client_udp_mux PRIVATE ../src/client)
+
+tx_add_test(tx_api)
+target_sources(test_tx_api PRIVATE
+    ../src/lib/tx_api.cpp
+    ../src/client/client_app.cpp
+    ../src/client/config.cpp
+    ../src/client/platform_tun.cpp
+    ../src/server/server_app.cpp
+    ../src/server/config.cpp)
+target_include_directories(test_tx_api PRIVATE
+    ../src/lib
+    ../src/client
+    ../src/server)

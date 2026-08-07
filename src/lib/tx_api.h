@@ -5,6 +5,9 @@
 
 #ifdef __cplusplus
 extern "C" {
+#define TX_C_NOEXCEPT noexcept
+#else
+#define TX_C_NOEXCEPT
 #endif
 
 #ifdef _WIN32
@@ -82,11 +85,11 @@ typedef struct {
 } tx_traffic_stats_t;
 
 // Start the client. Returns handle or NULL on failure.
-TX_API tx_handle_t tx_client_start(const tx_client_config_t* config);
+TX_API tx_handle_t tx_client_start(const tx_client_config_t* config) TX_C_NOEXCEPT;
 
 // Start the client with a VpnService TUN fd. Native code takes ownership even
 // when startup fails and closes it before this client is stopped.
-TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd);
+TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) TX_C_NOEXCEPT;
 
 // Start the Android client with a physical-network bind + VPN-exemption callback.
 // TX endpoint and direct DNS use the selected physical Network. TX-routed DNS
@@ -96,7 +99,7 @@ TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config,
 // protect_user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
                                            tx_socket_protect_fn protect_fn,
-                                           void* protect_user_data);
+                                           void* protect_user_data) TX_C_NOEXCEPT;
 
 // Versioned Android network integration. protect_socket is used for every
 // outbound socket. resolve_host/query_dns provide physical-Network DNS for TX
@@ -104,32 +107,35 @@ TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int
 // tunnel and the server's system resolver.
 // hooks->user_data must remain valid until tx_client_stop() returns.
 TX_API tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
-                                              const tx_android_network_hooks_t* hooks);
+                                              const tx_android_network_hooks_t* hooks) TX_C_NOEXCEPT;
 
 // Cancel work tied to the previous Android Network and close existing outbound
 // sockets. Applications reconnect while fake-IP mappings remain intact.
-TX_API void tx_client_notify_network_changed(tx_handle_t handle);
+TX_API void tx_client_notify_network_changed(tx_handle_t handle) TX_C_NOEXCEPT;
 
 // Update the selected Android Network's usable IP families, then close work
 // tied to the previous network state. See TX_ANDROID_NETWORK_FAMILY_*.
 TX_API void tx_client_update_android_network_state(tx_handle_t handle,
-                                                   unsigned int address_family_mask);
+                                                   unsigned int address_family_mask) TX_C_NOEXCEPT;
 
 // Stop the client.
-TX_API void tx_client_stop(tx_handle_t handle);
+TX_API void tx_client_stop(tx_handle_t handle) TX_C_NOEXCEPT;
 
 // Get cumulative client traffic counters. Returns 0 on success, -1 on failure.
-TX_API int tx_client_get_traffic_stats(tx_handle_t handle, tx_traffic_stats_t* stats);
+TX_API int tx_client_get_traffic_stats(tx_handle_t handle,
+                                       tx_traffic_stats_t* stats) TX_C_NOEXCEPT;
 
 // Start the server. Returns handle or NULL on failure.
-TX_API tx_handle_t tx_server_start(const tx_server_config_t* config);
+TX_API tx_handle_t tx_server_start(const tx_server_config_t* config) TX_C_NOEXCEPT;
 
 // Stop the server.
-TX_API void tx_server_stop(tx_handle_t handle);
+TX_API void tx_server_stop(tx_handle_t handle) TX_C_NOEXCEPT;
 
 // Get version string.
-TX_API const char* tx_version(void);
+TX_API const char* tx_version(void) TX_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }
 #endif
+
+#undef TX_C_NOEXCEPT

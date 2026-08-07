@@ -50,6 +50,8 @@ private:
         uint64_t         next_tcp_generation = 1;
         uint64_t         next_udp_generation = 1;
         uint32_t         pending_dns_queries = 0;
+        size_t           pending_udp_send_bytes = 0;
+        size_t           pending_udp_send_count = 0;
 
         // Outbound connections by session ID
         struct Outbound {
@@ -71,6 +73,8 @@ private:
             socklen_t peer_len = 0;
             bool peer_ready = false;
             bool resolving = false;
+            size_t pending_send_bytes = 0;
+            size_t pending_send_count = 0;
             TargetAddr resolution_target;
             std::deque<std::vector<uint8_t>> pending_resolution_packets;
             size_t pending_resolution_bytes = 0;
@@ -95,6 +99,13 @@ private:
         uint64_t generation;
         TargetAddr target;
     };
+    struct TcpResolveCtx {
+        ServerApp* app;
+        TunnelClientPtr client;
+        SessionId sid;
+        uint64_t generation;
+        TargetAddr target;
+    };
     struct HandshakeTimerCtx {
         ServerApp* app;
         TunnelClientPtr client;
@@ -107,6 +118,10 @@ private:
 
     // Handle decoded tunnel message
     void handle_connect(TunnelClientPtr client, SessionId sid, const TargetAddr& target);
+    void connect_tcp_candidates(TunnelClientPtr client, SessionId sid,
+                                uint64_t generation, const TargetAddr& target,
+                                std::shared_ptr<std::vector<std::string>> addresses,
+                                size_t index);
     void handle_data(TunnelClientPtr client, SessionId sid, Buffer& payload);
     void handle_udp_packet(TunnelClientPtr client, SessionId sid,
                            const TargetAddr& target, Buffer& payload);
@@ -117,8 +132,10 @@ private:
     void close_udp_outbound(TunnelClient::UdpOutbound& outbound);
     bool queue_udp_resolution_packet(TunnelClient::UdpOutbound& outbound,
                                      const uint8_t* data, size_t len);
-    bool send_udp_datagram(uv_udp_t* udp, const sockaddr_storage& target,
-                           const uint8_t* data, size_t len);
+    bool send_udp_datagram(TunnelClientPtr client, SessionId sid,
+                           TunnelClient::UdpOutbound& outbound, uv_udp_t* udp,
+                           const sockaddr_storage& target, const uint8_t* data,
+                           size_t len);
     void handle_disconnect(TunnelClientPtr client, SessionId sid);
     void handle_half_close(TunnelClientPtr client, SessionId sid);
     bool start_udp_cleanup_timer();
@@ -139,12 +156,16 @@ private:
     void tunnel_send_disconnect(TunnelClientPtr client, SessionId sid);
     void tunnel_send_half_close(TunnelClientPtr client, SessionId sid);
     void tunnel_send_connect_result(TunnelClientPtr client, SessionId sid, bool success);
+    bool send_tunnel_frame(TunnelClientPtr client, Buffer& encoded,
+                           const char* frame_name);
     void pause_outbound_reads(TunnelClientPtr client);
     void resume_outbound_reads(TunnelClientPtr client);
+    void resume_inbound_read_if_possible(TunnelClientPtr client);
     static void udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
     static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
                             const struct sockaddr* addr, unsigned flags);
     static void on_udp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
+    static void on_tcp_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo* res);
     static void on_udp_send_done(uv_udp_send_t* req, int status);
     static void on_udp_closed(uv_handle_t* handle);
     static void on_udp_cleanup_timer(uv_timer_t* timer);
@@ -170,6 +191,8 @@ private:
     // Active tunnel clients
     std::unordered_map<uv_tcp_t*, TunnelClientPtr> clients_;
     std::unordered_map<std::string, uint32_t> unauthenticated_by_ip_;
+    size_t pending_udp_send_bytes_ = 0;
+    size_t pending_udp_send_count_ = 0;
     uint64_t new_client_window_started_ms_ = 0;
     uint32_t new_client_window_count_ = 0;
 };

@@ -424,6 +424,48 @@ static void test_chacha20_poly1305_tunnel_round_trip() {
     printf("OK\n");
 }
 
+static void test_encoded_frame_size_preflight() {
+    printf("  test_encoded_frame_size_preflight... ");
+    auto encoder = make_client_codec();
+    const uint8_t payload[] = {1, 2, 3, 4, 5};
+
+    tx::TargetAddr targets[3];
+    targets[0].type = tx::AddrType::IPv4;
+    targets[0].host = "192.0.2.1";
+    targets[0].port = 53;
+    targets[1].type = tx::AddrType::IPv6;
+    targets[1].host = "2001:db8::1";
+    targets[1].port = 53;
+    targets[2].type = tx::AddrType::Domain;
+    targets[2].host = "resolver.example";
+    targets[2].port = 53;
+
+    for (const auto& target : targets) {
+        size_t expected = 0;
+        TX_ASSERT(tx::TunnelCodec::encoded_frame_size(
+            tx::TunnelCmd::UdpPacket, target, sizeof(payload), expected));
+        tx::Buffer encoded;
+        TX_ASSERT(encoder.encode_udp_packet(7, target, payload, sizeof(payload), encoded));
+        TX_ASSERT(encoded.readable() == expected);
+    }
+
+    tx::TargetAddr dummy;
+    size_t dns_expected = 0;
+    TX_ASSERT(tx::TunnelCodec::encoded_frame_size(
+        tx::TunnelCmd::DnsQuery, dummy, sizeof(payload), dns_expected));
+    tx::Buffer dns;
+    TX_ASSERT(encoder.encode(tx::TunnelCmd::DnsQuery, 8, dummy,
+                             payload, sizeof(payload), dns));
+    TX_ASSERT(dns.readable() == dns_expected);
+
+    tx::TargetAddr long_domain = targets[2];
+    long_domain.host.assign(255, 'a');
+    TX_ASSERT(!tx::TunnelCodec::encoded_frame_size(
+        tx::TunnelCmd::UdpPacket, long_domain,
+        tx::TunnelCodec::kMaxDataPayloadSize, dns_expected));
+    printf("OK\n");
+}
+
 int main() {
     printf("=== Tunnel Tests ===\n");
     test_handshake_round_trip();
@@ -438,6 +480,7 @@ int main() {
     test_protocol_error_for_invalid_frame_length();
     test_tampered_frame_is_discarded();
     test_chacha20_poly1305_tunnel_round_trip();
+    test_encoded_frame_size_preflight();
     printf("All tunnel tests passed!\n");
     return 0;
 }

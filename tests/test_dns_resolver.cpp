@@ -1,10 +1,13 @@
 #include "tx/net/dns_resolver.h"
+#include "tx/net/dns_network_provider.h"
+#include "tx/common/endian.h"
 
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,7 +40,50 @@ std::vector<uint8_t> make_response(const std::vector<uint8_t>& query,
     return response;
 }
 
+std::vector<uint8_t> make_a_response(const std::vector<uint8_t>& query,
+                                     uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    std::vector<uint8_t> response = make_response(query);
+    tx::store_be16(response.data() + 6, 1);
+    const uint8_t answer[] = {
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, a, b, c, d,
+    };
+    response.insert(response.end(), answer, answer + sizeof(answer));
+    return response;
+}
+
 #if defined(__linux__)
+bool is_loopback(const std::string& address) {
+    in_addr address4{};
+    if (inet_pton(AF_INET, address.c_str(), &address4) == 1)
+        return (ntohl(address4.s_addr) >> 24) == 127;
+    in6_addr address6{};
+    return inet_pton(AF_INET6, address.c_str(), &address6) == 1 &&
+           IN6_IS_ADDR_LOOPBACK(&address6);
+}
+
+void test_platform_dns_provider_policy() {
+    auto ordinary = tx::create_platform_dns_network_provider(0, false);
+    assert(ordinary);
+    const tx::DnsNetworkSnapshot ordinary_snapshot = ordinary->snapshot();
+    assert(ordinary_snapshot.available == !ordinary_snapshot.endpoints.empty());
+    for (const auto& endpoint : ordinary_snapshot.endpoints) {
+        assert(endpoint.port == 53);
+        if (is_loopback(endpoint.address)) {
+            // Local stubs must use the kernel's normal loopback route, not a
+            // physical interface binding intended for TUN bypass traffic.
+            assert(ordinary_snapshot.socket_binding.mark == 0);
+            assert(ordinary_snapshot.socket_binding.interface_name.empty());
+        }
+    }
+
+    auto physical = tx::create_platform_dns_network_provider(0, true);
+    assert(physical);
+    const tx::DnsNetworkSnapshot physical_snapshot = physical->snapshot();
+    for (const auto& endpoint : physical_snapshot.endpoints)
+        assert(!is_loopback(endpoint.address));
+}
+
 struct LocalDnsPair {
     int tcp = -1;
     int udp = -1;
@@ -84,7 +130,8 @@ void serve_tcp_without_response(int listener, int hold_ms) {
 std::vector<uint8_t> resolve_once(
     LocalDnsPair pair,
     const std::function<void(int, const std::vector<uint8_t>&)>& udp_server,
-    int tcp_hold_ms, long long* elapsed_ms = nullptr) {
+    int tcp_hold_ms, long long* elapsed_ms = nullptr,
+    std::shared_ptr<tx::DnsNetworkProvider> network_provider = nullptr) {
     const std::vector<uint8_t> query = make_query();
     std::thread udp_thread([pair, query, udp_server]() {
         udp_server(pair.udp, query);
@@ -95,9 +142,16 @@ std::vector<uint8_t> resolve_once(
     uv_loop_t loop;
     assert(uv_loop_init(&loop) == 0);
     tx::DnsResolver resolver(&loop);
-    resolver.configure(
-        {"127.0.0.1:" + std::to_string(pair.port)},
-        tx::DnsResolver::ProtectCallback(), 0);
+    if (network_provider) {
+        resolver.configure({}, tx::DnsResolver::ProtectCallback(), 0,
+                           tx::DnsResolver::HostResolveHook(),
+                           tx::DnsResolver::QueryHook(),
+                           tx::DnsResolver::AsyncQueryHook(), network_provider);
+    } else {
+        resolver.configure(
+            {"127.0.0.1:" + std::to_string(pair.port)},
+            tx::DnsResolver::ProtectCallback(), 0);
+    }
 
     std::vector<uint8_t> result;
     const auto started = std::chrono::steady_clock::now();
@@ -113,6 +167,25 @@ std::vector<uint8_t> resolve_once(
     tcp_thread.join();
     return result;
 }
+
+class StaticDnsNetworkProvider final : public tx::DnsNetworkProvider {
+public:
+    explicit StaticDnsNetworkProvider(uint16_t port) : port_(port) {}
+
+    tx::DnsNetworkSnapshot snapshot() const override {
+        tx::DnsNetworkSnapshot result;
+        result.available = true;
+        result.endpoints.push_back(tx::DnsEndpoint{"127.0.0.1", port_});
+        return result;
+    }
+
+    void invalidate() override { ++invalidations_; }
+    unsigned invalidations() const { return invalidations_; }
+
+private:
+    uint16_t port_;
+    unsigned invalidations_ = 0;
+};
 
 void test_first_success_and_validation() {
     long long elapsed_ms = 0;
@@ -180,8 +253,57 @@ void test_first_success_and_validation() {
         },
         0);
     assert(authenticated == make_response(query));
+
+    auto provider_pair = open_local_dns_pair();
+    auto provider = std::make_shared<StaticDnsNetworkProvider>(provider_pair.port);
+    auto provided = resolve_once(
+        provider_pair,
+        [](int udp, const std::vector<uint8_t>& received_query) {
+            sockaddr_storage peer{};
+            socklen_t peer_len = sizeof(peer);
+            uint8_t buffer[512];
+            assert(recvfrom(udp, buffer, sizeof(buffer), 0,
+                            reinterpret_cast<sockaddr*>(&peer), &peer_len) > 0);
+            const auto response = make_response(received_query);
+            assert(sendto(udp, response.data(), response.size(), 0,
+                          reinterpret_cast<sockaddr*>(&peer), peer_len) ==
+                   static_cast<ssize_t>(response.size()));
+        },
+        0, nullptr, provider);
+    assert(provided == make_response(query));
 }
 #endif
+
+void test_address_filter() {
+    uv_loop_t loop;
+    assert(uv_loop_init(&loop) == 0);
+    tx::DnsResolver resolver(&loop);
+    const auto query = make_query();
+    resolver.configure({}, tx::DnsResolver::ProtectCallback(), 0,
+        tx::DnsResolver::HostResolveHook(),
+        [&](const uint8_t* request, size_t length) {
+            assert(length == query.size());
+            return make_a_response(std::vector<uint8_t>(request, request + length),
+                                   198, 18, 0, 6);
+        },
+        tx::DnsResolver::AsyncQueryHook(), nullptr,
+        [](const std::string& address) { return address == "198.18.0.6"; });
+
+    bool response_done = false;
+    resolver.resolve(query.data(), query.size(), [&](std::vector<uint8_t> response) {
+        assert(response.empty());
+        response_done = true;
+    });
+    bool numeric_done = false;
+    resolver.resolve_host("198.18.0.6", AF_UNSPEC,
+        [&](std::vector<std::string> addresses) {
+            assert(addresses.empty());
+            numeric_done = true;
+        });
+    uv_run(&loop, UV_RUN_DEFAULT);
+    assert(response_done && numeric_done);
+    assert(uv_loop_close(&loop) == 0);
+}
 
 } // namespace
 
@@ -251,7 +373,9 @@ int main() {
     assert(uv_loop_close(&loop) == 0);
 #if defined(__linux__)
     test_first_success_and_validation();
+    test_platform_dns_provider_policy();
 #endif
+    test_address_filter();
     std::printf("dns resolver hook tests passed\n");
     return 0;
 }

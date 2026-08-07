@@ -68,12 +68,14 @@ public:
 private:
     friend struct ClientAppDnsTest;
     friend struct ClientAppUdpMuxTest;
+    friend struct ClientAppTcpTest;
     friend struct ClientAppQuicTest;
     friend struct ClientAppNetworkTest;
 
     struct TunnelTimerCtx;
     struct DirectUdpRelay;
     struct UdpTunnelRetryCtx;
+    struct UdpTunnelHandshakeCtx;
 
     // ---- Proxy connection handling ----
 
@@ -106,6 +108,7 @@ private:
         bool                 local_half_close_sent = false;
         bool                 remote_eof = false;
         bool                 local_paused_for_tunnel = false;
+        bool                 local_paused_for_connect = false;
         bool                 tunnel_paused_for_local = false;
         bool                 admitted = false;
     };
@@ -188,6 +191,7 @@ private:
         bool connected = false;
         bool connecting = false;
         uv_timer_t* retry_timer = nullptr;
+        uv_timer_t* handshake_timer = nullptr;
         uint32_t retry_delay_ms = 0;
         std::deque<PendingUdpPacket> pending;
         size_t pending_bytes = 0;
@@ -207,6 +211,7 @@ private:
         TargetAddr route_target;
         const OutboundConfig* outbound = nullptr;
         uint64_t expires_at_ms = 0;
+        uint64_t last_used_at_ms = 0;
     };
 
     // Accept handlers for HTTP and SOCKS5 listeners
@@ -242,6 +247,8 @@ private:
     void finish_tunnel_handshake(ProxyConnPtr conn,
                                  const TunnelTrafficKeys& keys);
     void tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len);
+    bool append_lwip_tcp_data(ProxyConnPtr conn, Buffer& data);
+    void release_local_read(ProxyConnPtr conn);
     void tunnel_send_connect(ProxyConnPtr conn);
     void tunnel_send_disconnect(ProxyConnPtr conn);
     void tunnel_send_half_close(ProxyConnPtr conn);
@@ -257,6 +264,7 @@ private:
 
     // Routing is decided from the original host. Domain resolution occurs only
     // after a direct outbound has been selected.
+    bool normalize_fake_ip_target(TargetAddr& target, const char* context);
     void resolve_and_route(ProxyConnPtr conn);
 
     void record_traffic(RouteAction route, bool upload, size_t bytes);
@@ -312,8 +320,12 @@ private:
     void close_all_udp_tunnels();
     void schedule_udp_tunnel_retry(const UdpTunnelPtr& tunnel);
     void cancel_udp_tunnel_retry(const UdpTunnelPtr& tunnel);
+    bool start_udp_tunnel_handshake_timer(const UdpTunnelPtr& tunnel);
+    void cancel_udp_tunnel_handshake_timer(const UdpTunnelPtr& tunnel);
     static void on_udp_tunnel_retry(uv_timer_t* timer);
     static void on_udp_tunnel_retry_closed(uv_handle_t* handle);
+    static void on_udp_tunnel_handshake_timeout(uv_timer_t* timer);
+    static void on_udp_tunnel_handshake_timer_closed(uv_handle_t* handle);
     static void on_udp_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
     static void on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
                             const struct sockaddr* addr, unsigned flags);
@@ -431,6 +443,7 @@ private:
     std::atomic<uint64_t> proxy_download_bytes_;
     std::atomic<uint32_t> android_address_family_mask_;
     SocketProtectCallback socket_protector_;
+    OutboundSocketPolicy outbound_socket_policy_;
     DnsResolver::HostResolveHook host_resolver_;
     DnsResolver::QueryHook dns_query_;
 };

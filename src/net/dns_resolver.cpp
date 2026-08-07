@@ -31,12 +31,14 @@ namespace tx {
 struct DnsResolver::Request {
     uv_work_t work;
     std::vector<std::string> upstreams;
+    DnsSocketBinding static_socket_binding;
+    std::shared_ptr<DnsNetworkProvider> network_provider;
     ProtectCallback protector;
-    uint32_t mark = 0;
     std::vector<uint8_t> query;
     std::vector<uint8_t> response;
     ResolveCallback callback;
     QueryHook query_hook;
+    AddressFilterHook address_filter;
     uint64_t generation = 0;
     DnsResolver* owner = nullptr;
 };
@@ -46,6 +48,7 @@ struct DnsResolver::HostRequest {
     std::string host;
     int family = AF_UNSPEC;
     HostResolveHook resolver;
+    AddressFilterHook address_filter;
     std::vector<std::string> addresses;
     HostResolveCallback callback;
     uint64_t generation = 0;
@@ -143,6 +146,57 @@ std::vector<std::string> parse_host_response(const std::vector<uint8_t>& respons
     return addresses;
 }
 
+void filter_host_addresses(std::vector<std::string>& addresses,
+                           const DnsResolver::AddressFilterHook& filter) {
+    if (!filter) return;
+    addresses.erase(std::remove_if(addresses.begin(), addresses.end(),
+                                   [&filter](const std::string& address) {
+                                       return filter(address);
+                                   }),
+                    addresses.end());
+}
+
+bool response_contains_filtered_address(
+    const std::vector<uint8_t>& response,
+    const DnsResolver::AddressFilterHook& filter) {
+    if (!filter || response.size() < 12) return false;
+
+    size_t offset = 12;
+    const uint16_t questions = load_be16(response.data() + 4);
+    const uint32_t records = static_cast<uint32_t>(load_be16(response.data() + 6)) +
+                             static_cast<uint32_t>(load_be16(response.data() + 8)) +
+                             static_cast<uint32_t>(load_be16(response.data() + 10));
+    for (uint16_t i = 0; i < questions; ++i) {
+        if (!skip_dns_name(response.data(), response.size(), offset) ||
+            offset + 4 > response.size()) {
+            return false;
+        }
+        offset += 4;
+    }
+    for (uint32_t i = 0; i < records; ++i) {
+        if (!skip_dns_name(response.data(), response.size(), offset) ||
+            offset + 10 > response.size()) {
+            return false;
+        }
+        const uint16_t type = load_be16(response.data() + offset);
+        const uint16_t klass = load_be16(response.data() + offset + 2);
+        const uint16_t rdlength = load_be16(response.data() + offset + 8);
+        offset += 10;
+        if (offset + rdlength > response.size()) return false;
+        if (klass == 1 && ((type == 1 && rdlength == 4) ||
+                           (type == 28 && rdlength == 16))) {
+            char text[INET6_ADDRSTRLEN] = {};
+            const int family = type == 1 ? AF_INET : AF_INET6;
+            if (inet_ntop(family, response.data() + offset, text, sizeof(text)) &&
+                filter(text)) {
+                return true;
+            }
+        }
+        offset += rdlength;
+    }
+    return false;
+}
+
 } // namespace
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
@@ -197,19 +251,101 @@ void set_dns_socket_timeout(DnsSocket socket, int timeout_ms) {
 }
 #endif
 
-bool configure_socket(DnsSocket fd, const DnsResolver::ProtectCallback& protector,
-                      uint32_t mark) {
+bool configure_socket(DnsSocket fd, int family,
+                      const DnsResolver::ProtectCallback& protector,
+                      const DnsSocketBinding& binding) {
     if (protector && !protector(static_cast<int>(fd))) {
         TX_ERROR("Socket protector rejected DNS socket");
         return false;
     }
 #if defined(TX_PLATFORM_LINUX)
-    if (mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0)
+    if (binding.mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &binding.mark,
+                                   sizeof(binding.mark)) != 0) {
+        TX_WARN("SO_MARK 0x%x failed for DNS socket: %s", binding.mark,
+                std::strerror(errno));
         return false;
+    }
+    if (!binding.interface_name.empty() &&
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, binding.interface_name.c_str(),
+                   static_cast<socklen_t>(binding.interface_name.size() + 1)) != 0) {
+        // An unmarked resolver may still be used by a normal proxy process
+        // without CAP_NET_RAW. The marked TUN path must fail closed because
+        // continuing would reintroduce the DNS/TUN loop.
+        if (binding.mark != 0) {
+            TX_WARN("SO_BINDTODEVICE(%s) failed for DNS socket: %s",
+                    binding.interface_name.c_str(), std::strerror(errno));
+            return false;
+        }
+        TX_DEBUG("SO_BINDTODEVICE(%s) unavailable; using normal DNS routing",
+                 binding.interface_name.c_str());
+    }
+#elif defined(TX_PLATFORM_WINDOWS)
+    const uint32_t interface_index = family == AF_INET6
+        ? binding.ipv6_interface : binding.ipv4_interface;
+    if (interface_index != 0) {
+        const DWORD network_index = htonl(interface_index);
+        const int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+        const int option = family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
+        if (setsockopt(fd, level, option,
+                       reinterpret_cast<const char*>(&network_index),
+                       sizeof(network_index)) != 0) {
+            TX_WARN("DNS interface binding failed for index %u: %d",
+                    interface_index, dns_socket_error());
+            return false;
+        }
+    }
 #else
-    (void)mark;
+    (void)family;
+    (void)binding;
 #endif
     set_dns_socket_timeout(fd, 2000);
+    return true;
+}
+
+bool parse_dns_port(const std::string& text, uint16_t& port) {
+    if (text.empty()) return false;
+    unsigned value = 0;
+    for (const unsigned char character : text) {
+        if (character < '0' || character > '9') return false;
+        value = value * 10u + static_cast<unsigned>(character - '0');
+        if (value > 65535u) return false;
+    }
+    if (value == 0) return false;
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
+bool parse_dns_endpoint(const std::string& text, DnsEndpoint& endpoint) {
+    if (text.empty()) return false;
+    endpoint = DnsEndpoint();
+    endpoint.port = 53;
+
+    if (text.front() == '[') {
+        const size_t closing = text.find(']');
+        if (closing == std::string::npos || closing == 1) return false;
+        endpoint.address = text.substr(1, closing - 1);
+        if (closing + 1 < text.size()) {
+            if (text[closing + 1] != ':' ||
+                !parse_dns_port(text.substr(closing + 2), endpoint.port)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // An unbracketed address with more than one colon is an IPv6 literal;
+    // its optional port must use the bracketed form.
+    const size_t first_colon = text.find(':');
+    if (first_colon != std::string::npos && first_colon == text.rfind(':')) {
+        endpoint.address = text.substr(0, first_colon);
+        if (endpoint.address.empty() ||
+            !parse_dns_port(text.substr(first_colon + 1), endpoint.port)) {
+            return false;
+        }
+        return true;
+    }
+
+    endpoint.address = text;
     return true;
 }
 
@@ -536,26 +672,32 @@ bool dns_response_matches_query(const std::vector<uint8_t>& query,
            query_questions == response_questions;
 }
 
-bool resolve_tcp(const std::string& upstream, const std::vector<uint8_t>& query,
-                 const DnsResolver::ProtectCallback& protector, uint32_t mark,
+bool resolve_tcp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
+                 const DnsResolver::ProtectCallback& protector,
+                 const DnsSocketBinding& binding,
                  std::vector<uint8_t>& response,
                  const std::atomic<bool>* cancelled) {
     if (operation_cancelled(cancelled)) return false;
     sockaddr_storage address{}; DnsSocklen address_len = 0;
-    if (!upstream_address(upstream, SOCK_STREAM, address, address_len)) {
-        TX_WARN("Invalid DNS upstream address %s", upstream.c_str());
+    const std::string upstream_text = upstream.address.find(':') != std::string::npos
+        ? "[" + upstream.address + "]:" + std::to_string(upstream.port)
+        : upstream.address + ":" + std::to_string(upstream.port);
+    if (!upstream_address(upstream_text, SOCK_STREAM, address, address_len)) {
+        TX_WARN("Invalid DNS upstream address %s", upstream_text.c_str());
         return false;
     }
     DnsSocket fd = socket(address.ss_family, SOCK_STREAM, 0);
     if (fd == kInvalidDnsSocket) {
-        TX_WARN("DNS TCP socket for %s failed: %d", upstream.c_str(), dns_socket_error());
+        TX_WARN("DNS TCP socket for %s failed: %d", upstream_text.c_str(),
+                dns_socket_error());
         return false;
     }
-    bool ok = configure_socket(fd, protector, mark);
+    bool ok = configure_socket(fd, address.ss_family, protector, binding);
     set_dns_socket_timeout(fd, 100);
     if (ok && !connect_with_timeout(fd, reinterpret_cast<sockaddr*>(&address),
                                     address_len, 1000, cancelled)) {
-        TX_DEBUG("DNS TCP connect to %s failed: %d", upstream.c_str(), dns_socket_error());
+        TX_DEBUG("DNS TCP connect to %s failed: %d", upstream_text.c_str(),
+                 dns_socket_error());
         ok = false;
     }
     uint8_t length[2]; store_be16(length, static_cast<uint16_t>(query.size()));
@@ -571,35 +713,43 @@ bool resolve_tcp(const std::string& upstream, const std::vector<uint8_t>& query,
     const int exchange_error = dns_socket_error();
     close_dns_socket(fd);
     if (ok && !dns_response_matches_query(query, response)) {
-        TX_DEBUG("DNS TCP response from %s did not match the query", upstream.c_str());
+        TX_DEBUG("DNS TCP response from %s did not match the query",
+                 upstream_text.c_str());
         ok = false;
     }
     if (!ok) {
-        TX_DEBUG("DNS TCP exchange with %s failed: %d", upstream.c_str(), exchange_error);
+        TX_DEBUG("DNS TCP exchange with %s failed: %d", upstream_text.c_str(),
+                 exchange_error);
         response.clear();
     }
     return ok;
 }
 
-bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
-                 const DnsResolver::ProtectCallback& protector, uint32_t mark,
+bool resolve_udp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
+                 const DnsResolver::ProtectCallback& protector,
+                 const DnsSocketBinding& binding,
                  std::vector<uint8_t>& response,
                  const std::atomic<bool>* cancelled) {
     if (operation_cancelled(cancelled)) return false;
     sockaddr_storage address{}; DnsSocklen address_len = 0;
-    if (!upstream_address(upstream, SOCK_DGRAM, address, address_len)) {
-        TX_WARN("Invalid DNS upstream address %s", upstream.c_str());
+    const std::string upstream_text = upstream.address.find(':') != std::string::npos
+        ? "[" + upstream.address + "]:" + std::to_string(upstream.port)
+        : upstream.address + ":" + std::to_string(upstream.port);
+    if (!upstream_address(upstream_text, SOCK_DGRAM, address, address_len)) {
+        TX_WARN("Invalid DNS upstream address %s", upstream_text.c_str());
         return false;
     }
     DnsSocket fd = socket(address.ss_family, SOCK_DGRAM, 0);
     if (fd == kInvalidDnsSocket) {
-        TX_WARN("DNS UDP socket for %s failed: %d", upstream.c_str(), dns_socket_error());
+        TX_WARN("DNS UDP socket for %s failed: %d", upstream_text.c_str(),
+                dns_socket_error());
         return false;
     }
-    bool ok = configure_socket(fd, protector, mark);
+    bool ok = configure_socket(fd, address.ss_family, protector, binding);
     set_dns_socket_timeout(fd, 100);
     if (ok && connect(fd, reinterpret_cast<sockaddr*>(&address), address_len) != 0) {
-        TX_DEBUG("DNS UDP connect to %s failed: %d", upstream.c_str(), dns_socket_error());
+        TX_DEBUG("DNS UDP connect to %s failed: %d", upstream_text.c_str(),
+                 dns_socket_error());
         ok = false;
     }
     if (ok) {
@@ -616,7 +766,7 @@ bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
         const ssize_t sent = send(fd, query.data(), query.size(), send_flags);
         ok = sent == static_cast<ssize_t>(query.size());
 #endif
-        if (!ok) TX_DEBUG("DNS UDP send to %s failed: %d", upstream.c_str(),
+        if (!ok) TX_DEBUG("DNS UDP send to %s failed: %d", upstream_text.c_str(),
                           dns_socket_error());
     }
     uint8_t buffer[65535];
@@ -640,17 +790,19 @@ bool resolve_udp(const std::string& upstream, const std::vector<uint8_t>& query,
     const int receive_error = dns_socket_error();
     close_dns_socket(fd);
     if (received < 12) {
-        TX_DEBUG("DNS UDP receive from %s failed: %d", upstream.c_str(), receive_error);
+        TX_DEBUG("DNS UDP receive from %s failed: %d", upstream_text.c_str(),
+                 receive_error);
         return false;
     }
     response.assign(buffer, buffer + received);
     if (!dns_response_matches_query(query, response)) {
-        TX_DEBUG("DNS UDP response from %s did not match the query", upstream.c_str());
+        TX_DEBUG("DNS UDP response from %s did not match the query",
+                 upstream_text.c_str());
         response.clear();
         return false;
     }
     if ((load_be16(response.data() + 2) & 0x0200u) != 0)
-        return resolve_tcp(upstream, query, protector, mark, response, cancelled);
+        return resolve_tcp(upstream, query, protector, binding, response, cancelled);
     return true;
 }
 
@@ -671,9 +823,11 @@ bool DnsResolver::response_is_truncated(const std::vector<uint8_t>& response) {
 void DnsResolver::configure(std::vector<std::string> upstreams,
                             ProtectCallback protector, uint32_t bypass_mark,
                             HostResolveHook host_resolver, QueryHook query_hook,
-                            AsyncQueryHook async_query_hook) {
+                            AsyncQueryHook async_query_hook,
+                            std::shared_ptr<DnsNetworkProvider> network_provider,
+                            AddressFilterHook address_filter) {
 #if !defined(TX_PLATFORM_WINDOWS)
-    if (upstreams.empty() && !query_hook && !async_query_hook) {
+    if (upstreams.empty() && !query_hook && !async_query_hook && !network_provider) {
         std::ifstream resolv("/etc/resolv.conf");
         std::string line;
         while (std::getline(resolv, line)) {
@@ -685,22 +839,25 @@ void DnsResolver::configure(std::vector<std::string> upstreams,
         }
     }
 #else
-    if (upstreams.empty() && !query_hook && !async_query_hook)
+    if (upstreams.empty() && !query_hook && !async_query_hook && !network_provider)
         upstreams = load_windows_dns_upstreams();
 #endif
     upstreams_ = std::move(upstreams);
     protector_ = std::move(protector);
-    bypass_mark_ = bypass_mark;
+    static_socket_binding_ = DnsSocketBinding();
+    static_socket_binding_.mark = bypass_mark;
     host_resolver_ = std::move(host_resolver);
     query_hook_ = std::move(query_hook);
     async_query_hook_ = std::move(async_query_hook);
+    network_provider_ = std::move(network_provider);
+    address_filter_ = std::move(address_filter);
 }
 
 void DnsResolver::resolve(const uint8_t* query, size_t query_len,
                           ResolveCallback callback) {
     if (!callback) return;
     if (!query || query_len < 12 || query_len > 65535 ||
-        (!async_query_hook_ && !query_hook_ && upstreams_.empty())) {
+        (!async_query_hook_ && !query_hook_ && !network_provider_ && upstreams_.empty())) {
         callback(std::vector<uint8_t>());
         return;
     }
@@ -710,7 +867,9 @@ void DnsResolver::resolve(const uint8_t* query, size_t query_len,
         auto complete = [this, generation, request, callback = std::move(callback)]
                         (std::vector<uint8_t> response) mutable {
             if (generation != generation_ ||
-                (!response.empty() && !dns_response_matches_query(request, response))) {
+                (!response.empty() &&
+                 (!dns_response_matches_query(request, response) ||
+                  response_contains_filtered_address(response, address_filter_)))) {
                 response.clear();
             }
             callback(std::move(response));
@@ -721,11 +880,13 @@ void DnsResolver::resolve(const uint8_t* query, size_t query_len,
     auto* request = new Request;
     request->work.data = request;
     request->upstreams = upstreams_;
+    request->static_socket_binding = static_socket_binding_;
+    request->network_provider = network_provider_;
     request->protector = protector_;
-    request->mark = bypass_mark_;
     request->query.assign(query, query + query_len);
     request->callback = std::move(callback);
     request->query_hook = query_hook_;
+    request->address_filter = address_filter_;
     request->generation = generation_;
     request->owner = this;
     if (uv_queue_work(loop_, &request->work, on_work, after_work) != 0) {
@@ -739,6 +900,11 @@ void DnsResolver::on_work(uv_work_t* work) {
     auto* request = static_cast<Request*>(work->data);
     if (request->query_hook) {
         request->response = request->query_hook(request->query.data(), request->query.size());
+        if (!request->response.empty() &&
+            response_contains_filtered_address(request->response, request->address_filter)) {
+            TX_WARN("Rejecting DNS response containing a protected Fake-IP address");
+            request->response.clear();
+        }
         return;
     }
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
@@ -746,16 +912,48 @@ void DnsResolver::on_work(uv_work_t* work) {
     // uv_queue_work already uses libuv's bounded worker pool. Do all upstream
     // attempts in that worker instead of spawning two native threads per DNS
     // request, which allowed a burst of queries to exhaust process resources.
-    for (const auto& upstream : request->upstreams) {
+    DnsNetworkSnapshot network;
+    if (request->network_provider) {
+        network = request->network_provider->snapshot();
+    } else {
+        network.available = !request->upstreams.empty();
+        network.socket_binding = request->static_socket_binding;
+        for (const auto& address : request->upstreams) {
+            DnsEndpoint endpoint;
+            if (parse_dns_endpoint(address, endpoint)) {
+                network.endpoints.push_back(std::move(endpoint));
+            } else {
+                TX_WARN("Invalid DNS upstream endpoint %s", address.c_str());
+            }
+        }
+    }
+    for (const auto& upstream : network.endpoints) {
+        if (request->address_filter && request->address_filter(upstream.address)) {
+            TX_WARN("Skipping protected Fake-IP DNS upstream %s", upstream.address.c_str());
+            continue;
+        }
         if (resolve_udp(upstream, request->query, request->protector,
-                        request->mark, request->response, nullptr) ||
-            resolve_tcp(upstream, request->query, request->protector,
-                        request->mark, request->response, nullptr)) {
+                        network.socket_binding, request->response, nullptr)) {
+            if (!response_contains_filtered_address(request->response,
+                                                     request->address_filter)) return;
+            TX_WARN("Rejecting DNS response from %s: protected Fake-IP address",
+                    upstream.address.c_str());
+            request->response.clear();
+        }
+        if (resolve_tcp(upstream, request->query, request->protector,
+                        network.socket_binding, request->response, nullptr)) {
+            if (!response_contains_filtered_address(request->response,
+                                                     request->address_filter)) return;
+            TX_WARN("Rejecting DNS TCP response from %s: protected Fake-IP address",
+                    upstream.address.c_str());
+            request->response.clear();
+        }
+        if (!request->response.empty()) {
             return;
         }
     }
     if (request->response.empty())
-        TX_WARN("All %zu DNS upstreams failed", request->upstreams.size());
+        TX_WARN("All %zu DNS upstreams failed", network.endpoints.size());
 #endif
 }
 
@@ -776,6 +974,11 @@ void DnsResolver::resolve_host(const std::string& host, int family,
     in6_addr address6{};
     if (inet_pton(AF_INET, host.c_str(), &address4) == 1 ||
         inet_pton(AF_INET6, host.c_str(), &address6) == 1) {
+        if (address_filter_ && address_filter_(host)) {
+            TX_WARN("Rejecting protected Fake-IP target %s", host.c_str());
+            callback(std::vector<std::string>());
+            return;
+        }
         callback(std::vector<std::string>{host});
         return;
     }
@@ -803,6 +1006,7 @@ void DnsResolver::resolve_host(const std::string& host, int family,
                     }
                     std::vector<std::string> addresses =
                         parse_host_response(response, family);
+                    filter_host_addresses(addresses, address_filter_);
                     if (!addresses.empty() || !fallback_ipv6) {
                         callback(std::move(addresses));
                         return;
@@ -818,7 +1022,10 @@ void DnsResolver::resolve_host(const std::string& host, int family,
                                 callback(std::vector<std::string>());
                                 return;
                             }
-                            callback(parse_host_response(response6, family));
+                            std::vector<std::string> addresses =
+                                parse_host_response(response6, family);
+                            filter_host_addresses(addresses, address_filter_);
+                            callback(std::move(addresses));
                         });
                 });
         };
@@ -835,6 +1042,7 @@ void DnsResolver::resolve_host(const std::string& host, int family,
     request->host = host;
     request->family = family;
     request->resolver = host_resolver_;
+    request->address_filter = address_filter_;
     request->callback = std::move(callback);
     request->generation = generation_;
     request->owner = this;
@@ -847,8 +1055,10 @@ void DnsResolver::resolve_host(const std::string& host, int family,
 
 void DnsResolver::on_host_work(uv_work_t* work) {
     auto* request = static_cast<HostRequest*>(work->data);
-    if (request->resolver)
+    if (request->resolver) {
         request->addresses = request->resolver(request->host, request->family);
+        filter_host_addresses(request->addresses, request->address_filter);
+    }
 }
 
 void DnsResolver::after_host_work(uv_work_t* work, int status) {
@@ -862,6 +1072,7 @@ void DnsResolver::after_host_work(uv_work_t* work, int status) {
 }
 
 void DnsResolver::cancel_pending() {
+    if (network_provider_) network_provider_->invalidate();
     ++generation_;
 }
 

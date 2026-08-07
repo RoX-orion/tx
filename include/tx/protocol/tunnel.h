@@ -70,6 +70,13 @@ public:
     TunnelCodec() = default;
     TunnelCodec(const TunnelTrafficKeys& keys, bool client_side);
 
+    // Return the exact wire size of one encrypted frame without consuming a
+    // send sequence number. Callers that enforce a write backlog must use
+    // this before encoding a droppable datagram; encoding itself advances the
+    // sequence number and therefore cannot be undone safely.
+    static bool encoded_frame_size(TunnelCmd cmd, const TargetAddr& target,
+                                   size_t payload_len, size_t& out_size);
+
     // Encode a tunnel message (plaintext) into encrypted frame
     // Returns encrypted frame: [len:4][ciphertext+tag]
     bool encode(TunnelCmd cmd, SessionId session_id,

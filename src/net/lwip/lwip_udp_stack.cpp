@@ -406,13 +406,6 @@ bool LwipUdpStack::initialize(const std::vector<std::string>& addresses, int mtu
         error = "lwIP TUN requires addresses and an MTU between 1 and 65535";
         return false;
     }
-    LwipUdpStack* expected = nullptr;
-    if (!g_active_lwip_stack.compare_exchange_strong(
-            expected, this, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        error = "only one native lwIP TUN instance can run in this process";
-        return false;
-    }
-    impl_->owns_global_stack = true;
     ip4_addr_t address;
     ip4_addr_set_zero(&address);
     ip4_addr_t netmask;
@@ -422,18 +415,47 @@ bool LwipUdpStack::initialize(const std::vector<std::string>& addresses, int mtu
     bool have_ipv4 = false;
     for (const auto& cidr : addresses) {
         const size_t slash = cidr.find('/');
-        if (slash == std::string::npos) { error = "TUN address must use CIDR notation"; return false; }
+        if (slash == std::string::npos || slash == 0 || slash + 1 >= cidr.size()) {
+            error = "TUN address must use CIDR notation";
+            return false;
+        }
         const std::string host = cidr.substr(0, slash);
-        if (host.find(':') == std::string::npos && !have_ipv4) {
-            char* end = nullptr;
-            long prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
-            if (!end || *end || prefix < 0 || prefix > 32 || !ip4addr_aton(host.c_str(), &address)) {
-                error = "invalid IPv4 TUN CIDR"; return false;
+        const std::string prefix_text = cidr.substr(slash + 1);
+        char* end = nullptr;
+        const long prefix = std::strtol(prefix_text.c_str(), &end, 10);
+        if (!end || end == prefix_text.c_str() || *end) {
+            error = "invalid TUN CIDR prefix";
+            return false;
+        }
+        if (host.find(':') == std::string::npos) {
+            ip4_addr_t parsed;
+            if (prefix < 0 || prefix > 32 || !ip4addr_aton(host.c_str(), &parsed)) {
+                error = "invalid IPv4 TUN CIDR";
+                return false;
             }
-            ip4_addr_set_u32(&netmask, lwip_htonl(prefix == 0 ? 0u : 0xffffffffu << (32 - prefix)));
-            have_ipv4 = true;
+            if (!have_ipv4) {
+                address = parsed;
+                ip4_addr_set_u32(&netmask, lwip_htonl(
+                    prefix == 0 ? 0u : 0xffffffffu << (32 - prefix)));
+                have_ipv4 = true;
+            }
+        } else {
+            ip6_addr_t parsed;
+            if (prefix < 0 || prefix > 128 || !ip6addr_aton(host.c_str(), &parsed)) {
+                error = "invalid IPv6 TUN CIDR";
+                return false;
+            }
         }
     }
+
+    LwipUdpStack* expected = nullptr;
+    if (!g_active_lwip_stack.compare_exchange_strong(
+            expected, this, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        error = "only one native lwIP TUN instance can run in this process";
+        return false;
+    }
+    impl_->owns_global_stack = true;
+
     std::call_once(g_lwip_init_once, [] { lwip_init(); });
     std::memset(&impl_->interface, 0, sizeof(impl_->interface));
     impl_->datagram_callback = std::move(datagram_callback);

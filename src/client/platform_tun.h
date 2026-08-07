@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "tx/net/tcp_server.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,9 @@ public:
     virtual void close() = 0;
     virtual int fd() const { return -1; }
     virtual const std::string& name() const = 0;
+    virtual OutboundSocketPolicy outbound_socket_policy() const {
+        return OutboundSocketPolicy();
+    }
     virtual std::ptrdiff_t read_packet(uint8_t* data, size_t len, std::string& error) = 0;
     virtual bool write_packet(const uint8_t* data, size_t len, std::string& error) = 0;
     virtual bool start_async_reader(uv_loop_t*, std::function<void()>, std::string& error) {

@@ -111,6 +111,23 @@ int main() {
     tx::ClientConfig unknown;
     assert(!load_text("unknown", config_json("surprise"), unknown));
 
+    tx::ClientConfig system_without_redirect;
+    assert(!load_text("system_without_redirect", std::string("{\n") +
+                     "  \"tun\": {\"enabled\": true, \"tcp_stack\": \"system\"},\n" +
+                     "  \"outbounds\": [{\"tag\":\"direct-out\",\"type\":\"direct\"}],\n" +
+                     "  \"routing\": {\"rules\": [{\"outboundTag\":\"direct-out\"}]}\n" +
+                     "}\n", system_without_redirect));
+
+#if defined(TX_PLATFORM_LINUX)
+    tx::ClientConfig system_with_redirect;
+    assert(load_text("system_with_redirect", std::string("{\n") +
+                     "  \"tun\": {\"enabled\": true, \"tcp_stack\": \"system\", "
+                     "\"auto_redirect\": true},\n" +
+                     "  \"outbounds\": [{\"tag\":\"direct-out\",\"type\":\"direct\"}],\n" +
+                     "  \"routing\": {\"rules\": [{\"outboundTag\":\"direct-out\"}]}\n" +
+                     "}\n", system_with_redirect));
+#endif
+
     // A failed reload must not leave callers with a partially parsed config.
     const std::string retained_tag = default_config.outbounds.front().tag;
     const std::string retained_rule = default_config.router.rules.front().outbound_tag;

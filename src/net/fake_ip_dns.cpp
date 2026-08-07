@@ -258,7 +258,7 @@ bool FakeIpDns::respond(const uint8_t* query, size_t query_len,
         response.resize(12);
         return true;
     }
-    response.resize(pos);
+    response.assign(query, query + pos);
     domain = lower(domain);
     const bool local_type = type == 1 || type == 28 || type == 64 || type == 65;
     if (klass == 1 && !local_type) {

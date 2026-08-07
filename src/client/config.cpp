@@ -163,6 +163,10 @@ bool ClientConfig::validate() const {
             TX_ERROR("tun.udp_stack must be lwip");
             return false;
         }
+        if (tun_tcp_stack == "system" && !tun_auto_redirect) {
+            TX_ERROR("tun.tcp_stack=system requires tun.auto_redirect=true");
+            return false;
+        }
         if (tun_tcp_stack == "lwip" && tun_auto_redirect) {
             TX_ERROR("tun.auto_redirect cannot be enabled with tcp_stack=lwip");
             return false;

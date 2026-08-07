@@ -21,16 +21,12 @@ namespace tx {
 
 namespace {
 
-uint32_t g_tcp_outbound_mark = 0;
-uint32_t g_outbound_ipv4_interface = 0;
-uint32_t g_outbound_ipv6_interface = 0;
 std::atomic<uint64_t> g_socket_sequence{0};
 
 #if defined(TX_PLATFORM_LINUX)
-bool set_outbound_mark(int fd) {
-    if (g_tcp_outbound_mark == 0) return true;
+bool set_outbound_mark(int fd, uint32_t mark) {
+    if (mark == 0) return true;
 
-    uint32_t mark = g_tcp_outbound_mark;
     if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) {
         TX_WARN("SO_MARK 0x%x failed: %s", mark, std::strerror(errno));
         return false;
@@ -41,8 +37,9 @@ bool set_outbound_mark(int fd) {
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
-                            const SocketProtectCallback& socket_protector) {
-    if (g_tcp_outbound_mark == 0 && !socket_protector) return true;
+                            const SocketProtectCallback& socket_protector,
+                            const OutboundSocketPolicy& socket_policy) {
+    if (socket_policy.mark == 0 && !socket_protector) return true;
 
     uv_os_fd_t fd;
     if (uv_fileno(reinterpret_cast<const uv_handle_t*>(tcp), &fd) == 0) {
@@ -52,7 +49,7 @@ bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
             return false;
         }
 #if defined(TX_PLATFORM_LINUX)
-        return set_outbound_mark(socket_fd);
+        return set_outbound_mark(socket_fd, socket_policy.mark);
 #else
         return true;
 #endif
@@ -70,7 +67,7 @@ bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
         return false;
     }
 #if defined(TX_PLATFORM_LINUX)
-    if (!set_outbound_mark(sock)) {
+    if (!set_outbound_mark(sock, socket_policy.mark)) {
         ::close(sock);
         return false;
     }
@@ -116,10 +113,11 @@ bool open_transparent_socket(uv_tcp_t* tcp, int family) {
 #endif
 #elif defined(TX_PLATFORM_WINDOWS)
 bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
-                            const SocketProtectCallback& socket_protector) {
+                            const SocketProtectCallback& socket_protector,
+                            const OutboundSocketPolicy& socket_policy) {
     if (socket_protector) return false;
-    uint32_t index = family == AF_INET6 ? g_outbound_ipv6_interface
-                                        : g_outbound_ipv4_interface;
+    uint32_t index = family == AF_INET6 ? socket_policy.ipv6_interface
+                                        : socket_policy.ipv4_interface;
     if (!index) return true;
     SOCKET socket_fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (socket_fd == INVALID_SOCKET) return false;
@@ -137,7 +135,8 @@ bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
 }
 #else
 bool ensure_outbound_socket(uv_tcp_t*, int,
-                            const SocketProtectCallback& socket_protector) {
+                            const SocketProtectCallback& socket_protector,
+                            const OutboundSocketPolicy&) {
     if (socket_protector) {
         TX_ERROR("Socket protection is not supported on this platform");
         return false;
@@ -168,14 +167,17 @@ struct ConnectCtx {
 
 // ==================== TcpSession ====================
 
-TcpSession::TcpSession(uv_loop_t* loop, SocketProtectCallback socket_protector)
+TcpSession::TcpSession(uv_loop_t* loop, SocketProtectCallback socket_protector,
+                       OutboundSocketPolicy socket_policy)
     : loop_(loop), closed_(false), reading_(false), read_eof_(false),
       write_shutdown_(false), shutdown_pending_(false), remote_port_(0),
       pending_write_bytes_(0),
       write_high_watermark_(4 * 1024 * 1024),
       write_low_watermark_(1024 * 1024),
+      write_hard_limit_(TcpSession::kDefaultWriteHardLimit),
       paused_for_write_(false),
       socket_protector_(std::move(socket_protector)),
+      socket_policy_(socket_policy),
       socket_sequence_(0) {
     uv_tcp_init(loop_, &tcp_);
     tcp_.data = this;
@@ -244,7 +246,8 @@ void TcpSession::connect(const std::string& host, uint16_t port, uint64_t timeou
         TX_DEBUG("TCP socket #%llu prepare family=%s target=%s:%u",
                  static_cast<unsigned long long>(socket_sequence_),
                  sa->sa_family == AF_INET6 ? "IPv6" : "IPv4", host.c_str(), port);
-        if (!ensure_outbound_socket(&tcp_, sa->sa_family, socket_protector_)) {
+        if (!ensure_outbound_socket(&tcp_, sa->sa_family, socket_protector_,
+                                    socket_policy_)) {
             TX_ERROR("TCP socket #%llu prepare failed for %s:%u",
                      static_cast<unsigned long long>(socket_sequence_), host.c_str(), port);
             cb(false);
@@ -360,30 +363,32 @@ bool TcpSession::local_addr(std::string& host, uint16_t& port) const {
     return true;
 }
 
-void TcpSession::set_outbound_mark(uint32_t mark) {
-    g_tcp_outbound_mark = mark;
-}
-
-void TcpSession::set_outbound_interfaces(uint32_t ipv4_index, uint32_t ipv6_index) {
-    g_outbound_ipv4_interface = ipv4_index;
-    g_outbound_ipv6_interface = ipv6_index;
-}
-
-uint32_t TcpSession::outbound_interface(int family) {
-    return family == AF_INET6 ? g_outbound_ipv6_interface
-                              : g_outbound_ipv4_interface;
-}
-
 bool TcpSession::send(const uint8_t* data, size_t len) {
-    if (closed_ || write_shutdown_ || shutdown_pending_ || len == 0) return false;
+    if (closed_ || write_shutdown_ || shutdown_pending_ || !data || len == 0) return false;
+    if (len > write_hard_limit_ ||
+        pending_write_bytes_ > write_hard_limit_ - len) {
+        TX_WARN("TCP write hard limit reached: pending=%zu requested=%zu limit=%zu",
+                pending_write_bytes_, len, write_hard_limit_);
+        return false;
+    }
 
-    auto* wr = new WriteReq;
-    wr->data = new char[len];
-    memcpy(wr->data, data, len);
-    wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
-    wr->len = len;
-    wr->session = shared_from_this();
-    wr->req.data = wr;
+    WriteReq* wr = nullptr;
+    try {
+        wr = new WriteReq{};
+        wr->data = new char[len];
+        memcpy(wr->data, data, len);
+        wr->buf = uv_buf_init(wr->data, static_cast<unsigned int>(len));
+        wr->len = len;
+        wr->session = shared_from_this();
+        wr->req.data = wr;
+    } catch (...) {
+        if (wr) {
+            delete[] wr->data;
+            delete wr;
+        }
+        TX_WARN("TCP write allocation failed for %zu bytes", len);
+        return false;
+    }
 
     int r = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&tcp_),
                       &wr->buf, 1, on_write_free);
@@ -690,7 +695,8 @@ void TcpSession::on_resolved(uv_getaddrinfo_t* req, int status, struct addrinfo*
 
     // Connect using resolved address
     if (!ensure_outbound_socket(&ctx->session->tcp_, sa->sa_family,
-                                ctx->session->socket_protector_)) {
+                                ctx->session->socket_protector_,
+                                ctx->session->socket_policy_)) {
         ctx->cb(false);
         if (!ctx->session->is_closed()) {
             ctx->session->close();

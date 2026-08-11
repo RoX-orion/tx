@@ -58,6 +58,16 @@ constexpr size_t kMaxQuicSniffActiveFlows = 256;
 constexpr size_t kMaxQuicSniffPendingBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxQuicRouteCacheEntries = 1024;
 
+bool append_tunnel_input(Buffer& destination, const Buffer& source) {
+    const size_t incoming = source.readable();
+    if (incoming > TunnelCodec::kMaxReceiveBufferSize ||
+        destination.readable() > TunnelCodec::kMaxReceiveBufferSize - incoming) {
+        return false;
+    }
+    destination.append(source);
+    return true;
+}
+
 bool same_target(const TargetAddr& left, const TargetAddr& right) {
     return left.type == right.type && left.port == right.port && left.host == right.host;
 }
@@ -1922,7 +1932,12 @@ void ClientApp::on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer&
         std::weak_ptr<UdpTunnel> weak_tunnel = tunnel;
         tunnel->tunnel_session->start_read([this, weak_tunnel](SessionPtr, Buffer& more) {
             if (UdpTunnelPtr current = weak_tunnel.lock()) {
-                current->recv_buf.append(more);
+                if (!append_tunnel_input(current->recv_buf, more)) {
+                    TX_ERROR("UDP tunnel receive buffer limit exceeded");
+                    more.clear();
+                    close_udp_tunnel(current);
+                    return;
+                }
                 more.clear();
                 on_udp_tunnel_read(current, current->recv_buf);
             } else {
@@ -1932,7 +1947,11 @@ void ClientApp::on_udp_tunnel_handshake_read(const UdpTunnelPtr& tunnel, Buffer&
     }
 
     if (!tunnel->handshake_buf.empty()) {
-        tunnel->recv_buf.append(tunnel->handshake_buf);
+        if (!append_tunnel_input(tunnel->recv_buf, tunnel->handshake_buf)) {
+            TX_ERROR("UDP tunnel receive buffer limit exceeded after handshake");
+            close_udp_tunnel(tunnel);
+            return;
+        }
         tunnel->handshake_buf.clear();
         on_udp_tunnel_read(tunnel, tunnel->recv_buf);
     }
@@ -3299,9 +3318,7 @@ void ClientApp::on_http_accept(SessionPtr session) {
         return;
     }
 
-    conn->http->set_target_callback([conn](const TargetAddr& target) {
-        conn->target = target;
-    });
+    bind_proxy_target_callback(conn);
 
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
@@ -3380,9 +3397,7 @@ void ClientApp::on_socks5_accept(SessionPtr session) {
         return;
     }
 
-    conn->socks5->set_target_callback([conn](const TargetAddr& target) {
-        conn->target = target;
-    });
+    bind_proxy_target_callback(conn);
 
     session->set_close_callback([this, conn](SessionPtr) {
         on_proxy_close(conn);
@@ -3857,7 +3872,12 @@ void ClientApp::on_tunnel_handshake_read(ProxyConnPtr conn, Buffer& data) {
     finish_tunnel_handshake(conn, keys);
 
     if (!conn->tunnel_handshake_buf.empty()) {
-        conn->tunnel_recv_buf.append(conn->tunnel_handshake_buf);
+        if (!append_tunnel_input(conn->tunnel_recv_buf, conn->tunnel_handshake_buf)) {
+            TX_ERROR("Tunnel receive buffer limit exceeded after handshake for session %u",
+                     conn->session_id);
+            fail_tunnel_connection(conn);
+            return;
+        }
         conn->tunnel_handshake_buf.clear();
         on_tunnel_read(conn, conn->tunnel_recv_buf);
     }
@@ -3878,7 +3898,13 @@ void ClientApp::finish_tunnel_handshake(ProxyConnPtr conn,
     TX_INFO("Tunnel handshake complete for session %u", conn->session_id);
 
     conn->tunnel_session->start_read([this, conn](SessionPtr, Buffer& data) {
-        conn->tunnel_recv_buf.append(data);
+        if (!append_tunnel_input(conn->tunnel_recv_buf, data)) {
+            TX_ERROR("Tunnel receive buffer limit exceeded for session %u",
+                     conn->session_id);
+            data.clear();
+            fail_tunnel_connection(conn);
+            return;
+        }
         data.clear();
         on_tunnel_read(conn, conn->tunnel_recv_buf);
     });
@@ -4241,10 +4267,35 @@ void ClientApp::on_tunnel_read(ProxyConnPtr conn, Buffer& data) {
     }
 }
 
+void ClientApp::bind_proxy_target_callback(ProxyConnPtr conn) {
+    if (!conn) return;
+
+    std::weak_ptr<ProxyConn> weak_conn = conn;
+    if (conn->http) {
+        conn->http->set_target_callback([weak_conn](const TargetAddr& target) {
+            if (auto current = weak_conn.lock()) {
+                current->target = target;
+            }
+        });
+    } else if (conn->socks5) {
+        conn->socks5->set_target_callback([weak_conn](const TargetAddr& target) {
+            if (auto current = weak_conn.lock()) {
+                current->target = target;
+            }
+        });
+    }
+}
+
 void ClientApp::on_proxy_close(ProxyConnPtr conn) {
     if (!conn) return;
 
     TX_DEBUG("Proxy connection closed, session %u", conn->session_id);
+
+    // Do not retain callbacks after the proxy stream is gone.  The callbacks
+    // use weak_ptr today, but clearing them also releases handler state
+    // promptly on all close paths.
+    if (conn->http) conn->http->set_target_callback(nullptr);
+    if (conn->socks5) conn->socks5->set_target_callback(nullptr);
 
     if (conn->direct_session && !conn->direct_session->is_closed()) {
         conn->direct_session->set_close_callback(nullptr);

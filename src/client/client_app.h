@@ -217,6 +217,7 @@ private:
     // Accept handlers for HTTP and SOCKS5 listeners
     void on_http_accept(SessionPtr session);
     void on_socks5_accept(SessionPtr session);
+    void bind_proxy_target_callback(ProxyConnPtr conn);
     void on_proxy_read(ProxyConnPtr conn, Buffer& data);
     void on_proxy_close(ProxyConnPtr conn);
     bool admit_proxy_connection(ProxyConnPtr conn);

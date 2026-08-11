@@ -27,6 +27,16 @@ constexpr size_t kMaxUdpPendingSendPackets = 262144;
 constexpr size_t kMaxDnsQueriesPerClient = 64;
 constexpr size_t kMaxDnsQuerySize = 65535;
 
+bool append_tunnel_input(Buffer& destination, const Buffer& source) {
+    const size_t incoming = source.readable();
+    if (incoming > TunnelCodec::kMaxReceiveBufferSize ||
+        destination.readable() > TunnelCodec::kMaxReceiveBufferSize - incoming) {
+        return false;
+    }
+    destination.append(source);
+    return true;
+}
+
 std::unique_ptr<uv_loop_t> create_server_loop() {
     std::unique_ptr<uv_loop_t> loop(new uv_loop_t);
     const int status = uv_loop_init(loop.get());
@@ -462,13 +472,26 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
             more.clear();
             return;
         }
-        client->recv_buf.append(more);
+        if (!append_tunnel_input(client->recv_buf, more)) {
+            TX_ERROR("Tunnel receive buffer limit exceeded");
+            more.clear();
+            if (client->session && !client->session->is_closed()) {
+                client->session->close();
+            }
+            return;
+        }
         more.clear();
         on_tunnel_read(client, client->recv_buf);
     });
 
     if (!client->handshake_buf.empty()) {
-        client->recv_buf.append(client->handshake_buf);
+        if (!append_tunnel_input(client->recv_buf, client->handshake_buf)) {
+            TX_ERROR("Tunnel receive buffer limit exceeded after handshake");
+            if (client->session && !client->session->is_closed()) {
+                client->session->close();
+            }
+            return;
+        }
         client->handshake_buf.clear();
         on_tunnel_read(client, client->recv_buf);
     }

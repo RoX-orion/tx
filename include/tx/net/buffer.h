@@ -5,7 +5,9 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <limits>
 #include <string>
+#include <stdexcept>
 
 namespace tx {
 
@@ -29,6 +31,7 @@ public:
     // Writable space
     uint8_t* writable() { return buf_.data() + write_pos_; }
     size_t writable_bytes() const { return buf_.size() - write_pos_; }
+    size_t capacity() const { return buf_.size(); }
 
     // Advance write position after external write
     void commit(size_t n) { write_pos_ += n; }
@@ -95,11 +98,12 @@ public:
 
     // Shrink buffer if over-allocated
     void shrink() {
-        if (buf_.size() > kInitialSize * 4 && readable() < kInitialSize) {
-            std::vector<uint8_t> new_buf(kPrependSize + readable());
-            memcpy(new_buf.data() + kPrependSize, data(), readable());
+        const size_t len = readable();
+        if (buf_.size() > kInitialSize * 4 && len < kInitialSize) {
+            std::vector<uint8_t> new_buf(kPrependSize + len);
+            memcpy(new_buf.data() + kPrependSize, data(), len);
             buf_ = std::move(new_buf);
-            write_pos_ = kPrependSize + readable();
+            write_pos_ = kPrependSize + len;
             read_pos_ = kPrependSize;
         }
     }
@@ -111,10 +115,34 @@ public:
 
 private:
     void ensure_writable(size_t n) {
-        if (writable_bytes() < n) {
-            size_t new_cap = std::max(buf_.size() * 2, write_pos_ + n);
-            buf_.resize(new_cap);
+        if (writable_bytes() >= n) return;
+
+        const size_t len = readable();
+        if (len > std::numeric_limits<size_t>::max() - kPrependSize ||
+            n > std::numeric_limits<size_t>::max() - kPrependSize - len) {
+            throw std::length_error("Buffer size overflow");
         }
+        const size_t required = kPrependSize + len + n;
+
+        // Reclaim consumed space before growing.  Tunnel frames are commonly
+        // split across reads, so relying on consume() to reach an exactly
+        // empty buffer allows the write cursor to grow with total traffic.
+        if (read_pos_ > kPrependSize && required <= buf_.size()) {
+            memmove(buf_.data() + kPrependSize, data(), len);
+            read_pos_ = kPrependSize;
+            write_pos_ = kPrependSize + len;
+            return;
+        }
+
+        const size_t doubled = buf_.size() > std::numeric_limits<size_t>::max() / 2
+            ? std::numeric_limits<size_t>::max()
+            : buf_.size() * 2;
+        const size_t new_cap = std::max(doubled, required);
+        std::vector<uint8_t> new_buf(new_cap);
+        memcpy(new_buf.data() + kPrependSize, data(), len);
+        buf_ = std::move(new_buf);
+        read_pos_ = kPrependSize;
+        write_pos_ = kPrependSize + len;
     }
 
     std::vector<uint8_t> buf_;

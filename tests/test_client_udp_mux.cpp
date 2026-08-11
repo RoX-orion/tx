@@ -39,6 +39,24 @@ public:
 };
 
 struct ClientAppTcpTest {
+    static void proxy_target_callback_does_not_retain_connection() {
+        ClientApp app;
+
+        auto http_conn = std::make_shared<ClientApp::ProxyConn>();
+        http_conn->http = std::make_unique<HttpProxyHandler>();
+        std::weak_ptr<ClientApp::ProxyConn> http_weak = http_conn;
+        app.bind_proxy_target_callback(http_conn);
+        http_conn.reset();
+        assert(http_weak.expired());
+
+        auto socks_conn = std::make_shared<ClientApp::ProxyConn>();
+        socks_conn->socks5 = std::make_unique<Socks5Handler>();
+        std::weak_ptr<ClientApp::ProxyConn> socks_weak = socks_conn;
+        app.bind_proxy_target_callback(socks_conn);
+        socks_conn.reset();
+        assert(socks_weak.expired());
+    }
+
     static void preconnect_buffer_is_bounded() {
         ClientApp app;
         auto conn = std::make_shared<ClientApp::ProxyConn>();
@@ -237,6 +255,7 @@ struct ClientAppUdpMuxTest {
 } // namespace tx
 
 int main() {
+    tx::ClientAppTcpTest::proxy_target_callback_does_not_retain_connection();
     tx::ClientAppTcpTest::preconnect_buffer_is_bounded();
     tx::ClientAppUdpMuxTest::verify_udp_backlog_drop_keeps_sequence();
     tx::ClientAppUdpMuxTest::verify_dns_backlog_drop_keeps_sequence();

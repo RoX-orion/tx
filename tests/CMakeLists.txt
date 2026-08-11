@@ -18,6 +18,7 @@ function(tx_add_test name)
 endfunction()
 
 tx_add_test(crypto)
+tx_add_test(buffer)
 tx_add_test(geoip)
 tx_add_test(geosite)
 tx_add_test(socks5)

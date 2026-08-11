@@ -59,6 +59,10 @@ public:
     static constexpr size_t kMinFrameSize = kLenPrefixSize + AeadCipher::kOverhead;
     static constexpr size_t kMaxPlaintextSize = 66000;
     static constexpr size_t kMaxEncryptedFrameSize = kMaxPlaintextSize + AeadCipher::kOverhead;
+    // TcpSession delivers at most 64 KiB per read.  A valid stream therefore
+    // needs room for at most one partial frame plus the next read; a larger
+    // accumulation indicates that decoding is not making progress.
+    static constexpr size_t kMaxReceiveBufferSize = 256 * 1024;
     static constexpr size_t kDataHeaderSize = 6;
     static constexpr size_t kMaxDataPayloadSize = kMaxPlaintextSize - kDataHeaderSize;
     static constexpr size_t kHandshakeNonceSize = 16;

@@ -34,6 +34,7 @@ public:
 
     // Lookup first matching geosite tag for a domain
     std::string lookup(const std::string& domain) const;
+    bool has_tag(const std::string& tag) const;
 
 private:
     struct RegexEntry {
@@ -55,6 +56,7 @@ private:
 
     // Regex patterns (rare, fallback)
     std::vector<RegexEntry> regex_patterns_;
+    std::vector<std::string> tag_order_;
 };
 
 } // namespace tx

@@ -3,14 +3,16 @@
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <climits>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace tx {
 
 AesGcm::AesGcm(const uint8_t* key, size_t key_len) {
-    if (key_len < kKeyLen) {
-        TX_FATAL("AES-GCM key must be at least %zu bytes", kKeyLen);
-    }
+    if (!key || key_len != kKeyLen)
+        throw std::invalid_argument("AES-GCM key must be exactly 32 bytes");
     memcpy(key_, key, kKeyLen);
 }
 
@@ -33,6 +35,13 @@ int AesGcm::encrypt(const uint8_t* plaintext, size_t plaintext_len,
 int AesGcm::encrypt(const uint8_t* nonce,
                      const uint8_t* plaintext, size_t plaintext_len,
                      uint8_t* output, size_t output_len) {
+    if (!nonce || (!plaintext && plaintext_len != 0) || !output ||
+        plaintext_len > static_cast<size_t>(INT_MAX) ||
+        plaintext_len > std::numeric_limits<size_t>::max() - kOverhead ||
+        plaintext_len + kOverhead > static_cast<size_t>(INT_MAX)) {
+        TX_ERROR("Invalid or oversized AES-GCM encryption input");
+        return -1;
+    }
     size_t total = kNonceLen + plaintext_len + kTagLen;
     if (output_len < total) {
         TX_ERROR("Output buffer too small: need %zu, got %zu", total, output_len);
@@ -79,6 +88,10 @@ int AesGcm::encrypt(const uint8_t* nonce,
 
 int AesGcm::decrypt(const uint8_t* input, size_t input_len,
                      uint8_t* output, size_t output_len) {
+    if (!input || !output || input_len > static_cast<size_t>(INT_MAX)) {
+        TX_ERROR("Invalid or oversized AES-GCM input");
+        return -1;
+    }
     if (input_len < kNonceLen + kTagLen) {
         TX_ERROR("Input too short for AES-GCM: %zu bytes", input_len);
         return -1;
@@ -96,6 +109,11 @@ int AesGcm::decrypt(const uint8_t* nonce,
                      const uint8_t* ciphertext, size_t ciphertext_len,
                      const uint8_t* tag,
                      uint8_t* plaintext, size_t plaintext_len) {
+    if (!nonce || (!ciphertext && ciphertext_len != 0) || !tag || !plaintext ||
+        ciphertext_len > static_cast<size_t>(INT_MAX)) {
+        TX_ERROR("Invalid or oversized AES-GCM decryption input");
+        return -1;
+    }
     if (plaintext_len < ciphertext_len) {
         TX_ERROR("Plaintext buffer too small");
         return -1;

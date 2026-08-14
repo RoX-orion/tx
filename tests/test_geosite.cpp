@@ -50,6 +50,8 @@ static std::vector<uint8_t> make_geosite_dat() {
     append_string_field(site, 1, "CN");
     append_message_field(site, 2, make_domain(0, "google"));
     append_message_field(site, 2, make_domain(2, "bilibili.com"));
+    append_message_field(site, 2, make_domain(3, "full.example"));
+    append_message_field(site, 2, make_domain(1, "^regex[0-9]+\\.example$"));
 
     std::vector<uint8_t> list;
     append_message_field(list, 1, site);
@@ -141,6 +143,19 @@ static void test_aho_corasick_overlapping() {
     assert(ac.search("abcde", "t3"));
     assert(!ac.search("xyz", "t1"));
 
+    tx::AhoCorasick suffixes;
+    suffixes.add_pattern("ab", "first");
+    suffixes.add_pattern("b", "second");
+    suffixes.add_pattern("doubleclick", "ads");
+    suffixes.add_pattern("click", "suffix");
+    suffixes.build();
+    assert(suffixes.search("ab", "first"));
+    assert(suffixes.search("ab", "second"));
+    assert(suffixes.search("doubleclick", "ads"));
+    assert(suffixes.search("doubleclick", "suffix"));
+    const auto matches = suffixes.search_all("ab doubleclick");
+    assert(matches.size() == 4);
+
     printf("OK\n");
 }
 
@@ -171,10 +186,49 @@ static void test_geosite_domain_match_excludes_plain_rules() {
     assert(matcher.match_domain("www.bilibili.com", "cn"));
     assert(matcher.match_domain("WWW.BILIBILI.COM", "CN"));
     assert(!matcher.match_domain("notbilibili.com", "cn"));
+    assert(matcher.match("full.example", "cn"));
+    assert(!matcher.match("www.full.example", "cn"));
+    assert(matcher.match("regex42.example", "cn"));
+    assert(!matcher.match("regex.example", "cn"));
+    assert(matcher.has_tag("CN"));
 
     std::remove(path.c_str());
 
     printf("OK\n");
+}
+
+static void test_malformed_geosite_is_rejected() {
+    const auto rejected = [](const char* name, const std::vector<uint8_t>& data) {
+        const std::string path = std::string("/tmp/tx_test_geosite_") + name + ".dat";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(data.data()),
+                      static_cast<std::streamsize>(data.size()));
+        }
+        tx::GeoSiteMatcher matcher;
+        assert(!matcher.load(path));
+        std::remove(path.c_str());
+    };
+
+    std::vector<uint8_t> empty_site;
+    append_string_field(empty_site, 1, "EMPTY");
+    append_message_field(empty_site, 2, make_domain(2, ""));
+    std::vector<uint8_t> empty_list;
+    append_message_field(empty_list, 1, empty_site);
+    rejected("empty", empty_list);
+
+    std::vector<uint8_t> regex_site;
+    append_string_field(regex_site, 1, "REGEX");
+    append_message_field(regex_site, 2, make_domain(1, "[unterminated"));
+    std::vector<uint8_t> regex_list;
+    append_message_field(regex_list, 1, regex_site);
+    rejected("regex", regex_list);
+
+    rejected("long_length", {0x0a, 0xff, 0xff, 0xff, 0xff, 0xff,
+                              0xff, 0xff, 0xff, 0xff, 0x01});
+    rejected("long_varint", {0x80, 0x80, 0x80, 0x80, 0x80,
+                              0x80, 0x80, 0x80, 0x80, 0x02});
+    rejected("truncated_fixed", {0x09, 0x01, 0x02, 0x03});
 }
 
 int main() {
@@ -186,6 +240,7 @@ int main() {
     test_aho_corasick_overlapping();
     test_aho_corasick_empty();
     test_geosite_domain_match_excludes_plain_rules();
+    test_malformed_geosite_is_rejected();
     printf("All GeoSite tests passed!\n");
     return 0;
 }

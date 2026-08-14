@@ -5,10 +5,63 @@
 
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <limits>
+#include <algorithm>
+#include <cctype>
 
 using json = nlohmann::json;
 
 namespace tx {
+
+namespace {
+
+bool config_error(const std::string& path, const char* message) {
+    TX_ERROR("Invalid config field %s: %s", path.c_str(), message);
+    return false;
+}
+
+bool json_integer(const json& value, int64_t& output) {
+    if (value.is_number_unsigned()) {
+        const uint64_t raw = value.get<uint64_t>();
+        if (raw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+        output = static_cast<int64_t>(raw);
+        return true;
+    }
+    if (!value.is_number_integer()) return false;
+    output = value.get<int64_t>();
+    return true;
+}
+
+template <typename T>
+bool read_integer(const json& object, const char* key, const std::string& path,
+                  int64_t minimum, uint64_t maximum, T& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    int64_t value = 0;
+    if (!json_integer(*it, value)) return config_error(path, "expected JSON integer");
+    if (value < minimum || (value >= 0 && static_cast<uint64_t>(value) > maximum))
+        return config_error(path, "integer is out of range");
+    output = static_cast<T>(value);
+    return true;
+}
+
+bool read_string(const json& object, const char* key, const std::string& path,
+                 std::string& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    if (!it->is_string()) return config_error(path, "expected string");
+    output = it->get<std::string>();
+    return true;
+}
+
+std::string lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+} // namespace
 
 bool ServerConfig::validate() const {
     if (udp_idle_timeout_ms < 1000 || udp_idle_timeout_ms > 24 * 60 * 60 * 1000ULL) {
@@ -55,11 +108,15 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
     try {
         json j;
         file >> j;
+        if (!j.is_object()) return config_error("$", "expected object");
+        ServerConfig parsed;
 
         if (j.contains("listen")) {
-            auto& listen = j["listen"];
-            if (listen.contains("host")) config.listen_host = listen["host"].get<std::string>();
-            if (listen.contains("port")) config.listen_port = listen["port"].get<uint16_t>();
+            const auto& listen = j["listen"];
+            if (!listen.is_object()) return config_error("listen", "expected object");
+            if (!read_string(listen, "host", "listen.host", parsed.listen_host) ||
+                !read_integer(listen, "port", "listen.port", 1, 65535,
+                              parsed.listen_port)) return false;
         }
 
         if (j.contains("cipher")) {
@@ -69,46 +126,48 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
 
         if (j.contains("udp")) {
             const auto& udp = j["udp"];
-            int64_t idle_timeout = udp.value("idle_timeout",
-                                             static_cast<int64_t>(
-                                                 kDefaultUdpFlowIdleTimeoutMs / 1000));
-            if (idle_timeout < 1 || idle_timeout > 86400) {
-                TX_ERROR("udp.idle_timeout must be between 1 and 86400 seconds");
-                return false;
-            }
-            config.udp_idle_timeout_ms = static_cast<uint64_t>(idle_timeout) * 1000;
+            if (!udp.is_object()) return config_error("udp", "expected object");
+            uint64_t idle_timeout = kDefaultUdpFlowIdleTimeoutMs / 1000;
+            if (!read_integer(udp, "idle_timeout", "udp.idle_timeout", 1, 86400,
+                              idle_timeout)) return false;
+            parsed.udp_idle_timeout_ms = idle_timeout * 1000;
         }
 
         if (j.contains("limits")) {
             const auto& limits = j["limits"];
-            config.max_clients = limits.value("max_clients", config.max_clients);
-            config.max_unauthenticated_per_ip = limits.value(
-                "max_unauthenticated_per_ip", config.max_unauthenticated_per_ip);
-            config.max_new_clients_per_second = limits.value(
-                "max_new_clients_per_second", config.max_new_clients_per_second);
-            config.max_tcp_outbounds_per_client = limits.value(
-                "max_tcp_outbounds_per_client", config.max_tcp_outbounds_per_client);
-            config.max_udp_flows_per_client = limits.value(
-                "max_udp_flows_per_client", config.max_udp_flows_per_client);
-            int64_t handshake_timeout = limits.value(
-                "handshake_timeout", static_cast<int64_t>(config.handshake_timeout_ms / 1000));
-            int64_t connect_timeout = limits.value(
-                "connect_timeout", static_cast<int64_t>(config.connect_timeout_ms / 1000));
-            int64_t rate_mbps = limits.value("max_client_rate_mbps",
-                static_cast<int64_t>(config.max_client_rate_bytes_per_sec / (1024 * 1024)));
-            if (handshake_timeout < 1 || connect_timeout < 1 || rate_mbps < 1 ||
-                handshake_timeout > 60 || connect_timeout > 120 || rate_mbps > 1024) {
-                TX_ERROR("Invalid server limits");
-                return false;
-            }
-            config.handshake_timeout_ms = static_cast<uint64_t>(handshake_timeout) * 1000;
-            config.connect_timeout_ms = static_cast<uint64_t>(connect_timeout) * 1000;
-            config.max_client_rate_bytes_per_sec = static_cast<uint64_t>(rate_mbps) * 1024 * 1024;
+            if (!limits.is_object()) return config_error("limits", "expected object");
+            uint64_t handshake = parsed.handshake_timeout_ms / 1000;
+            uint64_t connect = parsed.connect_timeout_ms / 1000;
+            uint64_t rate = parsed.max_client_rate_bytes_per_sec / (1024 * 1024);
+            if (!read_integer(limits, "max_clients", "limits.max_clients", 1, 1000000,
+                              parsed.max_clients) ||
+                !read_integer(limits, "max_unauthenticated_per_ip",
+                    "limits.max_unauthenticated_per_ip", 1, 1000000,
+                    parsed.max_unauthenticated_per_ip) ||
+                !read_integer(limits, "max_new_clients_per_second",
+                    "limits.max_new_clients_per_second", 1, 1000000,
+                    parsed.max_new_clients_per_second) ||
+                !read_integer(limits, "max_tcp_outbounds_per_client",
+                    "limits.max_tcp_outbounds_per_client", 1, 1000000,
+                    parsed.max_tcp_outbounds_per_client) ||
+                !read_integer(limits, "max_udp_flows_per_client",
+                    "limits.max_udp_flows_per_client", 1, 1000000,
+                    parsed.max_udp_flows_per_client) ||
+                !read_integer(limits, "handshake_timeout", "limits.handshake_timeout",
+                              1, 60, handshake) ||
+                !read_integer(limits, "connect_timeout", "limits.connect_timeout",
+                              1, 120, connect) ||
+                !read_integer(limits, "max_client_rate_mbps",
+                              "limits.max_client_rate_mbps", 1, 1024, rate)) return false;
+            parsed.handshake_timeout_ms = handshake * 1000;
+            parsed.connect_timeout_ms = connect * 1000;
+            parsed.max_client_rate_bytes_per_sec = rate * 1024 * 1024;
         }
 
         if (j.contains("secret")) {
-            const std::string secret = j["secret"].get<std::string>();
-            if (!Secret::parse_psk(secret, config.psk)) {
+            std::string secret;
+            if (!read_string(j, "secret", "secret", secret)) return false;
+            if (!Secret::parse_psk(secret, parsed.psk)) {
                 return false;
             }
         } else if (j.contains("password")) {
@@ -116,16 +175,22 @@ bool load_server_config(const std::string& path, ServerConfig& config) {
             return false;
         }
 
-        if (j.contains("log_level")) {
-            config.log_level = j["log_level"].get<std::string>();
-        }
+        if (!read_string(j, "log_level", "log_level", parsed.log_level)) return false;
+        parsed.log_level = lower(parsed.log_level);
+        if (parsed.log_level != "debug" && parsed.log_level != "info" &&
+            parsed.log_level != "warn" && parsed.log_level != "error")
+            return config_error("log_level", "unsupported log level");
+
+        if (!parsed.validate()) return false;
+        config = std::move(parsed);
+        return true;
 
     } catch (const json::exception& e) {
         TX_ERROR("Failed to parse config: %s", e.what());
         return false;
     }
 
-    return config.validate();
+    return false;
 }
 
 } // namespace tx

@@ -43,8 +43,9 @@ private:
     struct Node {
         // Bit position where this node's prefix diverges from parent
         uint16_t bit_pos;
-        // If terminal, the country code
-        std::string country;
+        // Tags are retained in source-file order. Duplicate CIDRs may belong
+        // to more than one tag.
+        std::vector<std::string> countries;
         bool is_terminal;
         // Children: 0 = left (bit 0), 1 = right (bit 1)
         Node* children[2];

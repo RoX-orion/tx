@@ -170,7 +170,8 @@ struct ConnectCtx {
 TcpSession::TcpSession(uv_loop_t* loop, SocketProtectCallback socket_protector,
                        OutboundSocketPolicy socket_policy)
     : loop_(loop), closed_(false), reading_(false), read_eof_(false),
-      write_shutdown_(false), shutdown_pending_(false), remote_port_(0),
+      write_shutdown_(false), shutdown_pending_(false),
+      close_after_flush_(false), remote_port_(0),
       pending_write_bytes_(0),
       write_high_watermark_(4 * 1024 * 1024),
       write_low_watermark_(1024 * 1024),
@@ -476,6 +477,15 @@ void TcpSession::shutdown_write() {
     }
 }
 
+void TcpSession::close_after_flush() {
+    if (closed_) return;
+    close_after_flush_ = true;
+    stop_read();
+    read_cb_ = nullptr;
+    eof_cb_ = nullptr;
+    shutdown_write();
+}
+
 void TcpSession::on_alloc(uv_handle_t*, size_t, uv_buf_t* buf) {
     // We use our own pre-allocated buffer
     static thread_local char slab[65536];
@@ -485,7 +495,12 @@ void TcpSession::on_alloc(uv_handle_t*, size_t, uv_buf_t* buf) {
 
 void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     auto* self = static_cast<TcpSession*>(stream->data);
-    // Guard: session may already be closing — shared_from_this() would throw
+    SessionPtr keep_alive;
+    try {
+        keep_alive = self->shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        return;
+    }
     if (self->closed_) return;
 
     if (nread > 0) {
@@ -498,7 +513,7 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
         // behavior and used to cause intermittent use-after-free crashes.
         auto cb = self->read_cb_;
         if (cb) {
-            cb(self->shared_from_this(), tmp);
+            cb(keep_alive, tmp);
         }
     } else if (nread == UV_EOF) {
         self->reading_ = false;
@@ -506,7 +521,7 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
         uv_read_stop(stream);
         auto cb = self->eof_cb_;
         if (cb) {
-            cb(self->shared_from_this());
+            cb(keep_alive);
         } else {
             self->close();
         }
@@ -515,7 +530,7 @@ void TcpSession::on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
         TX_DEBUG("Read error: %s", uv_strerror(static_cast<int>(nread)));
         auto cb = self->error_cb_;
         if (cb) {
-            cb(self->shared_from_this(), static_cast<int>(nread));
+            cb(keep_alive, static_cast<int>(nread));
         }
         self->close();
     }
@@ -532,7 +547,8 @@ void TcpSession::on_shutdown(uv_shutdown_t* req, int status) {
         session->write_shutdown_ = true;
         // Once both directions have completed, all writes queued before
         // uv_shutdown have drained and the handle can be closed safely.
-        if (session->read_eof_ && !session->closed_) session->close();
+        if ((session->read_eof_ || session->close_after_flush_) &&
+            !session->closed_) session->close();
     } else if (status != UV_ECANCELED) {
         TX_DEBUG("TCP shutdown error: %s", uv_strerror(status));
         if (!session->closed_) session->close();

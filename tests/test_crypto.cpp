@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cassert>
 #include <string>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 static void test_key_derive() {
@@ -124,8 +126,41 @@ static void test_secret_parse() {
     assert(parsed.size() == tx::Secret::kPskLen);
     assert(!tx::Secret::parse_psk("uuid-v4:7e52be0e-6929-132b-b74e-4e1d559dbccb", parsed));
     assert(!tx::Secret::parse_psk("password123", parsed));
+    assert(!tx::Secret::parse_psk(encoded + "\n", parsed));
+    assert(!tx::Secret::parse_psk(encoded.substr(0, encoded.size() - 1), parsed));
+    std::string noncanonical = encoded;
+    static const std::string alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t last_data = noncanonical.find_last_not_of('=');
+    const size_t alphabet_index = alphabet.find(noncanonical[last_data]);
+    assert(alphabet_index != std::string::npos);
+    noncanonical[last_data] = alphabet[(alphabet_index & ~size_t(3)) |
+                                       ((alphabet_index + 1) & size_t(3))];
+    assert(!tx::Secret::parse_psk(noncanonical, parsed));
 
     printf("OK\n");
+}
+
+static void test_crypto_input_bounds() {
+    uint8_t key[tx::AeadCipher::kKeyLen] = {};
+    bool threw = false;
+    try { tx::AeadCipher invalid(tx::AeadCipherKind::Aes256Gcm, nullptr, 0); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+    threw = false;
+    try { tx::AesGcm invalid(key, sizeof(key) - 1); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+
+    tx::AeadCipher aead(tx::AeadCipherKind::Aes256Gcm, key, sizeof(key));
+    tx::AesGcm aes(key, sizeof(key));
+    uint8_t nonce[tx::AeadCipher::kNonceLen] = {};
+    uint8_t byte = 0;
+    const size_t huge = static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
+    assert(aead.encrypt(nonce, nullptr, 0, &byte, huge, &byte,
+                        std::numeric_limits<size_t>::max()) == -1);
+    assert(aes.encrypt(nonce, &byte, huge, &byte,
+                       std::numeric_limits<size_t>::max()) == -1);
 }
 
 static void test_aead_chacha20_poly1305() {
@@ -163,6 +198,7 @@ int main() {
     test_empty_plaintext();
     test_secret_parse();
     test_aead_chacha20_poly1305();
+    test_crypto_input_bounds();
     printf("All crypto tests passed!\n");
     return 0;
 }

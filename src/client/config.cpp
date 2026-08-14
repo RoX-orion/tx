@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include "tx/common/network.h"
 #include <sys/stat.h>
 
@@ -16,9 +17,84 @@ using json = nlohmann::json;
 
 namespace tx {
 
+static std::string to_lower(std::string s);
+
 namespace {
 
 constexpr int32_t kMaxUdpMuxConnections = 64;
+
+bool config_error(const std::string& path, const char* message) {
+    TX_ERROR("Invalid config field %s: %s", path.c_str(), message);
+    return false;
+}
+
+bool read_string_field(const json& object, const char* key, const std::string& path,
+                       std::string& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    if (!it->is_string()) return config_error(path, "expected string");
+    output = it->get<std::string>();
+    return true;
+}
+
+bool read_bool_field(const json& object, const char* key, const std::string& path,
+                     bool& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    if (!it->is_boolean()) return config_error(path, "expected boolean");
+    output = it->get<bool>();
+    return true;
+}
+
+bool json_integer(const json& value, int64_t& output) {
+    if (value.is_number_unsigned()) {
+        const uint64_t raw = value.get<uint64_t>();
+        if (raw > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+        output = static_cast<int64_t>(raw);
+        return true;
+    }
+    if (!value.is_number_integer()) return false;
+    output = value.get<int64_t>();
+    return true;
+}
+
+template <typename T>
+bool read_integer_field(const json& object, const char* key, const std::string& path,
+                        int64_t minimum, uint64_t maximum, T& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    int64_t value = 0;
+    if (!json_integer(*it, value)) return config_error(path, "expected JSON integer");
+    if (value < minimum || (value >= 0 && static_cast<uint64_t>(value) > maximum))
+        return config_error(path, "integer is out of range");
+    output = static_cast<T>(value);
+    return true;
+}
+
+bool require_object(const json& value, const std::string& path) {
+    return value.is_object() || config_error(path, "expected object");
+}
+
+bool require_array(const json& value, const std::string& path) {
+    return value.is_array() || config_error(path, "expected array");
+}
+
+bool read_string_array(const json& object, const char* key, const std::string& path,
+                       std::vector<std::string>& output, bool lowercase) {
+    auto it = object.find(key);
+    if (it == object.end()) return true;
+    if (!require_array(*it, path)) return false;
+    std::vector<std::string> values;
+    for (size_t index = 0; index < it->size(); ++index) {
+        const auto& value = (*it)[index];
+        if (!value.is_string())
+            return config_error(path + "[" + std::to_string(index) + "]", "expected string");
+        std::string text = value.get<std::string>();
+        values.push_back(lowercase ? to_lower(std::move(text)) : std::move(text));
+    }
+    output = std::move(values);
+    return true;
+}
 
 } // namespace
 
@@ -63,9 +139,14 @@ static std::string parent_dir(const std::string& path) {
 static bool has_valid_ip_cidr(const std::string& cidr) {
     const size_t slash = cidr.find('/');
     if (slash == std::string::npos) return false;
+    const std::string prefix_text = cidr.substr(slash + 1);
+    if (prefix_text.empty() ||
+        prefix_text.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
     char* end = nullptr;
-    long prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
-    if (!end || *end) return false;
+    long prefix = std::strtol(prefix_text.c_str(), &end, 10);
+    if (end != prefix_text.c_str() + prefix_text.size()) return false;
     uint8_t bytes[16];
     const std::string host = cidr.substr(0, slash);
     if (inet_pton(AF_INET, host.c_str(), bytes) == 1) return prefix >= 0 && prefix <= 32;
@@ -155,6 +236,12 @@ bool ClientConfig::validate() const {
                 return false;
             }
         }
+        for (const auto& route : tun_routes) {
+            if (!has_valid_ip_cidr(route)) {
+                TX_ERROR("Invalid tun.routes CIDR: %s", route.c_str());
+                return false;
+            }
+        }
         if (tun_tcp_stack != "lwip" && tun_tcp_stack != "system") {
             TX_ERROR("tun.tcp_stack must be lwip or system");
             return false;
@@ -171,12 +258,19 @@ bool ClientConfig::validate() const {
             TX_ERROR("tun.auto_redirect cannot be enabled with tcp_stack=lwip");
             return false;
         }
-        if (tun_tcp_stack == "lwip" && tun_auto_route && tun_bypass_mark == 0) {
-            TX_ERROR("tun.bypass_mark must be non-zero with lwip auto_route");
+        const bool managed_routes = tun_auto_route || !tun_routes.empty();
+        const uint32_t effective_mark = tun_tcp_stack == "lwip"
+            ? tun_bypass_mark : tun_redirect_mark;
+        if (managed_routes && effective_mark == 0) {
+            TX_ERROR("effective TUN policy mark must be non-zero with managed routes");
             return false;
         }
-        if (tun_auto_route && (tun_route_table == 0 || tun_rule_priority == 0)) {
-            TX_ERROR("tun.route_table and tun.rule_priority must be non-zero with auto_route");
+        if (managed_routes && (tun_route_table == 0 || tun_rule_priority == 0)) {
+            TX_ERROR("tun.route_table and tun.rule_priority must be non-zero with managed routes");
+            return false;
+        }
+        if (managed_routes && tun_rule_priority == UINT32_MAX) {
+            TX_ERROR("tun.rule_priority + 1 overflows");
             return false;
         }
 #if !defined(TX_PLATFORM_LINUX)
@@ -272,28 +366,39 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
     try {
         json j;
         file >> j;
+        if (!require_object(j, "$")) return false;
 
-        // Listen config
         if (j.contains("listen")) {
-            auto& listen = j["listen"];
+            const auto& listen = j["listen"];
+            if (!require_object(listen, "listen")) return false;
             if (listen.contains("http")) {
-                auto& http = listen["http"];
-                if (http.contains("host")) config.http_host = http["host"].get<std::string>();
-                if (http.contains("port")) config.http_port = http["port"].get<uint16_t>();
+                const auto& http = listen["http"];
+                if (!require_object(http, "listen.http") ||
+                    !read_string_field(http, "host", "listen.http.host", config.http_host) ||
+                    !read_integer_field(http, "port", "listen.http.port", 1, 65535,
+                                        config.http_port)) return false;
             }
             if (listen.contains("socks5")) {
-                auto& socks5 = listen["socks5"];
-                if (socks5.contains("host")) config.socks5_host = socks5["host"].get<std::string>();
-                if (socks5.contains("port")) config.socks5_port = socks5["port"].get<uint16_t>();
+                const auto& socks5 = listen["socks5"];
+                if (!require_object(socks5, "listen.socks5") ||
+                    !read_string_field(socks5, "host", "listen.socks5.host",
+                                       config.socks5_host) ||
+                    !read_integer_field(socks5, "port", "listen.socks5.port", 1, 65535,
+                                        config.socks5_port)) return false;
             }
         }
 
-        // Outbound config
         if (j.contains("outbounds")) {
-            for (auto& item : j["outbounds"]) {
+            const auto& outbounds = j["outbounds"];
+            if (!require_array(outbounds, "outbounds")) return false;
+            for (size_t index = 0; index < outbounds.size(); ++index) {
+                const auto& item = outbounds[index];
+                const std::string base = "outbounds[" + std::to_string(index) + "]";
+                if (!require_object(item, base)) return false;
                 OutboundConfig outbound;
-                if (item.contains("tag")) outbound.tag = item["tag"].get<std::string>();
-                std::string type = item.value("type", "tx");
+                std::string type = "tx";
+                if (!read_string_field(item, "tag", base + ".tag", outbound.tag) ||
+                    !read_string_field(item, "type", base + ".type", type)) return false;
                 type = to_lower(type);
                 if (type == "direct" || type == "freedom") {
                     outbound.type = OutboundType::Direct;
@@ -302,8 +407,7 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
                 } else if (type == "tx" || type == "proxy") {
                     outbound.type = OutboundType::Tx;
                 } else {
-                    TX_ERROR("Unsupported outbound type: %s", type.c_str());
-                    return false;
+                    return config_error(base + ".type", "unsupported outbound type");
                 }
 
                 if (outbound.type != OutboundType::Tx &&
@@ -312,28 +416,39 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
                     return false;
                 }
                 if (outbound.type == OutboundType::Tx) {
-                    outbound.udp_over_tcp = item.value("udp-over-tcp", outbound.udp_over_tcp);
+                    if (!read_bool_field(item, "udp-over-tcp", base + ".udp-over-tcp",
+                                         outbound.udp_over_tcp)) return false;
                     if (item.contains("udp-mux")) {
                         const auto& udp_mux = item["udp-mux"];
-                        if (!udp_mux.is_object()) {
-                            TX_ERROR("TX outbound udp-mux must be an object");
-                            return false;
-                        }
-                        outbound.udp_mux_connections = udp_mux.value(
-                            "connections", outbound.udp_mux_connections);
+                        if (!require_object(udp_mux, base + ".udp-mux") ||
+                            !read_integer_field(udp_mux, "connections",
+                                base + ".udp-mux.connections", -1,
+                                kMaxUdpMuxConnections, outbound.udp_mux_connections)) return false;
+                        if (outbound.udp_mux_connections == 0)
+                            return config_error(base + ".udp-mux.connections",
+                                                "must be -1 or between 1 and 64");
                     }
-                    auto& server = item.contains("server") ? item["server"] : item;
-                    if (server.contains("host")) outbound.server_host = server["host"].get<std::string>();
-                    if (server.contains("port")) outbound.server_port = server["port"].get<uint16_t>();
+                    const auto& server = item.contains("server") ? item["server"] : item;
+                    const std::string server_path = item.contains("server")
+                        ? base + ".server" : base;
+                    if (!require_object(server, server_path) ||
+                        !read_string_field(server, "host", server_path + ".host",
+                                           outbound.server_host) ||
+                        !read_integer_field(server, "port", server_path + ".port", 1, 65535,
+                                            outbound.server_port)) return false;
                     if (server.contains("cipher")) {
-                        std::string cipher_name = server["cipher"].get<std::string>();
+                        std::string cipher_name;
+                        if (!read_string_field(server, "cipher", server_path + ".cipher",
+                                               cipher_name)) return false;
                         if (!parse_aead_cipher(cipher_name, outbound.cipher)) {
-                            TX_ERROR("Unsupported tunnel cipher: %s", cipher_name.c_str());
-                            return false;
+                            return config_error(server_path + ".cipher",
+                                                "unsupported tunnel cipher");
                         }
                     }
                     if (server.contains("secret")) {
-                        const std::string secret = server["secret"].get<std::string>();
+                        std::string secret;
+                        if (!read_string_field(server, "secret", server_path + ".secret",
+                                               secret)) return false;
                         if (!Secret::parse_psk(secret, outbound.psk)) {
                             return false;
                         }
@@ -352,35 +467,36 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
             }
         }
 
-        // Routing config
         if (j.contains("routing")) {
-            auto& routing = j["routing"];
-            config.router.domain_strategy =
-                routing.value("domainStrategy", config.router.domain_strategy);
+            const auto& routing = j["routing"];
+            if (!require_object(routing, "routing") ||
+                !read_string_field(routing, "domainStrategy", "routing.domainStrategy",
+                                   config.router.domain_strategy)) return false;
             if (routing.contains("geoip_path")) {
-                config.router.geoip_path =
-                    resolve_config_path(path, routing["geoip_path"].get<std::string>());
+                std::string value;
+                if (!read_string_field(routing, "geoip_path", "routing.geoip_path", value))
+                    return false;
+                config.router.geoip_path = resolve_config_path(path, value);
             }
             if (routing.contains("geosite_path")) {
-                config.router.geosite_path =
-                    resolve_config_path(path, routing["geosite_path"].get<std::string>());
+                std::string value;
+                if (!read_string_field(routing, "geosite_path", "routing.geosite_path", value))
+                    return false;
+                config.router.geosite_path = resolve_config_path(path, value);
             }
             if (routing.contains("rules")) {
-                for (auto& item : routing["rules"]) {
+                const auto& rules = routing["rules"];
+                if (!require_array(rules, "routing.rules")) return false;
+                for (size_t index = 0; index < rules.size(); ++index) {
+                    const auto& item = rules[index];
+                    const std::string base = "routing.rules[" + std::to_string(index) + "]";
+                    if (!require_object(item, base)) return false;
                     RouteRule rule;
-                    if (item.contains("domain")) {
-                        for (auto& domain : item["domain"]) {
-                            rule.domains.push_back(to_lower(domain.get<std::string>()));
-                        }
-                    }
-                    if (item.contains("ip")) {
-                        for (auto& ip : item["ip"]) {
-                            rule.ips.push_back(to_lower(ip.get<std::string>()));
-                        }
-                    }
-                    if (item.contains("outboundTag")) {
-                        rule.outbound_tag = item["outboundTag"].get<std::string>();
-                    }
+                    if (!read_string_array(item, "domain", base + ".domain",
+                                           rule.domains, true) ||
+                        !read_string_array(item, "ip", base + ".ip", rule.ips, true) ||
+                        !read_string_field(item, "outboundTag", base + ".outboundTag",
+                                           rule.outbound_tag)) return false;
                     config.router.rules.push_back(std::move(rule));
                 }
             }
@@ -388,35 +504,40 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
 
         if (j.contains("udp")) {
             const auto& udp = j["udp"];
-            int64_t idle_timeout = udp.value("idle_timeout",
-                                             static_cast<int64_t>(
-                                                 kDefaultUdpFlowIdleTimeoutMs / 1000));
-            if (idle_timeout < 1 || idle_timeout > 86400) {
-                TX_ERROR("udp.idle_timeout must be between 1 and 86400 seconds");
-                return false;
-            }
+            if (!require_object(udp, "udp")) return false;
+            uint64_t idle_timeout = kDefaultUdpFlowIdleTimeoutMs / 1000;
+            if (!read_integer_field(udp, "idle_timeout", "udp.idle_timeout", 1, 86400,
+                                    idle_timeout) ||
+                !read_integer_field(udp, "max_flows", "udp.max_flows", 1, 1000000,
+                                    config.udp_max_flows) ||
+                !read_bool_field(udp, "quic_sniff", "udp.quic_sniff",
+                                 config.udp_quic_sniff)) return false;
             config.udp_idle_timeout_ms = static_cast<uint64_t>(idle_timeout) * 1000;
-            config.udp_max_flows = udp.value("max_flows", config.udp_max_flows);
-            config.udp_quic_sniff = udp.value("quic_sniff", config.udp_quic_sniff);
         }
 
         if (j.contains("limits")) {
             const auto& limits = j["limits"];
-            config.max_proxy_connections = limits.value(
-                "max_proxy_connections", config.max_proxy_connections);
+            if (!require_object(limits, "limits") ||
+                !read_integer_field(limits, "max_proxy_connections",
+                    "limits.max_proxy_connections", 1, 1000000,
+                    config.max_proxy_connections)) return false;
         }
 
         if (j.contains("tun")) {
-            auto& tun = j["tun"];
-            config.tun_enabled = tun.value("enabled", config.tun_enabled);
-            config.tun_fd = tun.value("fd", config.tun_fd);
-            config.tun_mtu = tun.value("mtu", config.tun_mtu);
-            config.tun_name = tun.value("name", config.tun_name);
-            config.tun_address = tun.value("address", config.tun_address);
+            const auto& tun = j["tun"];
+            if (!require_object(tun, "tun") ||
+                !read_bool_field(tun, "enabled", "tun.enabled", config.tun_enabled) ||
+                !read_integer_field(tun, "fd", "tun.fd", -1,
+                                    static_cast<uint64_t>(std::numeric_limits<int>::max()),
+                                    config.tun_fd) ||
+                !read_integer_field(tun, "mtu", "tun.mtu", 1, 65535, config.tun_mtu) ||
+                !read_string_field(tun, "name", "tun.name", config.tun_name) ||
+                !read_string_field(tun, "address", "tun.address", config.tun_address))
+                return false;
             if (tun.contains("addresses")) {
-                config.tun_addresses.clear();
-                for (const auto& address : tun["addresses"])
-                    config.tun_addresses.push_back(address.get<std::string>());
+                if (!read_string_array(tun, "addresses", "tun.addresses",
+                                       config.tun_addresses, false)) return false;
+                config.tun_address.clear();
                 for (const auto& address : config.tun_addresses) {
                     if (address.find(':') == std::string::npos) {
                         config.tun_address = address;
@@ -424,42 +545,52 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
                     }
                 }
             } else if (tun.contains("address")) {
-                if (config.tun_addresses.empty()) {
-                    config.tun_addresses.push_back(config.tun_address);
-                } else {
-                    config.tun_addresses[0] = config.tun_address;
-                }
+                config.tun_addresses.assign(1, config.tun_address);
             }
-            config.tun_auto_config = tun.value("auto_config", config.tun_auto_config);
-            config.tun_auto_route = tun.value("auto_route", config.tun_auto_route);
-            config.tun_auto_redirect = tun.value("auto_redirect", config.tun_auto_redirect);
-            config.tun_redirect_port = tun.value("redirect_port", config.tun_redirect_port);
-            config.tun_redirect_mark = tun.value("redirect_mark", config.tun_redirect_mark);
-            config.tun_bypass_mark = tun.value("bypass_mark", config.tun_bypass_mark);
-            config.tun_route_table = tun.value("route_table", config.tun_route_table);
-            config.tun_rule_priority = tun.value("rule_priority", config.tun_rule_priority);
-            if (tun.contains("routes")) {
-                config.tun_routes.clear();
-                for (auto& route : tun["routes"]) {
-                    config.tun_routes.push_back(route.get<std::string>());
-                }
-            }
+            if (!read_bool_field(tun, "auto_config", "tun.auto_config", config.tun_auto_config) ||
+                !read_bool_field(tun, "auto_route", "tun.auto_route", config.tun_auto_route) ||
+                !read_bool_field(tun, "auto_redirect", "tun.auto_redirect",
+                                 config.tun_auto_redirect) ||
+                !read_integer_field(tun, "redirect_port", "tun.redirect_port", 1, 65535,
+                                    config.tun_redirect_port) ||
+                !read_integer_field(tun, "redirect_mark", "tun.redirect_mark", 0,
+                                    UINT32_MAX, config.tun_redirect_mark) ||
+                !read_integer_field(tun, "bypass_mark", "tun.bypass_mark", 0,
+                                    UINT32_MAX, config.tun_bypass_mark) ||
+                !read_integer_field(tun, "route_table", "tun.route_table", 0,
+                                    UINT32_MAX, config.tun_route_table) ||
+                !read_integer_field(tun, "rule_priority", "tun.rule_priority", 0,
+                                    UINT32_MAX, config.tun_rule_priority) ||
+                !read_string_array(tun, "routes", "tun.routes", config.tun_routes, false))
+                return false;
             if (tun.contains("mode")) {
-                config.tun_mode = to_lower(tun.value("mode", config.tun_mode));
+                if (!read_string_field(tun, "mode", "tun.mode", config.tun_mode)) return false;
+                config.tun_mode = to_lower(config.tun_mode);
                 TX_WARN("tun.mode is deprecated and no longer selects the data plane");
             }
-            config.tun_tcp_stack = to_lower(tun.value("tcp_stack", config.tun_tcp_stack));
-            config.tun_udp_stack = to_lower(tun.value("udp_stack", config.tun_udp_stack));
+            if (!read_string_field(tun, "tcp_stack", "tun.tcp_stack",
+                                   config.tun_tcp_stack) ||
+                !read_string_field(tun, "udp_stack", "tun.udp_stack",
+                                   config.tun_udp_stack)) return false;
+            config.tun_tcp_stack = to_lower(config.tun_tcp_stack);
+            config.tun_udp_stack = to_lower(config.tun_udp_stack);
         }
 
         if (j.contains("dns")) {
             const auto& dns = j["dns"];
-            config.dns_mode = to_lower(dns.value("mode", config.dns_mode));
-            config.dns_fake_ipv4_range = dns.value("fake_ipv4_range", config.dns_fake_ipv4_range);
-            config.dns_fake_ipv6_range = dns.value("fake_ipv6_range", config.dns_fake_ipv6_range);
-            config.dns_cache_ttl = dns.value("cache_ttl", config.dns_cache_ttl);
-            config.dns_mapping_ttl = dns.value("mapping_ttl", config.dns_mapping_ttl);
-            config.dns_cache_capacity = dns.value("cache_capacity", config.dns_cache_capacity);
+            if (!require_object(dns, "dns") ||
+                !read_string_field(dns, "mode", "dns.mode", config.dns_mode) ||
+                !read_string_field(dns, "fake_ipv4_range", "dns.fake_ipv4_range",
+                                   config.dns_fake_ipv4_range) ||
+                !read_string_field(dns, "fake_ipv6_range", "dns.fake_ipv6_range",
+                                   config.dns_fake_ipv6_range) ||
+                !read_integer_field(dns, "cache_ttl", "dns.cache_ttl", 1, 86400,
+                                    config.dns_cache_ttl) ||
+                !read_integer_field(dns, "mapping_ttl", "dns.mapping_ttl", 1, 604800,
+                                    config.dns_mapping_ttl) ||
+                !read_integer_field(dns, "cache_capacity", "dns.cache_capacity", 1,
+                                    1000000, config.dns_cache_capacity)) return false;
+            config.dns_mode = to_lower(config.dns_mode);
         }
 
         if (j.contains("geo") || j.contains("server")) {
@@ -467,10 +598,11 @@ bool load_client_config(const std::string& path, ClientConfig& output_config) {
             return false;
         }
 
-        // Log level
-        if (j.contains("log_level")) {
-            config.log_level = j["log_level"].get<std::string>();
-        }
+        if (!read_string_field(j, "log_level", "log_level", config.log_level)) return false;
+        config.log_level = to_lower(config.log_level);
+        if (config.log_level != "debug" && config.log_level != "info" &&
+            config.log_level != "warn" && config.log_level != "error")
+            return config_error("log_level", "unsupported log level");
 
     } catch (const json::exception& e) {
         TX_ERROR("Failed to parse config: %s", e.what());

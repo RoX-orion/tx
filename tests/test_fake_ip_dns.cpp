@@ -87,6 +87,8 @@ int main() {
     std::string error;
     assert(!dns.configure("198.18.0.0/30", "fd00:198:18::/96", 60, error));
     assert(!error.empty());
+    assert(!dns.configure("198.18.0.0/", "fd00:198:18::/96", 60, error));
+    assert(!dns.configure("198.18.0.0/+16", "fd00:198:18::/96", 60, error));
     assert(dns.configure("198.18.0.0/16", "fd00:198:18::/96", 60, error, 1));
     auto first = query(1, "first");
     assert(dns.respond(first.data(), first.size(), response));

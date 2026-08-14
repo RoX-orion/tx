@@ -20,12 +20,30 @@ extern "C" {
     #define TX_API __attribute__((visibility("default")))
 #endif
 
+#if defined(_MSC_VER)
+    #define TX_DEPRECATED(message) __declspec(deprecated(message))
+#elif defined(__GNUC__) || defined(__clang__)
+    #define TX_DEPRECATED(message) __attribute__((deprecated(message)))
+#else
+    #define TX_DEPRECATED(message)
+#endif
+
 // Opaque handle
 typedef void* tx_handle_t;
 
-// Called synchronously on the client network thread after an outbound socket
-// is created and before it is used. The hook must bind the socket to the
-// selected physical Android Network and exempt it from the VPN. Do not close
+typedef enum {
+    TX_STATUS_OK = 0,
+    TX_STATUS_INVALID_ARGUMENT = 1,
+    TX_STATUS_INVALID_HANDLE = 2,
+    TX_STATUS_INVALID_STATE = 3,
+    TX_STATUS_REENTRANT_WAIT = 4,
+    TX_STATUS_INTERNAL_ERROR = 5,
+} tx_status_t;
+
+// Called synchronously with outbound-socket setup after a socket is created
+// and before it is used. The hook must bind the socket to the
+// selected physical Android Network and exempt it from the VPN. The protect
+// hook may run on the client loop or a libuv worker. Do not close
 // the fd or retain ownership of it. Return non-zero only when both operations
 // succeeded and the selected Network remained current.
 typedef int (*tx_socket_protect_fn)(int socket_fd, void* user_data);
@@ -91,21 +109,25 @@ TX_API tx_handle_t tx_client_start(const tx_client_config_t* config) TX_C_NOEXCE
 // when startup fails and closes it before this client is stopped.
 TX_API tx_handle_t tx_client_start_with_tun_fd(const tx_client_config_t* config, int tun_fd) TX_C_NOEXCEPT;
 
-// Start the Android client with a physical-network bind + VPN-exemption callback.
-// TX endpoint and direct DNS use the selected physical Network. TX-routed DNS
-// is resolved by the remote server's system resolver; no DNS address is
-// required in the client configuration.
+// Start the Android client with a VPN-exemption callback. TX-routed DNS is
+// resolved by the remote server's system resolver; direct domain resolution
+// is unavailable through this compatibility entry point.
 // Native code takes ownership of tun_fd, including startup-failure paths.
-// protect_user_data must remain valid until tx_client_stop() returns.
-TX_API tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
+// protect_user_data must remain valid until tx_client_wait() returns. This
+// compatibility entry point supports direct numeric targets only; use _ex
+// when direct-domain resolution is required.
+TX_API TX_DEPRECATED("use tx_client_start_android_ex for direct domain targets")
+tx_handle_t tx_client_start_android(const tx_client_config_t* config, int tun_fd,
                                            tx_socket_protect_fn protect_fn,
                                            void* protect_user_data) TX_C_NOEXCEPT;
 
 // Versioned Android network integration. protect_socket is used for every
-// outbound socket. resolve_host/query_dns provide physical-Network DNS for TX
-// bootstrap and targets routed to direct. TX-routed DNS uses the encrypted
-// tunnel and the server's system resolver.
-// hooks->user_data must remain valid until tx_client_stop() returns.
+// outbound socket. resolve_host/query_dns provide physical-Network DNS only
+// for targets already routed to direct. TX-routed DNS uses the encrypted
+// tunnel and the server's system resolver; TX endpoints must be numeric.
+// resolve_host/query_dns run on libuv workers. Android/JNI implementations
+// must AttachCurrentThread/DetachCurrentThread as needed. hooks->user_data
+// must remain valid until tx_client_wait() returns.
 TX_API tx_handle_t tx_client_start_android_ex(const tx_client_config_t* config, int tun_fd,
                                               const tx_android_network_hooks_t* hooks) TX_C_NOEXCEPT;
 
@@ -118,8 +140,12 @@ TX_API void tx_client_notify_network_changed(tx_handle_t handle) TX_C_NOEXCEPT;
 TX_API void tx_client_update_android_network_state(tx_handle_t handle,
                                                    unsigned int address_family_mask) TX_C_NOEXCEPT;
 
-// Stop the client.
-TX_API void tx_client_stop(tx_handle_t handle) TX_C_NOEXCEPT;
+// Three-phase asynchronous lifecycle. stop only requests shutdown and never
+// joins. wait is allowed only after stop and must be called outside hooks and
+// the client loop. destroy is non-blocking and is allowed only after wait.
+TX_API tx_status_t tx_client_stop(tx_handle_t handle) TX_C_NOEXCEPT;
+TX_API tx_status_t tx_client_wait(tx_handle_t handle) TX_C_NOEXCEPT;
+TX_API tx_status_t tx_client_destroy(tx_handle_t handle) TX_C_NOEXCEPT;
 
 // Get cumulative client traffic counters. Returns 0 on success, -1 on failure.
 TX_API int tx_client_get_traffic_stats(tx_handle_t handle,
@@ -128,8 +154,9 @@ TX_API int tx_client_get_traffic_stats(tx_handle_t handle,
 // Start the server. Returns handle or NULL on failure.
 TX_API tx_handle_t tx_server_start(const tx_server_config_t* config) TX_C_NOEXCEPT;
 
-// Stop the server.
-TX_API void tx_server_stop(tx_handle_t handle) TX_C_NOEXCEPT;
+TX_API tx_status_t tx_server_stop(tx_handle_t handle) TX_C_NOEXCEPT;
+TX_API tx_status_t tx_server_wait(tx_handle_t handle) TX_C_NOEXCEPT;
+TX_API tx_status_t tx_server_destroy(tx_handle_t handle) TX_C_NOEXCEPT;
 
 // Get version string.
 TX_API const char* tx_version(void) TX_C_NOEXCEPT;
@@ -139,3 +166,4 @@ TX_API const char* tx_version(void) TX_C_NOEXCEPT;
 #endif
 
 #undef TX_C_NOEXCEPT
+#undef TX_DEPRECATED

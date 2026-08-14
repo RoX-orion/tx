@@ -19,7 +19,7 @@ public:
     static constexpr size_t kPrependSize = 8;  // space for header prepend
 
     explicit Buffer(size_t initial_size = kInitialSize)
-        : buf_(kPrependSize + initial_size),
+        : buf_(checked_initial_size(initial_size)),
           read_pos_(kPrependSize),
           write_pos_(kPrependSize) {}
 
@@ -34,7 +34,10 @@ public:
     size_t capacity() const { return buf_.size(); }
 
     // Advance write position after external write
-    void commit(size_t n) { write_pos_ += n; }
+    void commit(size_t n) {
+        if (n > writable_bytes()) throw std::out_of_range("Buffer commit exceeds writable space");
+        write_pos_ += n;
+    }
 
     // Consume n bytes from front
     void consume(size_t n) {
@@ -69,8 +72,19 @@ public:
 
     // Append data
     void append(const uint8_t* src, size_t n) {
+        if (!src && n != 0) throw std::invalid_argument("Buffer append source is null");
+        const uintptr_t source = reinterpret_cast<uintptr_t>(src);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(buf_.data());
+        const uintptr_t end = begin + buf_.size();
+        if (n != 0 && source >= begin && source < end) {
+            if (n > end - source)
+                throw std::out_of_range("Buffer append source exceeds buffer storage");
+            std::vector<uint8_t> snapshot(src, src + n);
+            append(snapshot.data(), snapshot.size());
+            return;
+        }
         ensure_writable(n);
-        memcpy(writable(), src, n);
+        if (n) memcpy(writable(), src, n);
         commit(n);
     }
 
@@ -83,13 +97,20 @@ public:
     }
 
     void append(const Buffer& other) {
+        if (this == &other) {
+            std::vector<uint8_t> snapshot(data(), data() + readable());
+            append(snapshot.data(), snapshot.size());
+            return;
+        }
         append(other.data(), other.readable());
     }
 
     // Prepend (for headers) — must have reserved space
     void prepend(const uint8_t* src, size_t n) {
+        if (!src && n != 0) throw std::invalid_argument("Buffer prepend source is null");
+        if (n > read_pos_) throw std::out_of_range("Buffer prepend exceeds reserved space");
         read_pos_ -= n;
-        memcpy(buf_.data() + read_pos_, src, n);
+        if (n) memcpy(buf_.data() + read_pos_, src, n);
     }
 
     // Access internal buffer for libuv
@@ -114,6 +135,12 @@ public:
     }
 
 private:
+    static size_t checked_initial_size(size_t initial_size) {
+        if (initial_size > std::numeric_limits<size_t>::max() - kPrependSize)
+            throw std::length_error("Buffer initial size overflow");
+        return kPrependSize + initial_size;
+    }
+
     void ensure_writable(size_t n) {
         if (writable_bytes() >= n) return;
 

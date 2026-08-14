@@ -10,6 +10,12 @@
 
 namespace tx {
 
+static IpAddr parse_ip(const std::string& host, uint16_t port = 0) {
+    IpAddr result;
+    assert(IpAddr::parse(host, port, result));
+    return result;
+}
+
 struct ClientAppQuicTest {
     static void configure(ClientApp& app, bool quic_sniff = true) {
         app.config_.udp_quic_sniff = quic_sniff;
@@ -45,8 +51,8 @@ struct ClientAppQuicTest {
         ClientApp app;
         configure(app);
         const uint8_t packet[] = {0x00};
-        app.handle_lwip_udp_datagram(1, IpAddr::from_string("10.0.0.2", 10000),
-                                     IpAddr::from_string("203.0.113.7", 443),
+        app.handle_lwip_udp_datagram(1, parse_ip("10.0.0.2", 10000),
+                                     parse_ip("203.0.113.7", 443),
                                      packet, sizeof(packet));
         const ClientApp::UdpFlow& result = flow(app, 1);
         assert(result.route_ready);
@@ -64,8 +70,8 @@ struct ClientAppQuicTest {
         ClientApp app;
         configure(app, false);
         const uint8_t packet[] = {0xc0, 0x00};
-        app.handle_lwip_udp_datagram(2, IpAddr::from_string("10.0.0.2", 10001),
-                                     IpAddr::from_string("203.0.113.8", 443),
+        app.handle_lwip_udp_datagram(2, parse_ip("10.0.0.2", 10001),
+                                     parse_ip("203.0.113.8", 443),
                                      packet, sizeof(packet));
         const ClientApp::UdpFlow& result = flow(app, 2);
         assert(result.route_ready);
@@ -104,8 +110,8 @@ struct ClientAppQuicTest {
         configure(app);
         const std::string fake_ip = allocate_fake_ipv4(app, "cached.example");
         const uint8_t packet[] = {0xc0, 0x00};
-        app.handle_lwip_udp_datagram(3, IpAddr::from_string("10.0.0.2", 10002),
-                                     IpAddr::from_string(fake_ip, 443),
+        app.handle_lwip_udp_datagram(3, parse_ip("10.0.0.2", 10002),
+                                     parse_ip(fake_ip, 443),
                                      packet, sizeof(packet));
         const ClientApp::UdpFlow& result = flow(app, 3);
         assert(result.route_ready);
@@ -122,19 +128,20 @@ struct ClientAppQuicTest {
         ClientApp::UdpFlow flow;
         flow.kind = ClientApp::UdpFlowKind::Tun;
         flow.fake_ip_target = true;
-        flow.tun_src_ip = IpAddr::from_string("10.0.0.2", 10002);
-        flow.tun_dst_ip = IpAddr::from_string("198.18.1.10", 443);
+        flow.tun_src_ip = parse_ip("10.0.0.2", 10002);
+        flow.tun_dst_ip = parse_ip("198.18.1.10", 443);
 
         TargetAddr actual;
         actual.type = AddrType::IPv4;
         actual.host = "142.250.1.2";
         actual.port = 443;
-        const IpAddr source = app.tun_udp_response_source(flow, actual);
+        IpAddr source;
+        assert(app.tun_udp_response_source(flow, actual, source));
         assert(source == flow.tun_dst_ip);
 
         flow.fake_ip_target = false;
-        assert(app.tun_udp_response_source(flow, actual) ==
-               IpAddr::from_string("142.250.1.2", 443));
+        assert(app.tun_udp_response_source(flow, actual, source));
+        assert(source == parse_ip("142.250.1.2", 443));
 
         flow.route_target.type = AddrType::Domain;
         flow.route_target.host = "youtubei.googleapis.com";
@@ -142,8 +149,8 @@ struct ClientAppQuicTest {
         flow.send_target.type = AddrType::IPv6;
         flow.send_target.host = "2607:f8b0:4004:c1d::5e";
         flow.send_target.port = 443;
-        assert(app.tun_udp_response_source(flow, actual) ==
-               IpAddr::from_string(actual.host, actual.port));
+        assert(app.tun_udp_response_source(flow, actual, source));
+        assert(source == parse_ip(actual.host, actual.port));
     }
 
     static void stale_fake_ipv6_is_not_routed_as_private() {
@@ -168,8 +175,8 @@ struct ClientAppQuicTest {
         assert(app.fake_ip_dns_.configure("198.18.0.0/16", "fd00:198:18::/96",
                                           60, error));
         const uint8_t packet[] = {0x01};
-        app.handle_lwip_udp_datagram(9, IpAddr::from_string("fd00:198:18::1", 10006),
-                                     IpAddr::from_string("fd00:198:18::999", 443),
+        app.handle_lwip_udp_datagram(9, parse_ip("fd00:198:18::1", 10006),
+                                     parse_ip("fd00:198:18::999", 443),
                                      packet, sizeof(packet));
         assert(app.udp_flows_.empty());
     }
@@ -203,8 +210,8 @@ struct ClientAppQuicTest {
                 return true;
             }, error));
 
-        const IpAddr source = IpAddr::from_string("198.18.0.3", 53000);
-        const IpAddr dns = IpAddr::from_string("198.18.0.2", 53);
+        const IpAddr source = parse_ip("198.18.0.3", 53000);
+        const IpAddr dns = parse_ip("198.18.0.2", 53);
         Buffer first;
         const auto a = dns_query(0x1234, 1);
         assert(build_udp_tun_packet(source, source.port, dns, dns.port,
@@ -246,10 +253,10 @@ struct ClientAppQuicTest {
                 return true;
             }, error));
 
-        const IpAddr dns = IpAddr::from_string("198.18.0.2", 53);
+        const IpAddr dns = parse_ip("198.18.0.2", 53);
         const auto query = dns_query(0x1000, 1);
         for (uint16_t port = 53000; port < 53300; ++port) {
-            const IpAddr source = IpAddr::from_string("198.18.0.3", port);
+            const IpAddr source = parse_ip("198.18.0.3", port);
             Buffer packet;
             assert(build_udp_tun_packet(source, source.port, dns, dns.port,
                                         query.data(), query.size(), packet));
@@ -263,7 +270,7 @@ struct ClientAppQuicTest {
 
         app.close_all_tun_dns_flows();
         assert(app.tun_dns_flows_.empty());
-        const IpAddr source = IpAddr::from_string("198.18.0.3", 60000);
+        const IpAddr source = parse_ip("198.18.0.3", 60000);
         Buffer packet;
         assert(build_udp_tun_packet(source, source.port, dns, dns.port,
                                     query.data(), query.size(), packet));
@@ -304,8 +311,8 @@ struct ClientAppQuicTest {
         const std::string fake_ip = allocate_fake_ipv4(app, "pinned.example");
         const uint8_t first[] = {0x01};
         const uint8_t second[] = {0x02};
-        const IpAddr client = IpAddr::from_string("10.0.0.2", 10004);
-        const IpAddr fake_target = IpAddr::from_string(fake_ip, 443);
+        const IpAddr client = parse_ip("10.0.0.2", 10004);
+        const IpAddr fake_target = parse_ip(fake_ip, 443);
         app.handle_lwip_udp_datagram(6, client, fake_target, first, sizeof(first));
         app.handle_lwip_udp_datagram(6, client, fake_target, second, sizeof(second));
 
@@ -356,8 +363,8 @@ struct ClientAppQuicTest {
         app.quic_route_cache_[server_cid] = cached;
 
         const uint8_t short_header[] = {0x40, 0x91, 0x92, 0x93, 0x94, 0x00};
-        app.handle_lwip_udp_datagram(7, IpAddr::from_string("10.0.0.2", 10005),
-                                     IpAddr::from_string("203.0.113.11", 443),
+        app.handle_lwip_udp_datagram(7, parse_ip("10.0.0.2", 10005),
+                                     parse_ip("203.0.113.11", 443),
                                      short_header, sizeof(short_header));
         const ClientApp::UdpFlow& result = flow(app, 7);
         assert(result.route_ready);
@@ -427,8 +434,8 @@ struct ClientAppQuicTest {
         ClientApp app;
         configure(app);
         std::vector<uint8_t> packet(16 * 1024 + 1, 0xc0);
-        app.handle_lwip_udp_datagram(4, IpAddr::from_string("10.0.0.2", 10003),
-                                     IpAddr::from_string("203.0.113.10", 443),
+        app.handle_lwip_udp_datagram(4, parse_ip("10.0.0.2", 10003),
+                                     parse_ip("203.0.113.10", 443),
                                      packet.data(), packet.size());
         const ClientApp::UdpFlow& result = flow(app, 4);
         assert(result.route_ready);

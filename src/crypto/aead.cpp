@@ -5,7 +5,10 @@
 #include <openssl/crypto.h>
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace tx {
 
@@ -55,9 +58,8 @@ bool parse_aead_cipher(const std::string& name, AeadCipherKind& kind) {
 
 AeadCipher::AeadCipher(AeadCipherKind kind, const uint8_t* key, size_t key_len)
     : kind_(kind) {
-    if (key_len < kKeyLen) {
-        TX_FATAL("AEAD key must be at least %zu bytes", kKeyLen);
-    }
+    if (!key || key_len != kKeyLen)
+        throw std::invalid_argument("AEAD key must be exactly 32 bytes");
     memcpy(key_, key, kKeyLen);
 }
 
@@ -69,6 +71,14 @@ int AeadCipher::encrypt(const uint8_t nonce[kNonceLen],
                         const uint8_t* aad, size_t aad_len,
                         const uint8_t* plaintext, size_t plaintext_len,
                         uint8_t* output, size_t output_len) {
+    if (!nonce || (!aad && aad_len != 0) || (!plaintext && plaintext_len != 0) ||
+        !output || aad_len > static_cast<size_t>(INT_MAX) ||
+        plaintext_len > static_cast<size_t>(INT_MAX) ||
+        plaintext_len > std::numeric_limits<size_t>::max() - kTagLen ||
+        plaintext_len + kTagLen > static_cast<size_t>(INT_MAX)) {
+        TX_ERROR("Invalid or oversized AEAD encryption input");
+        return -1;
+    }
     if (output_len < plaintext_len + kTagLen) {
         TX_ERROR("AEAD output buffer too small");
         return -1;
@@ -122,6 +132,13 @@ int AeadCipher::decrypt(const uint8_t nonce[kNonceLen],
                         const uint8_t* ciphertext, size_t ciphertext_len,
                         const uint8_t* tag,
                         uint8_t* plaintext, size_t plaintext_len) {
+    if (!nonce || (!aad && aad_len != 0) ||
+        (!ciphertext && ciphertext_len != 0) || !tag || !plaintext ||
+        aad_len > static_cast<size_t>(INT_MAX) ||
+        ciphertext_len > static_cast<size_t>(INT_MAX)) {
+        TX_ERROR("Invalid or oversized AEAD decryption input");
+        return -1;
+    }
     if (plaintext_len < ciphertext_len) {
         TX_ERROR("AEAD plaintext buffer too small");
         return -1;

@@ -36,12 +36,13 @@ static void set_addr_type(TargetAddr& target) {
 
 static bool parse_port(const std::string& text, uint16_t& port) {
     if (text.empty()) return false;
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
-    if (errno != 0 || !end || *end != '\0' || value == 0 || value > 65535) {
-        return false;
+    uint32_t value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10u + static_cast<uint32_t>(c - '0');
+        if (value > 65535u) return false;
     }
+    if (value == 0) return false;
     port = static_cast<uint16_t>(value);
     return true;
 }

@@ -150,6 +150,17 @@ static void test_invalid_port() {
                                  strlen(overflow_request)) > 0);
     assert(overflow_handler.state() == tx::HttpProxyHandler::State::Error);
 
+    const char* non_decimal_ports[] = {" 443", "+443", "-1", "443x"};
+    for (const char* port : non_decimal_ports) {
+        tx::HttpProxyHandler strict_handler;
+        const std::string strict_request = std::string("CONNECT example.com:") + port +
+            " HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert(strict_handler.feed(
+            reinterpret_cast<const uint8_t*>(strict_request.data()),
+            strict_request.size()) > 0);
+        assert(strict_handler.state() == tx::HttpProxyHandler::State::Error);
+    }
+
     printf("OK\n");
 }
 

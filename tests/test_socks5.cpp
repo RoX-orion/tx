@@ -125,6 +125,27 @@ static void test_no_supported_auth_method() {
     printf("OK\n");
 }
 
+static void test_request_error_responses() {
+    const auto check_request_error = [](uint8_t command, uint8_t reserved,
+                                        uint8_t atyp, uint8_t expected_reply) {
+        tx::Socks5Handler handler;
+        uint8_t handshake[] = {0x05, 0x01, 0x00};
+        assert(handler.feed(handshake, sizeof(handshake)) == sizeof(handshake));
+        uint8_t request[] = {0x05, command, reserved, atyp};
+        assert(handler.feed(request, sizeof(request)) == sizeof(request));
+        assert(handler.state() == tx::Socks5State::Error);
+        assert(handler.failure_stage() == tx::Socks5Handler::FailureStage::Request);
+        tx::Buffer response;
+        handler.build_connect_response(false, response);
+        assert(response.readable() == 10);
+        assert(response.data()[0] == 0x05);
+        assert(response.data()[1] == expected_reply);
+    };
+    check_request_error(0x02, 0x00, 0x01, 0x07);
+    check_request_error(0x01, 0x00, 0x02, 0x08);
+    check_request_error(0x01, 0x01, 0x01, 0x01);
+}
+
 int main() {
     printf("=== SOCKS5 Tests ===\n");
     test_handshake();
@@ -132,6 +153,7 @@ int main() {
     test_connect_domain();
     test_connect_response();
     test_no_supported_auth_method();
+    test_request_error_responses();
     printf("All SOCKS5 tests passed!\n");
     return 0;
 }

@@ -1,6 +1,7 @@
 #include "tx/geo/geosite.h"
 #include "tx/common/log.h"
 #include "geo_file.h"
+#include "protobuf_reader.h"
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -17,27 +18,16 @@ static std::string to_lower_ascii(std::string s) {
 }
 
 static bool read_varint(const uint8_t* data, size_t len, size_t& pos, uint64_t& val) {
-    val = 0;
-    int shift = 0;
-    while (pos < len) {
-        uint8_t b = data[pos++];
-        val |= static_cast<uint64_t>(b & 0x7F) << shift;
-        if ((b & 0x80) == 0) return true;
-        shift += 7;
-        if (shift >= 64) return false;
-    }
-    return false;
+    return detail::read_proto_varint(data, len, pos, val);
 }
 
 static bool read_length_delimited(const uint8_t* data, size_t len, size_t& pos,
                                    const uint8_t*& field_data, size_t& field_len) {
-    uint64_t flen;
-    if (!read_varint(data, len, pos, flen)) return false;
-    if (pos + flen > len) return false;
-    field_data = data + pos;
-    field_len = static_cast<size_t>(flen);
-    pos += field_len;
-    return true;
+    return detail::read_proto_bytes(data, len, pos, field_data, field_len);
+}
+
+static bool skip_field(const uint8_t* data, size_t len, size_t& pos, uint32_t wt) {
+    return detail::skip_proto_field(data, len, pos, wt);
 }
 
 static bool read_string(const uint8_t* data, size_t len, size_t& pos, std::string& out) {
@@ -56,6 +46,7 @@ struct PbDomainAttribute {
 
 static bool parse_domain_attribute(const uint8_t* data, size_t len, PbDomainAttribute& attr) {
     size_t pos = 0;
+    bool has_key = false;
     while (pos < len) {
         uint64_t tag;
         if (!read_varint(data, len, pos, tag)) return false;
@@ -66,6 +57,7 @@ static bool parse_domain_attribute(const uint8_t* data, size_t len, PbDomainAttr
             case 1:
                 if (wt != 2) return false;
                 if (!read_string(data, len, pos, attr.key)) return false;
+                has_key = true;
                 break;
             case 2:
                 if (wt != 0) return false;
@@ -76,14 +68,10 @@ static bool parse_domain_attribute(const uint8_t* data, size_t len, PbDomainAttr
                 { uint64_t v; if (!read_varint(data, len, pos, v)) return false; attr.int_value = static_cast<int64_t>(v); }
                 break;
             default:
-                if (wt == 0) { uint64_t v; read_varint(data, len, pos, v); }
-                else if (wt == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-                else if (wt == 5) { pos += 4; }
-                else if (wt == 1) { pos += 8; }
-                else return false;
+                if (!skip_field(data, len, pos, wt)) return false;
         }
     }
-    return true;
+    return has_key;
 }
 
 // Domain: required Type type = 1; required string value = 2; repeated DomainAttribute attribute = 3;
@@ -95,6 +83,8 @@ struct PbDomain {
 
 static bool parse_domain(const uint8_t* data, size_t len, PbDomain& domain) {
     size_t pos = 0;
+    bool has_type = false;
+    bool has_value = false;
     while (pos < len) {
         uint64_t tag;
         if (!read_varint(data, len, pos, tag)) return false;
@@ -104,31 +94,27 @@ static bool parse_domain(const uint8_t* data, size_t len, PbDomain& domain) {
         switch (fn) {
             case 1: // type (enum/varint)
                 if (wt != 0) return false;
-                { uint64_t v; if (!read_varint(data, len, pos, v)) return false; domain.type = static_cast<uint32_t>(v); }
+                { uint64_t v; if (!read_varint(data, len, pos, v) || v > 3) return false; domain.type = static_cast<uint32_t>(v); has_type = true; }
                 break;
             case 2: // value (string)
                 if (wt != 2) return false;
                 if (!read_string(data, len, pos, domain.value)) return false;
+                has_value = true;
                 break;
             case 3: { // DomainAttribute (embedded message)
                 if (wt != 2) return false;
                 const uint8_t* ad; size_t al;
                 if (!read_length_delimited(data, len, pos, ad, al)) return false;
                 PbDomainAttribute attr;
-                if (parse_domain_attribute(ad, al, attr)) {
-                    domain.attributes.push_back(std::move(attr));
-                }
+                if (!parse_domain_attribute(ad, al, attr)) return false;
+                domain.attributes.push_back(std::move(attr));
                 break;
             }
             default:
-                if (wt == 0) { uint64_t v; read_varint(data, len, pos, v); }
-                else if (wt == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-                else if (wt == 5) { pos += 4; }
-                else if (wt == 1) { pos += 8; }
-                else return false;
+                if (!skip_field(data, len, pos, wt)) return false;
         }
     }
-    return true;
+    return has_type && has_value && !domain.value.empty();
 }
 
 // GeoSite: required string country_code = 1; repeated Domain domain = 2;
@@ -139,6 +125,7 @@ struct PbGeoSite {
 
 static bool parse_geosite_entry(const uint8_t* data, size_t len, PbGeoSite& site) {
     size_t pos = 0;
+    bool has_code = false;
     while (pos < len) {
         uint64_t tag;
         if (!read_varint(data, len, pos, tag)) return false;
@@ -149,31 +136,27 @@ static bool parse_geosite_entry(const uint8_t* data, size_t len, PbGeoSite& site
             case 1:
                 if (wt != 2) return false;
                 if (!read_string(data, len, pos, site.country_code)) return false;
+                has_code = true;
                 break;
             case 2: {
                 if (wt != 2) return false;
                 const uint8_t* dd; size_t dl;
                 if (!read_length_delimited(data, len, pos, dd, dl)) return false;
                 PbDomain domain;
-                if (parse_domain(dd, dl, domain)) {
-                    site.domains.push_back(std::move(domain));
-                }
+                if (!parse_domain(dd, dl, domain)) return false;
+                site.domains.push_back(std::move(domain));
                 break;
             }
             default:
-                if (wt == 0) { uint64_t v; read_varint(data, len, pos, v); }
-                else if (wt == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-                else if (wt == 5) { pos += 4; }
-                else if (wt == 1) { pos += 8; }
-                else return false;
+                if (!skip_field(data, len, pos, wt)) return false;
         }
     }
-    return true;
+    return has_code && !site.country_code.empty();
 }
 
 // GeoSiteList: repeated GeoSite entry = 1;
 static bool parse_geosite_list(const uint8_t* data, size_t len,
-                                std::function<void(PbGeoSite&)> callback) {
+                                std::vector<PbGeoSite>& sites) {
     size_t pos = 0;
     while (pos < len) {
         uint64_t tag;
@@ -185,15 +168,11 @@ static bool parse_geosite_list(const uint8_t* data, size_t len,
             const uint8_t* ed; size_t el;
             if (!read_length_delimited(data, len, pos, ed, el)) return false;
             PbGeoSite site;
-            if (parse_geosite_entry(ed, el, site)) {
-                callback(site);
-            }
+            if (!parse_geosite_entry(ed, el, site)) return false;
+            sites.push_back(std::move(site));
         } else {
-            if (wt == 0) { uint64_t v; read_varint(data, len, pos, v); }
-            else if (wt == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-            else if (wt == 5) { pos += 4; }
-            else if (wt == 1) { pos += 8; }
-            else return false;
+            if (fn == 1) return false;
+            if (!skip_field(data, len, pos, wt)) return false;
         }
     }
     return true;
@@ -216,10 +195,13 @@ bool GeoSiteMatcher::load(const std::string& path) {
 
 bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {
     size_t domain_count = 0;
+    std::vector<PbGeoSite> sites;
+    if (!parse_geosite_list(data, len, sites)) return false;
 
-    bool ok = parse_geosite_list(data, len,
-        [this, &domain_count](PbGeoSite& site) {
+    for (auto& site : sites) {
             const std::string country = to_lower_ascii(site.country_code);
+            if (std::find(tag_order_.begin(), tag_order_.end(), country) ==
+                tag_order_.end()) tag_order_.push_back(country);
 
             for (auto& dom : site.domains) {
                 domain_count++;
@@ -239,13 +221,16 @@ bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {
                         try {
                             regex_patterns_.push_back({std::regex(value), country});
                         } catch (const std::regex_error& e) {
-                            TX_WARN("Invalid regex in geosite '%s': %s (%s)",
+                            TX_ERROR("Invalid regex in geosite '%s': %s (%s)",
                                     country.c_str(), value.c_str(), e.what());
+                            return false;
                         }
                         break;
+                    default:
+                        return false;
                 }
             }
-        });
+    }
 
     // Build Aho-Corasick automaton
     ac_automaton_.build();
@@ -253,7 +238,7 @@ bool GeoSiteMatcher::parse_geosite(const uint8_t* data, size_t len) {
     TX_INFO("GeoSite loaded: %zu domains, trie nodes: %zu, AC patterns: %zu, exact entries: %zu, regex: %zu",
             domain_count, domain_trie_.size(), ac_automaton_.pattern_count(),
             exact_map_.size(), regex_patterns_.size());
-    return ok;
+    return true;
 }
 
 bool GeoSiteMatcher::match(const std::string& domain, const std::string& tag) const {
@@ -305,28 +290,13 @@ bool GeoSiteMatcher::match_domain(const std::string& domain, const std::string& 
 }
 
 std::string GeoSiteMatcher::lookup(const std::string& domain) const {
-    const std::string normalized_domain = to_lower_ascii(domain);
-
-    // Check each country in order of most common
-    for (const auto& kv : exact_map_) {
-        for (const auto& e : kv.second) {
-            if (normalized_domain == e) return kv.first;
-        }
-    }
-
-    auto trie_result = domain_trie_.lookup(normalized_domain);
-    if (!trie_result.empty()) return trie_result;
-
-    auto ac_results = ac_automaton_.search_all(normalized_domain);
-    if (!ac_results.empty()) return ac_results[0];
-
-    for (const auto& re : regex_patterns_) {
-        try {
-            if (std::regex_search(normalized_domain, re.pattern)) return re.country;
-        } catch (...) {}
-    }
-
+    for (const auto& tag : tag_order_) if (match(domain, tag)) return tag;
     return "";
+}
+
+bool GeoSiteMatcher::has_tag(const std::string& tag) const {
+    const std::string normalized = to_lower_ascii(tag);
+    return std::find(tag_order_.begin(), tag_order_.end(), normalized) != tag_order_.end();
 }
 
 } // namespace tx

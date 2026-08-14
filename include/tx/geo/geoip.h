@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "tx/geo/radix_tree.h"
 #include "tx/common/types.h"
 
@@ -21,6 +22,7 @@ public:
 
     // Lookup country code for an IP
     std::string lookup(const IpAddr& addr) const;
+    bool has_tag(const std::string& tag) const;
 
     // Access underlying trees
     const RadixTree& ipv4_tree() const { return tree_v4_; }
@@ -32,6 +34,7 @@ private:
 
     RadixTree tree_v4_;
     RadixTree tree_v6_;
+    std::vector<std::string> tag_order_;
 };
 
 } // namespace tx

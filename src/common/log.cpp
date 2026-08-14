@@ -29,8 +29,11 @@ static const char* level_str(LogLevel level) {
 
 void log_impl(LogLevel level, const char* file, int line, const char* fmt, ...) {
     // Extract filename
-    const char* fname = strrchr(file, '/');
-    fname = fname ? fname + 1 : file;
+    const char* slash = strrchr(file, '/');
+    const char* backslash = strrchr(file, '\\');
+    const char* separator = !slash ? backslash
+                                   : (!backslash || slash > backslash ? slash : backslash);
+    const char* fname = separator ? separator + 1 : file;
 
 #if defined(TX_PLATFORM_ANDROID)
     if (!g_log_file) {
@@ -59,7 +62,11 @@ void log_impl(LogLevel level, const char* file, int line, const char* fmt, ...) 
     // Timestamp
     time_t now = time(nullptr);
     struct tm tm_buf;
+#if defined(TX_PLATFORM_WINDOWS)
+    localtime_s(&tm_buf, &now);
+#else
     localtime_r(&now, &tm_buf);
+#endif
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tm_buf);
 

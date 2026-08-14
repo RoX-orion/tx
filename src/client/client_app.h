@@ -111,6 +111,8 @@ private:
         bool                 local_paused_for_connect = false;
         bool                 tunnel_paused_for_local = false;
         bool                 admitted = false;
+        bool                 closing = false;
+        bool                 resources_released = false;
     };
     using ProxyConnPtr = std::shared_ptr<ProxyConn>;
 
@@ -220,6 +222,10 @@ private:
     void bind_proxy_target_callback(ProxyConnPtr conn);
     void on_proxy_read(ProxyConnPtr conn, Buffer& data);
     void on_proxy_close(ProxyConnPtr conn);
+    bool append_proxy_input(ProxyConnPtr conn, Buffer& data, size_t hard_limit,
+                            const char* phase);
+    void fail_proxy_connection(ProxyConnPtr conn, int http_status = 502);
+    void release_proxy_resources(ProxyConnPtr conn);
     bool admit_proxy_connection(ProxyConnPtr conn);
     SessionId allocate_session_id();
     void release_session_id(SessionId session_id);
@@ -250,7 +256,7 @@ private:
     void tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len);
     bool append_lwip_tcp_data(ProxyConnPtr conn, Buffer& data);
     void release_local_read(ProxyConnPtr conn);
-    void tunnel_send_connect(ProxyConnPtr conn);
+    bool tunnel_send_connect(ProxyConnPtr conn);
     void tunnel_send_disconnect(ProxyConnPtr conn);
     void tunnel_send_half_close(ProxyConnPtr conn);
     void on_local_eof(ProxyConnPtr conn);
@@ -365,7 +371,8 @@ private:
     void release_tun_quic_sniffer(UdpFlow& flow);
     void clear_tun_quic_pending(UdpFlow& flow);
     void flush_tun_quic_pending(const std::string& flow_key, UdpFlow& flow);
-    IpAddr tun_udp_response_source(const UdpFlow& flow, const TargetAddr& source) const;
+    bool tun_udp_response_source(const UdpFlow& flow, const TargetAddr& source,
+                                 IpAddr& output) const;
     bool write_tun_udp_packet(const UdpFlow& flow, const TargetAddr& source,
                               const uint8_t* data, size_t len);
     static void on_tun_poll(uv_poll_t* handle, int status, int events);

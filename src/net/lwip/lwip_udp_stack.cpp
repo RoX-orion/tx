@@ -146,11 +146,16 @@ void acknowledge(tcp_pcb* pcb, size_t amount) {
 } // namespace
 
 struct LwipTcpStream::Impl {
+    enum class Termination { Close, Abort, PcbAlreadyFreed };
+
     tcp_pcb* pcb = nullptr;
     tcp_pcb* identity = nullptr;
+    std::weak_ptr<LwipTcpStream> owner;
     bool paused = false;
     bool closed = false;
+    bool aborted = false;
     bool read_eof = false;
+    bool pending_eof = false;
     bool write_shutdown = false;
     bool fin_pending = false;
     bool in_lwip_callback = false;
@@ -164,6 +169,49 @@ struct LwipTcpStream::Impl {
     EventCallback close_callback;
     ErrorCallback error_callback;
     std::function<void(tcp_pcb*)> detach;
+
+    bool terminate(Termination how, int error = ERR_OK) {
+        if (closed) return aborted;
+
+        closed = true;
+        aborted = how == Termination::Abort;
+        paused = false;
+        read_eof = true;
+        pending_eof = false;
+
+        tcp_pcb* current = pcb;
+        pcb = nullptr;
+        tcp_pcb* key = identity;
+        auto error_cb = std::move(error_callback);
+        auto close_cb = std::move(close_callback);
+        auto detach_cb = std::move(detach);
+        data_callback = DataCallback();
+        writable_callback = EventCallback();
+        eof_callback = EventCallback();
+        read_queue.clear();
+        write_queue.clear();
+        unacknowledged_receive = 0;
+        queued_bytes = 0;
+
+        if (current && how != Termination::PcbAlreadyFreed) {
+            tcp_arg(current, nullptr);
+            tcp_recv(current, nullptr);
+            tcp_sent(current, nullptr);
+            tcp_poll(current, nullptr, 0);
+            tcp_err(current, nullptr);
+            if (how == Termination::Abort) {
+                tcp_abort(current);
+            } else if (tcp_close(current) != ERR_OK) {
+                aborted = true;
+                tcp_abort(current);
+            }
+        }
+
+        if (error != ERR_OK && error_cb) error_cb(error);
+        if (close_cb) close_cb();
+        if (detach_cb) detach_cb(key);
+        return aborted;
+    }
 
     bool flush() {
         if (!pcb || closed) return false;
@@ -199,25 +247,27 @@ struct LwipTcpStream::Impl {
 
     static err_t on_receive(void* arg, tcp_pcb* pcb, pbuf* packet, err_t error) {
         auto* self = static_cast<Impl*>(arg);
+        auto keep_alive = self ? self->owner.lock() : std::shared_ptr<LwipTcpStream>();
         if (!self || self->closed) {
             if (packet) pbuf_free(packet);
             return ERR_OK;
         }
         if (error != ERR_OK) {
             if (packet) pbuf_free(packet);
-            auto callback = self->error_callback;
             self->in_lwip_callback = true;
-            if (callback) callback(error);
-            if (self->closed) return ERR_ABRT;
-            self->in_lwip_callback = false;
-            return error;
+            self->terminate(Termination::Abort, error);
+            return ERR_ABRT;
         }
         if (!packet) {
             self->read_eof = true;
+            if (self->paused || !self->read_queue.empty()) {
+                self->pending_eof = true;
+                return ERR_OK;
+            }
             auto callback = self->eof_callback;
             self->in_lwip_callback = true;
             if (callback) callback();
-            if (self->closed) return ERR_ABRT;
+            if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
             self->in_lwip_callback = false;
             return ERR_OK;
         }
@@ -225,19 +275,13 @@ struct LwipTcpStream::Impl {
         const bool copied = pbuf_copy_partial(packet, bytes.data(), packet->tot_len, 0) ==
                             packet->tot_len;
         pbuf_free(packet);
-        if (!copied) return ERR_BUF;
+        if (!copied) return ERR_OK;
         if (self->paused) {
-            const size_t limit = std::min<size_t>(kMaxTcpPendingRead, TCP_WND);
-            if (self->unacknowledged_receive + bytes.size() > limit) {
+            if (bytes.size() > kMaxTcpPendingRead -
+                                   std::min(self->unacknowledged_receive,
+                                            kMaxTcpPendingRead)) {
                 self->in_lwip_callback = true;
-                tcp_abort(pcb);
-                self->pcb = nullptr;
-                self->closed = true;
-                auto close_callback = self->close_callback;
-                auto detach = self->detach;
-                tcp_pcb* identity = self->identity;
-                if (close_callback) close_callback();
-                if (detach) detach(identity);
+                self->terminate(Termination::Abort, ERR_BUF);
                 return ERR_ABRT;
             }
             self->unacknowledged_receive += bytes.size();
@@ -249,7 +293,7 @@ struct LwipTcpStream::Impl {
         auto callback = self->data_callback;
         self->in_lwip_callback = true;
         if (callback) callback(data);
-        if (self->closed) return ERR_ABRT;
+        if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
         self->in_lwip_callback = false;
         acknowledge(pcb, bytes.size());
         return ERR_OK;
@@ -257,36 +301,36 @@ struct LwipTcpStream::Impl {
 
     static err_t on_sent(void* arg, tcp_pcb*, u16_t) {
         auto* self = static_cast<Impl*>(arg);
+        auto keep_alive = self ? self->owner.lock() : std::shared_ptr<LwipTcpStream>();
         if (!self || self->closed) return ERR_OK;
-        if (!self->flush()) return ERR_ABRT;
+        if (!self->flush()) {
+            self->in_lwip_callback = true;
+            self->terminate(Termination::Abort, ERR_BUF);
+            return ERR_ABRT;
+        }
         auto callback = self->writable_callback;
         self->in_lwip_callback = true;
         if (callback) callback();
-        if (self->closed) return ERR_ABRT;
+        if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
         self->in_lwip_callback = false;
         return ERR_OK;
     }
 
     static err_t on_poll(void* arg, tcp_pcb*) {
         auto* self = static_cast<Impl*>(arg);
+        auto keep_alive = self ? self->owner.lock() : std::shared_ptr<LwipTcpStream>();
         if (!self || self->closed) return ERR_OK;
-        return self->flush() ? ERR_OK : ERR_ABRT;
+        if (self->flush()) return ERR_OK;
+        self->in_lwip_callback = true;
+        self->terminate(Termination::Abort, ERR_BUF);
+        return ERR_ABRT;
     }
 
     static void on_error(void* arg, err_t error) {
         auto* self = static_cast<Impl*>(arg);
+        auto keep_alive = self ? self->owner.lock() : std::shared_ptr<LwipTcpStream>();
         if (!self || self->closed) return;
-        tcp_pcb* identity = self->identity;
-        auto error_callback = self->error_callback;
-        auto close_callback = self->close_callback;
-        auto detach = self->detach;
-        self->pcb = nullptr;
-        self->closed = true;
-        if (error_callback) error_callback(error);
-        if (close_callback) close_callback();
-        // Detaching can release the last owner of this Impl. Do it last and
-        // never access self afterwards.
-        if (detach) detach(identity);
+        self->terminate(Termination::PcbAlreadyFreed, error);
     }
 };
 
@@ -365,6 +409,7 @@ struct LwipUdpStack::Impl {
         state->identity = pcb;
         state->detach = [self](tcp_pcb* key) { self->tcp_flows.erase(key); };
         auto stream = std::shared_ptr<LwipTcpStream>(new LwipTcpStream(std::move(state)));
+        stream->impl_->owner = stream;
         self->tcp_flows.emplace(pcb, stream);
         tcp_arg(pcb, stream->impl_.get());
         tcp_recv(pcb, LwipTcpStream::Impl::on_receive);
@@ -500,7 +545,7 @@ bool LwipUdpStack::initialize(const std::vector<std::string>& addresses, int mtu
         error = "failed to bind Pretend TCP listener"; shutdown(); return false;
     }
     tcp_pcb* listener = tcp_listen(impl_->tcp_listener);
-    if (!listener) { error = "failed to listen for Pretend TCP"; impl_->tcp_listener = nullptr; shutdown(); return false; }
+    if (!listener) { error = "failed to listen for Pretend TCP"; shutdown(); return false; }
     impl_->tcp_listener = listener;
     tcp_arg(listener, impl_.get());
     tcp_accept(listener, Impl::accept_tcp);
@@ -575,7 +620,8 @@ LwipTcpStream::~LwipTcpStream() { if (impl_ && !impl_->closed) reset(); }
 bool LwipTcpStream::write(const uint8_t* data, size_t len) {
     if (!impl_ || impl_->closed || impl_->write_shutdown || impl_->fin_pending ||
         (!data && len)) return false;
-    if (impl_->queued_bytes + len > kMaxTcpPendingWrite) { reset(); return false; }
+    if (len > kMaxTcpPendingWrite ||
+        impl_->queued_bytes > kMaxTcpPendingWrite - len) { reset(); return false; }
     if (len) {
         impl_->write_queue.emplace_back(data, data + len);
         impl_->queued_bytes += len;
@@ -584,7 +630,7 @@ bool LwipTcpStream::write(const uint8_t* data, size_t len) {
     return true;
 }
 bool LwipTcpStream::write(Buffer& data) {
-    if (data.empty()) return false;
+    if (data.empty()) return true;
     if (!write(data.data(), data.readable())) return false;
     data.clear(); return true;
 }
@@ -603,6 +649,12 @@ void LwipTcpStream::resume_read() {
         acknowledge(impl_->pcb, bytes.size());
         impl_->unacknowledged_receive -= bytes.size();
     }
+    if (impl_->pcb && !impl_->closed && !impl_->paused &&
+        impl_->read_queue.empty() && impl_->pending_eof) {
+        impl_->pending_eof = false;
+        auto callback = impl_->eof_callback;
+        if (callback) callback();
+    }
 }
 void LwipTcpStream::shutdown_write() {
     if (!impl_ || impl_->closed || impl_->write_shutdown) return;
@@ -611,36 +663,20 @@ void LwipTcpStream::shutdown_write() {
 }
 void LwipTcpStream::close() {
     if (!impl_ || impl_->closed) return;
-    tcp_pcb* pcb = impl_->pcb;
-    auto close_callback = impl_->close_callback;
-    auto detach = impl_->detach;
-    tcp_pcb* identity = impl_->identity;
-    impl_->closed = true; impl_->pcb = nullptr;
-    tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_sent(pcb, nullptr); tcp_err(pcb, nullptr);
-    if (impl_->in_lwip_callback || tcp_close(pcb) != ERR_OK) tcp_abort(pcb);
-    if (close_callback) close_callback();
-    if (detach) detach(identity);
+    impl_->terminate(Impl::Termination::Close);
 }
 void LwipTcpStream::reset() {
     if (!impl_ || impl_->closed) return;
-    tcp_pcb* pcb = impl_->pcb;
-    auto close_callback = impl_->close_callback;
-    auto detach = impl_->detach;
-    tcp_pcb* identity = impl_->identity;
-    impl_->closed = true; impl_->pcb = nullptr;
-    tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_sent(pcb, nullptr); tcp_err(pcb, nullptr);
-    tcp_abort(pcb);
-    if (close_callback) close_callback();
-    if (detach) detach(identity);
+    impl_->terminate(Impl::Termination::Abort);
 }
 size_t LwipTcpStream::pending_write_bytes() const { return impl_ ? impl_->queued_bytes : 0; }
 bool LwipTcpStream::is_closed() const { return !impl_ || impl_->closed; }
 bool LwipTcpStream::is_read_eof() const { return impl_ && impl_->read_eof; }
 bool LwipTcpStream::is_write_shutdown() const { return impl_ && impl_->write_shutdown; }
-void LwipTcpStream::set_data_callback(DataCallback cb) { impl_->data_callback = std::move(cb); }
-void LwipTcpStream::set_writable_callback(EventCallback cb) { impl_->writable_callback = std::move(cb); }
-void LwipTcpStream::set_eof_callback(EventCallback cb) { impl_->eof_callback = std::move(cb); }
-void LwipTcpStream::set_close_callback(EventCallback cb) { impl_->close_callback = std::move(cb); }
-void LwipTcpStream::set_error_callback(ErrorCallback cb) { impl_->error_callback = std::move(cb); }
+void LwipTcpStream::set_data_callback(DataCallback cb) { if (impl_ && !impl_->closed) impl_->data_callback = std::move(cb); }
+void LwipTcpStream::set_writable_callback(EventCallback cb) { if (impl_ && !impl_->closed) impl_->writable_callback = std::move(cb); }
+void LwipTcpStream::set_eof_callback(EventCallback cb) { if (impl_ && !impl_->closed) impl_->eof_callback = std::move(cb); }
+void LwipTcpStream::set_close_callback(EventCallback cb) { if (impl_ && !impl_->closed) impl_->close_callback = std::move(cb); }
+void LwipTcpStream::set_error_callback(ErrorCallback cb) { if (impl_ && !impl_->closed) impl_->error_callback = std::move(cb); }
 
 } // namespace tx

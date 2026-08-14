@@ -20,9 +20,14 @@ bool parse_prefix(const std::string& cidr, std::string& host, long& prefix) {
     size_t slash = cidr.find('/');
     if (slash == std::string::npos) return false;
     host = cidr.substr(0, slash);
+    const std::string prefix_text = cidr.substr(slash + 1);
+    if (prefix_text.empty() ||
+        prefix_text.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
     char* end = nullptr;
-    prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
-    return end && *end == '\0';
+    prefix = std::strtol(prefix_text.c_str(), &end, 10);
+    return end == prefix_text.c_str() + prefix_text.size();
 }
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -101,11 +106,26 @@ bool FakeIpDns::configure(const std::string& ipv4_range,
         error = "fake-IP DNS cache capacity must be positive";
         return false;
     }
+    const uint64_t ipv4_host_count = 1ULL << (32 - prefix);
+    const uint64_t ipv4_capacity = ipv4_host_count > 5 ? ipv4_host_count - 5 : 0;
+    const uint64_t ipv6_capacity = (1ULL << 32) - 4;
+    if (capacity > ipv4_capacity || capacity > ipv6_capacity) {
+        error = "dns.cache_capacity exceeds the configured fake-IP address pool";
+        return false;
+    }
     ipv4_prefix_ = static_cast<uint8_t>(prefix);
     const uint32_t mask = prefix == 0 ? 0 : 0xffffffffu << (32 - prefix);
     ipv4_network_ = ntohl(address4.s_addr) & mask;
-    std::memcpy(ipv6_prefix_, &address6, 16);
     ipv6_prefix_bits_ = static_cast<uint8_t>(prefix6);
+    std::memcpy(ipv6_prefix_, &address6, 16);
+    const size_t full_bytes = ipv6_prefix_bits_ / 8;
+    const uint8_t partial_bits = static_cast<uint8_t>(ipv6_prefix_bits_ % 8);
+    if (partial_bits != 0) {
+        ipv6_prefix_[full_bytes] &=
+            static_cast<uint8_t>(0xffu << (8 - partial_bits));
+    }
+    const size_t clear_from = full_bytes + (partial_bits != 0 ? 1 : 0);
+    std::memset(ipv6_prefix_ + clear_from, 0, sizeof(ipv6_prefix_) - clear_from);
     dns_ttl_ = ttl_seconds ? ttl_seconds : 60;
     mapping_ttl_ = mapping_ttl_seconds ? mapping_ttl_seconds : 1800;
     capacity_ = capacity;
@@ -144,6 +164,7 @@ std::string FakeIpDns::allocate_ipv6() {
     for (size_t attempts = 0; attempts <= capacity_; ++attempts) {
         uint8_t bytes[16];
         std::memcpy(bytes, ipv6_prefix_, 16);
+        if (next_ipv6_ < 4) next_ipv6_ = 4;
         const uint32_t value = next_ipv6_++;
         bytes[12] = static_cast<uint8_t>(value >> 24);
         bytes[13] = static_cast<uint8_t>(value >> 16);

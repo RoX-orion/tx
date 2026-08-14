@@ -41,6 +41,20 @@ int main() {
                       config_json("\"cipher\":\"aes-256-gcm\""),
                       obsolete_cipher));
 
+    tx::ServerConfig retained = config;
+    assert(!load_text("negative_port",
+                      config_json("\"listen\":{\"port\":-1}"), retained));
+    assert(retained.listen_port == config.listen_port);
+    assert(retained.psk == config.psk);
+    assert(!load_text("large_port",
+                      "{\"listen\":{\"port\":70000},\"secret\":\"hex:"
+                      "000102030405060708090a0b0c0d0e0f"
+                      "101112131415161718191a1b1c1d1e1f\"}", retained));
+    assert(!load_text("float_limit",
+                      config_json("\"limits\":{\"max_clients\":1.5}"), retained));
+    assert(!load_text("wrong_log_type",
+                      config_json("\"log_level\":true"), retained));
+
     std::printf("server config tests passed\n");
     return 0;
 }

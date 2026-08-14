@@ -27,6 +27,11 @@ public:
         Connect,
         UdpAssociate,
     };
+    enum class FailureStage {
+        None,
+        MethodNegotiation,
+        Request,
+    };
 
     Socks5Handler();
 
@@ -48,6 +53,8 @@ public:
     // Get parsed target
     const TargetAddr& target() const { return target_; }
     Command command() const { return command_; }
+    FailureStage failure_stage() const { return failure_stage_; }
+    uint8_t failure_reply() const { return failure_reply_; }
 
 private:
     size_t parse_handshake(const uint8_t* data, size_t len);
@@ -56,6 +63,8 @@ private:
     Socks5State state_;
     TargetAddr  target_;
     Command     command_;
+    FailureStage failure_stage_ = FailureStage::None;
+    uint8_t failure_reply_ = 0x01;
     TargetCallback target_cb_;
 };
 

@@ -17,6 +17,8 @@ static constexpr uint8_t kAtypDomain    = 0x03;
 static constexpr uint8_t kAtypIPv6      = 0x04;
 static constexpr uint8_t kRepSuccess    = 0x00;
 static constexpr uint8_t kRepGeneralFail = 0x01;
+static constexpr uint8_t kRepCommandNotSupported = 0x07;
+static constexpr uint8_t kRepAddressTypeNotSupported = 0x08;
 
 Socks5Handler::Socks5Handler()
     : state_(Socks5State::Handshake),
@@ -43,6 +45,7 @@ size_t Socks5Handler::parse_handshake(const uint8_t* data, size_t len) {
     if (data[0] != kSocks5Version) {
         TX_ERROR("SOCKS5 version mismatch: got %u", data[0]);
         state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::MethodNegotiation;
         return len;
     }
 
@@ -61,6 +64,7 @@ size_t Socks5Handler::parse_handshake(const uint8_t* data, size_t len) {
     if (!found_noauth) {
         TX_ERROR("SOCKS5 no supported authentication method");
         state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::MethodNegotiation;
         return 2 + nmethods;
     }
 
@@ -75,12 +79,23 @@ size_t Socks5Handler::parse_request(const uint8_t* data, size_t len) {
     if (data[0] != kSocks5Version) {
         TX_ERROR("SOCKS5 request version mismatch");
         state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::Request;
+        failure_reply_ = kRepGeneralFail;
         return len;
     }
 
     if (data[1] != kCmdConnect && data[1] != kCmdUdpAssociate) {
         TX_ERROR("SOCKS5 unsupported command: %u", data[1]);
         state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::Request;
+        failure_reply_ = kRepCommandNotSupported;
+        return len;
+    }
+    if (data[2] != 0) {
+        TX_ERROR("SOCKS5 request RSV must be zero");
+        state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::Request;
+        failure_reply_ = kRepGeneralFail;
         return len;
     }
     command_ = data[1] == kCmdUdpAssociate ? Command::UdpAssociate : Command::Connect;
@@ -123,7 +138,18 @@ size_t Socks5Handler::parse_request(const uint8_t* data, size_t len) {
         default:
             TX_ERROR("SOCKS5 unknown address type: %u", atyp);
             state_ = Socks5State::Error;
+            failure_stage_ = FailureStage::Request;
+            failure_reply_ = kRepAddressTypeNotSupported;
             return len;
+    }
+
+    if (target_.host.empty() ||
+        (command_ == Command::Connect && target_.port == 0)) {
+        TX_ERROR("SOCKS5 invalid target address or port");
+        state_ = Socks5State::Error;
+        failure_stage_ = FailureStage::Request;
+        failure_reply_ = kRepGeneralFail;
+        return consumed;
     }
 
     state_ = Socks5State::Connected;
@@ -141,7 +167,7 @@ size_t Socks5Handler::parse_request(const uint8_t* data, size_t len) {
 void Socks5Handler::build_connect_response(bool success, Buffer& out,
                                            const std::string& bind_host,
                                            uint16_t bind_port) {
-    if (state_ == Socks5State::Error && !success) {
+    if (!success && failure_stage_ == FailureStage::MethodNegotiation) {
         uint8_t auth_fail[] = {kSocks5Version, kMethodNoAccept};
         out.append(auth_fail, sizeof(auth_fail));
         return;
@@ -149,7 +175,7 @@ void Socks5Handler::build_connect_response(bool success, Buffer& out,
 
     uint8_t resp[10];
     resp[0] = kSocks5Version;
-    resp[1] = success ? kRepSuccess : kRepGeneralFail;
+    resp[1] = success ? kRepSuccess : failure_reply_;
     resp[2] = 0x00; // RSV
     resp[3] = kAtypIPv4;
     struct in_addr bind_addr;

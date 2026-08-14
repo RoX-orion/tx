@@ -64,7 +64,7 @@
 - `tx_core` 本身始终构建为静态库。
 - OpenSSL 在所有平台都使用动态库链接。
 - 所有平台强制动态链接 C++ 运行库。
-- `TX_FETCH_DEPS=ON` 时，缺失的 libuv 和 nlohmann_json 会下载到项目 `.deps/` 目录。
+- `TX_FETCH_DEPS=ON` 时，缺失的 libuv、nlohmann_json 和 HEV lwIP 会下载到项目 `.deps/` 目录。
 - Linux / Windows 可继续构建 `tx_client` 和 `tx_server` 可执行文件。
 - Android 默认关闭命令行程序，转而构建 `libtx.so` 共享库，并使用动态 C++ 运行库。
 
@@ -95,7 +95,9 @@ cmake -B build \
 - 只有 OpenSSL 安装在非标准路径时，才需要额外传 `-DOPENSSL_ROOT_DIR=/path/to/openssl`。
 - `libuv` 可以显式指向静态库文件，例如 `libuv.a`、`uv_a.lib`；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
 - `nlohmann_json` 是 header-only；未指定且 `TX_FETCH_DEPS=ON` 时会下载到 `.deps/`。
-- 原生 TUN TCP / UDP 数据面使用固定提交的 HEV lwIP，并由 CMake FetchContent 下载到 `.deps/` 后静态链接。
+- 原生 TUN TCP / UDP 数据面使用固定提交的 HEV lwIP。依赖选择顺序为调用方预定义的
+  `tx::hev_lwip` target、`TX_HEV_LWIP_SOURCE_DIR` 指定的本地源码树，最后才是在
+  `TX_FETCH_DEPS=ON` 时下载到 `.deps/`。
 
 ## 构建
 
@@ -118,7 +120,9 @@ build/bin/tx_server
 - `-DTX_BUILD_APPS=ON|OFF`：是否构建 `tx_client` 和 `tx_server`。
 - `-DTX_BUILD_TESTS=ON|OFF`：是否构建测试，非 Android 平台默认开启。
 - `-DTX_BUILD_SHARED=ON|OFF`：是否构建共享库，主要用于 Android 场景，默认关闭。
-- `-DTX_FETCH_DEPS=ON|OFF`：是否把缺失的 libuv / nlohmann_json 下载到项目 `.deps/`，默认开启。
+- `-DTX_FETCH_DEPS=ON|OFF`：是否下载缺失依赖，默认开启；关闭时不会为 HEV lwIP 发起网络访问。
+- `-DTX_HEV_LWIP_SOURCE_DIR=/path/to/lwip`：使用本地 HEV lwIP 源码；目录必须包含
+  `src/core`、`src/include` 和 `src/ports/include`。
 - `-DCMAKE_BUILD_TYPE=Debug|Release`：选择调试或发布构建。
 
 ### Linux Release 构建
@@ -222,10 +226,10 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-当前共有 23 个测试目标，覆盖 crypto、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
+当前共有 26 个测试目标，覆盖 crypto、Buffer、GeoIP、GeoSite、SOCKS5、HTTP proxy、router、
 tunnel、TUN packet、HEV lwIP TCP / UDP、fake-IP DNS、DNS resolver、TX 隧道 DNS、
-客户端/服务端配置、TLS SNI、QUIC SNI、QUIC 路由、socket protector、TCP 回调和 UDP
-flow timeout。
+客户端/服务端配置、TLS SNI、QUIC SNI、QUIC 路由、Linux policy-route、socket
+protector、TCP 回调、服务端/客户端 UDP 和 C API 生命周期。
 
 ## 配置
 
@@ -393,6 +397,9 @@ cp config/client.json.example client.json
 - `routing.rules`：从上到下匹配；规则的 `outboundTag` 仅引用某个出站，不直接表示处理方式。
 - `routing.rules[*].ip`：IP/CIDR 或 `geoip:<tag>` 匹配项。
 - `routing.rules[*].domain`：域名或 `geosite:<tag>` 匹配项。
+- 配置了 Geo 文件，或规则引用了除 `geoip:private` 外的 Geo tag 时，文件缺失、解析失败
+  或 tag 不存在都会使客户端启动失败。GeoSite 的 Full、Domain、Plain、Regex 四类条目
+  均参与匹配；当前不支持 `geosite:tag@attribute` 属性过滤语法。
 - `routing.domainStrategy`：必须为 `AsIs`；域名只走 domain 规则，IP 字面量只走 IP 规则，不会二次解析后混合匹配。
 - `routing.rules` 的最后一条应作为无 matcher 的默认出站。私网 IP 规则应放在最前，避免 LAN 流量进入远端隧道。
 - `log_level`：日志级别，可选 `debug`、`info`、`warn`、`error`。
@@ -408,7 +415,9 @@ netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由�
 当前只能为 `lwip`。
 
 - `tun.addresses` 接受 IPv4/IPv6 CIDR；旧 `tun.address` 仍作为 IPv4 别名。
-- Linux lwIP + `auto_route=true` 使用独立路由表（默认 `20220`）、bypass mark（默认 `0x2024`）和有序 policy rules；未指定 `routes` 时安装 IPv4 / IPv6 split-default。
+- Linux 只要安装任何托管 TUN 路由（`auto_route=true` 的默认路由或显式
+  `tun.routes`），都会写入独立路由表（默认 `20220`），并先安装 mark → main 旁路规则，
+  再安装未标记流量 → TUN 表捕获规则；未指定 `routes` 时安装 IPv4 / IPv6 split-default。
 - Linux 普通 HTTP/SOCKS 客户端不会为 DNS socket 设置 `SO_MARK`；该 mark 仅用于 lwIP TUN 的 policy-routing 路径。
 - Linux `tun.auto_redirect` 使用 nftables 表 `inet tx_auto_redirect` 重定向本机 IPv4 TCP `OUTPUT` 流量，并通过 `tun.redirect_mark` 排除 TX 出站 socket，避免重定向循环。
 - `auto_redirect=true` 只能和 Linux `tcp_stack=system` 一起使用；lwIP 模式会在配置校验阶段拒绝该组合。
@@ -421,8 +430,31 @@ netif 终结 TUN 侧 TCP/UDP，随后进入统一的 direct / tx / block 路由�
 Android 共享库提供以下启动接口：
 
 - `tx_client_start_with_tun_fd()`：使用 `VpnService` 提供的 TUN fd 启动客户端。
-- `tx_client_start_android()`：额外接受 socket protector 回调；JNI 层应在回调中调用 `VpnService.protect(fd)`，防止直连和 TX 出站 socket 再次进入 VPN。客户端不再配置 DNS 地址；TX 入口域名和 direct DNS 使用选定的物理 Network，TX DNS 经加密隧道交由服务端系统 DNS 解析。
-- `tx_client_start_android_ex()`：接受带版本的 Android 网络 hooks 结构；`resolve_host` 与 `query_dns` 用于物理 Network 上的 TX 引导解析以及已选中 `direct-out` 的 DNS/目标，以恢复本地 CDN 亲和性。Fake-IP A/AAAA 仍由客户端本地回答，TX 路由的其他 DNS 类型通过无目标地址的 `DnsQuery` 命令发送到服务端。
+- `tx_client_start_android()`：已弃用的 protect-only 兼容入口，只支持 direct 数值目标；
+  direct 域名必须改用 `_ex`。
+- `tx_client_start_android_ex()`：接受带版本的 Android 网络 hooks 结构；`resolve_host` 与
+  `query_dns` 只用于已经选中 `direct-out` 的 DNS/目标，以恢复本地 CDN 亲和性。TX
+  server 必须在启动前配置为数值地址；Fake-IP A/AAAA 仍由客户端本地回答，TX 路由的
+  其他 DNS 类型通过无目标地址的 `DnsQuery` 命令发送到服务端。
+
+### C API 2.0 生命周期
+
+`tx_client_stop()` / `tx_server_stop()` 现在只发起异步停止并立即返回。外部所有者必须按
+以下顺序完成释放：
+
+```text
+start → stop → wait → destroy
+```
+
+- `stop` 可在 protect/resolve/query hook 内调用并保持幂等。
+- `wait` 等待 loop、worker 与正在执行的 hook 全部退出；从 hook 或 app loop 内调用会返回
+  `TX_STATUS_REENTRANT_WAIT`。
+- `destroy` 仅在 `wait` 成功后释放 handle；成功后的旧 handle 返回
+  `TX_STATUS_INVALID_HANDLE`。
+- `hooks->user_data` 必须保持有效到 `wait` 返回。protect 可能运行于 loop 或 libuv worker，
+  resolve/query 运行于 worker；JNI 回调必须自行 Attach/Detach 当前线程。
+
+旧版集成的逐项改法见 [C API 2.0 迁移文档](docs/c-api-2-migration.md)。
 
 服务端不接受客户端指定的 DNS 上游地址，启动时从系统 resolver（通常为 `/etc/resolv.conf`）读取配置。
 

@@ -10,7 +10,11 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <unordered_set>
+
+#include <openssl/rand.h>
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
 #include <arpa/inet.h>
@@ -57,7 +61,27 @@ struct DnsResolver::HostRequest {
 
 namespace {
 
-std::atomic<uint16_t> g_dns_query_id{1};
+std::mutex g_dns_query_id_mutex;
+std::unordered_set<uint16_t> g_dns_query_ids;
+
+bool reserve_dns_query_id(uint16_t& id) {
+    uint8_t random[2];
+    for (size_t attempt = 0; attempt < 65536; ++attempt) {
+        if (RAND_bytes(random, sizeof(random)) != 1) return false;
+        const uint16_t candidate = load_be16(random);
+        std::lock_guard<std::mutex> lock(g_dns_query_id_mutex);
+        if (g_dns_query_ids.insert(candidate).second) {
+            id = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+void release_dns_query_id(uint16_t id) {
+    std::lock_guard<std::mutex> lock(g_dns_query_id_mutex);
+    g_dns_query_ids.erase(id);
+}
 
 bool append_dns_name(const std::string& host, std::vector<uint8_t>& query) {
     if (host.empty() || host.size() > 253) return false;
@@ -79,12 +103,20 @@ bool append_dns_name(const std::string& host, std::vector<uint8_t>& query) {
     return true;
 }
 
-bool build_host_query(const std::string& host, uint16_t type, std::vector<uint8_t>& query) {
+bool build_host_query(const std::string& host, uint16_t type,
+                      std::vector<uint8_t>& query, uint16_t& query_id) {
+    if (!reserve_dns_query_id(query_id)) {
+        TX_ERROR("RAND_bytes failed while allocating a DNS transaction ID");
+        return false;
+    }
     query.assign(12, 0);
-    store_be16(query.data(), g_dns_query_id.fetch_add(1, std::memory_order_relaxed));
+    store_be16(query.data(), query_id);
     store_be16(query.data() + 2, 0x0100); // RD
     store_be16(query.data() + 4, 1);
-    if (!append_dns_name(host, query)) return false;
+    if (!append_dns_name(host, query)) {
+        release_dns_query_id(query_id);
+        return false;
+    }
     const size_t offset = query.size();
     query.resize(offset + 4);
     store_be16(query.data() + offset, type);
@@ -217,7 +249,8 @@ int dns_socket_error() {
 }
 
 bool dns_socket_retryable(int error) {
-    return error == WSAEINTR || error == WSAEWOULDBLOCK;
+    return error == WSAEINTR || error == WSAEWOULDBLOCK ||
+           error == WSAETIMEDOUT;
 }
 
 void set_dns_socket_timeout(DnsSocket socket, int timeout_ms) {
@@ -650,6 +683,34 @@ bool read_dns_questions(const std::vector<uint8_t>& message,
     return true;
 }
 
+bool dns_message_structure_valid(const std::vector<uint8_t>& message) {
+    if (message.size() < 12) return false;
+    size_t offset = 12;
+    const uint16_t questions = load_be16(message.data() + 4);
+    if (questions > 64) return false;
+    for (uint16_t i = 0; i < questions; ++i) {
+        if (!skip_dns_name(message.data(), message.size(), offset) ||
+            offset > message.size() || message.size() - offset < 4) {
+            return false;
+        }
+        offset += 4;
+    }
+    const uint32_t records = static_cast<uint32_t>(load_be16(message.data() + 6)) +
+                             static_cast<uint32_t>(load_be16(message.data() + 8)) +
+                             static_cast<uint32_t>(load_be16(message.data() + 10));
+    for (uint32_t i = 0; i < records; ++i) {
+        if (!skip_dns_name(message.data(), message.size(), offset) ||
+            offset > message.size() || message.size() - offset < 10) {
+            return false;
+        }
+        const uint16_t data_len = load_be16(message.data() + offset + 8);
+        offset += 10;
+        if (data_len > message.size() - offset) return false;
+        offset += data_len;
+    }
+    return offset == message.size();
+}
+
 bool dns_response_matches_query(const std::vector<uint8_t>& query,
                                 const std::vector<uint8_t>& response) {
     if (query.size() < 12 || response.size() < 12 ||
@@ -667,7 +728,9 @@ bool dns_response_matches_query(const std::vector<uint8_t>& query,
 
     std::vector<DnsQuestion> query_questions;
     std::vector<DnsQuestion> response_questions;
-    return read_dns_questions(query, query_questions) &&
+    return dns_message_structure_valid(query) &&
+           dns_message_structure_valid(response) &&
+           read_dns_questions(query, query_questions) &&
            read_dns_questions(response, response_questions) &&
            query_questions == response_questions;
 }
@@ -725,25 +788,28 @@ bool resolve_tcp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
     return ok;
 }
 
-bool resolve_udp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
+enum class UdpResolveResult { Success, Truncated, Failed };
+
+UdpResolveResult resolve_udp(const DnsEndpoint& upstream,
+                 const std::vector<uint8_t>& query,
                  const DnsResolver::ProtectCallback& protector,
                  const DnsSocketBinding& binding,
                  std::vector<uint8_t>& response,
                  const std::atomic<bool>* cancelled) {
-    if (operation_cancelled(cancelled)) return false;
+    if (operation_cancelled(cancelled)) return UdpResolveResult::Failed;
     sockaddr_storage address{}; DnsSocklen address_len = 0;
     const std::string upstream_text = upstream.address.find(':') != std::string::npos
         ? "[" + upstream.address + "]:" + std::to_string(upstream.port)
         : upstream.address + ":" + std::to_string(upstream.port);
     if (!upstream_address(upstream_text, SOCK_DGRAM, address, address_len)) {
         TX_WARN("Invalid DNS upstream address %s", upstream_text.c_str());
-        return false;
+        return UdpResolveResult::Failed;
     }
     DnsSocket fd = socket(address.ss_family, SOCK_DGRAM, 0);
     if (fd == kInvalidDnsSocket) {
         TX_WARN("DNS UDP socket for %s failed: %d", upstream_text.c_str(),
                 dns_socket_error());
-        return false;
+        return UdpResolveResult::Failed;
     }
     bool ok = configure_socket(fd, address.ss_family, protector, binding);
     set_dns_socket_timeout(fd, 100);
@@ -792,18 +858,20 @@ bool resolve_udp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
     if (received < 12) {
         TX_DEBUG("DNS UDP receive from %s failed: %d", upstream_text.c_str(),
                  receive_error);
-        return false;
+        return UdpResolveResult::Failed;
     }
     response.assign(buffer, buffer + received);
     if (!dns_response_matches_query(query, response)) {
         TX_DEBUG("DNS UDP response from %s did not match the query",
                  upstream_text.c_str());
         response.clear();
-        return false;
+        return UdpResolveResult::Failed;
     }
-    if ((load_be16(response.data() + 2) & 0x0200u) != 0)
-        return resolve_tcp(upstream, query, protector, binding, response, cancelled);
-    return true;
+    if ((load_be16(response.data() + 2) & 0x0200u) != 0) {
+        response.clear();
+        return UdpResolveResult::Truncated;
+    }
+    return UdpResolveResult::Success;
 }
 
 } // namespace
@@ -901,8 +969,10 @@ void DnsResolver::on_work(uv_work_t* work) {
     if (request->query_hook) {
         request->response = request->query_hook(request->query.data(), request->query.size());
         if (!request->response.empty() &&
-            response_contains_filtered_address(request->response, request->address_filter)) {
-            TX_WARN("Rejecting DNS response containing a protected Fake-IP address");
+            (!dns_response_matches_query(request->query, request->response) ||
+             response_contains_filtered_address(request->response,
+                                                request->address_filter))) {
+            TX_WARN("Rejecting invalid or protected synchronous DNS hook response");
             request->response.clear();
         }
         return;
@@ -932,15 +1002,18 @@ void DnsResolver::on_work(uv_work_t* work) {
             TX_WARN("Skipping protected Fake-IP DNS upstream %s", upstream.address.c_str());
             continue;
         }
-        if (resolve_udp(upstream, request->query, request->protector,
-                        network.socket_binding, request->response, nullptr)) {
+        const UdpResolveResult udp_result =
+            resolve_udp(upstream, request->query, request->protector,
+                        network.socket_binding, request->response, nullptr);
+        if (udp_result == UdpResolveResult::Success) {
             if (!response_contains_filtered_address(request->response,
                                                      request->address_filter)) return;
             TX_WARN("Rejecting DNS response from %s: protected Fake-IP address",
                     upstream.address.c_str());
             request->response.clear();
         }
-        if (resolve_tcp(upstream, request->query, request->protector,
+        if (udp_result == UdpResolveResult::Truncated &&
+            resolve_tcp(upstream, request->query, request->protector,
                         network.socket_binding, request->response, nullptr)) {
             if (!response_contains_filtered_address(request->response,
                                                      request->address_filter)) return;
@@ -972,8 +1045,15 @@ void DnsResolver::resolve_host(const std::string& host, int family,
     if (!callback || host.empty()) return;
     in_addr address4{};
     in6_addr address6{};
-    if (inet_pton(AF_INET, host.c_str(), &address4) == 1 ||
-        inet_pton(AF_INET6, host.c_str(), &address6) == 1) {
+    const bool numeric4 = inet_pton(AF_INET, host.c_str(), &address4) == 1;
+    const bool numeric6 = inet_pton(AF_INET6, host.c_str(), &address6) == 1;
+    if (numeric4 || numeric6) {
+        if ((family == AF_INET && !numeric4) ||
+            (family == AF_INET6 && !numeric6) ||
+            (family != AF_UNSPEC && family != AF_INET && family != AF_INET6)) {
+            callback(std::vector<std::string>());
+            return;
+        }
         if (address_filter_ && address_filter_(host)) {
             TX_WARN("Rejecting protected Fake-IP target %s", host.c_str());
             callback(std::vector<std::string>());
@@ -993,13 +1073,15 @@ void DnsResolver::resolve_host(const std::string& host, int family,
         auto resolve_type = [this, host, family, callback, generation](uint16_t type,
                                                                          bool fallback_ipv6) {
             std::vector<uint8_t> query;
-            if (!build_host_query(host, type, query)) {
+            uint16_t query_id = 0;
+            if (!build_host_query(host, type, query, query_id)) {
                 callback(std::vector<std::string>());
                 return;
             }
             resolve(query.data(), query.size(),
-                [this, host, family, callback, generation, fallback_ipv6]
+                [this, host, family, callback, generation, fallback_ipv6, query_id]
                 (std::vector<uint8_t> response) {
+                    release_dns_query_id(query_id);
                     if (generation != generation_) {
                         callback(std::vector<std::string>());
                         return;
@@ -1012,12 +1094,15 @@ void DnsResolver::resolve_host(const std::string& host, int family,
                         return;
                     }
                     std::vector<uint8_t> query6;
-                    if (!build_host_query(host, 28, query6)) {
+                    uint16_t query6_id = 0;
+                    if (!build_host_query(host, 28, query6, query6_id)) {
                         callback(std::vector<std::string>());
                         return;
                     }
                     resolve(query6.data(), query6.size(),
-                        [this, family, callback, generation](std::vector<uint8_t> response6) {
+                        [this, family, callback, generation, query6_id]
+                        (std::vector<uint8_t> response6) {
+                            release_dns_query_id(query6_id);
                             if (generation != generation_) {
                                 callback(std::vector<std::string>());
                                 return;
@@ -1057,6 +1142,19 @@ void DnsResolver::on_host_work(uv_work_t* work) {
     auto* request = static_cast<HostRequest*>(work->data);
     if (request->resolver) {
         request->addresses = request->resolver(request->host, request->family);
+        request->addresses.erase(
+            std::remove_if(request->addresses.begin(), request->addresses.end(),
+                [request](const std::string& address) {
+                    in_addr address4{};
+                    in6_addr address6{};
+                    const bool is4 = inet_pton(AF_INET, address.c_str(), &address4) == 1;
+                    const bool is6 = inet_pton(AF_INET6, address.c_str(), &address6) == 1;
+                    if (!is4 && !is6) return true;
+                    if (request->family == AF_INET) return !is4;
+                    if (request->family == AF_INET6) return !is6;
+                    return request->family != AF_UNSPEC;
+                }),
+            request->addresses.end());
         filter_host_addresses(request->addresses, request->address_filter);
     }
 }

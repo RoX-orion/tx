@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -98,6 +99,67 @@ struct ServerAppUdpTest {
         app.close_udp_outbound(it->second);
         uv_run(app.loop(), UV_RUN_DEFAULT);
     }
+
+    static void cross_protocol_session_ids_close_tunnel() {
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || defined(TX_PLATFORM_APPLE)
+        const auto expect_violation = [](
+            const std::function<void(ServerApp&,
+                                     const std::shared_ptr<ServerApp::TunnelClient>&)>& action) {
+            ServerApp app;
+            int sockets[2];
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+            auto client = std::make_shared<ServerApp::TunnelClient>();
+            client->session = std::make_shared<TcpSession>(app.loop());
+            assert(uv_tcp_open(client->session->handle(), sockets[0]) == 0);
+            action(app, client);
+            assert(client->session->is_closed());
+            uv_run(app.loop(), UV_RUN_DEFAULT);
+            assert(close(sockets[1]) == 0);
+        };
+
+        expect_violation([](ServerApp& app,
+                            const std::shared_ptr<ServerApp::TunnelClient>& client) {
+            client->dns_queries.insert(7);
+            TargetAddr target;
+            target.type = AddrType::IPv4;
+            target.host = "127.0.0.1";
+            target.port = 80;
+            app.handle_connect(client, 7, target);
+        });
+        expect_violation([](ServerApp& app,
+                            const std::shared_ptr<ServerApp::TunnelClient>& client) {
+            client->dns_queries.insert(8);
+            TargetAddr target;
+            target.type = AddrType::IPv4;
+            target.host = "127.0.0.1";
+            target.port = 53;
+            Buffer payload;
+            const uint8_t byte = 1;
+            payload.append(&byte, 1);
+            app.handle_udp_packet(client, 8, target, payload);
+        });
+        expect_violation([](ServerApp& app,
+                            const std::shared_ptr<ServerApp::TunnelClient>& client) {
+            ServerApp::TunnelClient::UdpOutbound udp;
+            udp.session_id = 9;
+            client->udp_outbounds.emplace(9, std::move(udp));
+            Buffer payload;
+            const uint8_t byte = 1;
+            payload.append(&byte, 1);
+            app.handle_data(client, 9, payload);
+        });
+        expect_violation([](ServerApp& app,
+                            const std::shared_ptr<ServerApp::TunnelClient>& client) {
+            client->dns_queries.insert(10);
+            app.handle_half_close(client, 10);
+        });
+        expect_violation([](ServerApp& app,
+                            const std::shared_ptr<ServerApp::TunnelClient>& client) {
+            client->dns_queries.insert(11);
+            app.handle_disconnect(client, 11);
+        });
+#endif
+    }
 };
 
 } // namespace tx
@@ -105,6 +167,7 @@ struct ServerAppUdpTest {
 int main() {
     tx::ServerAppUdpTest::udp_backlog_drop_keeps_sequence();
     tx::ServerAppUdpTest::domain_udp_resolves_once_and_pins_peer();
+    tx::ServerAppUdpTest::cross_protocol_session_ids_close_tunnel();
     std::printf("server UDP tests passed\n");
     return 0;
 }

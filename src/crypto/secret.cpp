@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <climits>
 
 namespace tx {
 
@@ -52,8 +53,15 @@ bool parse_hex(const std::string& text, std::vector<uint8_t>& out) {
 }
 
 bool parse_base64(const std::string& text, std::vector<uint8_t>& out) {
-    if (text.empty() || text.size() % 4 != 0) {
-        return false;
+    if (text.empty() || text.size() % 4 != 0 || text.size() > INT_MAX) return false;
+    size_t padding = 0;
+    if (text.back() == '=') ++padding;
+    if (text.size() >= 2 && text[text.size() - 2] == '=') ++padding;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        const bool alphabet = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                              (c >= '0' && c <= '9') || c == '+' || c == '/';
+        if (!alphabet && !(c == '=' && i >= text.size() - padding)) return false;
     }
 
     std::vector<uint8_t> decoded((text.size() / 4) * 3 + 3);
@@ -64,10 +72,14 @@ bool parse_base64(const std::string& text, std::vector<uint8_t>& out) {
         return false;
     }
 
-    size_t padding = 0;
-    if (!text.empty() && text[text.size() - 1] == '=') ++padding;
-    if (text.size() > 1 && text[text.size() - 2] == '=') ++padding;
+    if (static_cast<size_t>(len) < padding) return false;
     decoded.resize(static_cast<size_t>(len) - padding);
+    std::vector<unsigned char> canonical(((decoded.size() + 2) / 3) * 4 + 1);
+    const int encoded_len = EVP_EncodeBlock(canonical.data(), decoded.data(),
+                                             static_cast<int>(decoded.size()));
+    if (encoded_len < 0 || text != std::string(
+            reinterpret_cast<const char*>(canonical.data()),
+            static_cast<size_t>(encoded_len))) return false;
     out.swap(decoded);
     return true;
 }
@@ -113,9 +125,6 @@ bool starts_with(const std::string& s, const char* prefix) {
 
 bool Secret::parse_psk(const std::string& text, std::vector<uint8_t>& out) {
     std::string value = text;
-    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
-        return std::isspace(c) != 0;
-    }), value.end());
 
     std::string low = lower(value);
     std::vector<uint8_t> bytes;
@@ -157,6 +166,8 @@ bool Secret::generate_psk(std::vector<uint8_t>& out) {
 }
 
 std::string Secret::encode_base64_secret(const uint8_t* data, size_t len) {
+    if ((!data && len != 0) || len > static_cast<size_t>(INT_MAX) ||
+        len > (static_cast<size_t>(INT_MAX) / 4) * 3) return std::string();
     std::vector<unsigned char> encoded(((len + 2) / 3) * 4 + 1);
     int n = EVP_EncodeBlock(encoded.data(), data, static_cast<int>(len));
     if (n < 0) return std::string();
@@ -168,7 +179,9 @@ bool Secret::hkdf_sha256(const uint8_t* salt, size_t salt_len,
                          const uint8_t* ikm, size_t ikm_len,
                          const uint8_t* info, size_t info_len,
                          uint8_t* out, size_t out_len) {
-    if (!out || out_len == 0 || out_len > 255 * 32) {
+    if (!out || out_len == 0 || out_len > 255 * 32 ||
+        salt_len > static_cast<size_t>(INT_MAX) ||
+        (!ikm && ikm_len != 0) || (!info && info_len != 0)) {
         return false;
     }
 

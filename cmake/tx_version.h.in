@@ -1,0 +1,3 @@
+#pragma once
+
+#define TX_PROJECT_VERSION "@PROJECT_VERSION@"

@@ -98,6 +98,34 @@ int main() {
     assert(!load_text("udp_mux_too_many", tx_config_json("true", 65),
                       udp_mux_too_many));
 
+    const std::string strict_prefix =
+        "{\"outbounds\":[{\"tag\":\"direct-out\",\"type\":\"direct\"}],"
+        "\"routing\":{\"rules\":[{\"outboundTag\":\"direct-out\"}]},";
+    tx::ClientConfig invalid_integer;
+    assert(!load_text("negative_port", strict_prefix +
+        "\"listen\":{\"http\":{\"port\":-1}}}", invalid_integer));
+    assert(!load_text("large_port", strict_prefix +
+        "\"listen\":{\"http\":{\"port\":70000}}}", invalid_integer));
+    assert(!load_text("float_capacity", strict_prefix +
+        "\"dns\":{\"cache_capacity\":1.5}}", invalid_integer));
+    assert(!load_text("wrong_bool", strict_prefix +
+        "\"udp\":{\"quic_sniff\":\"true\"}}", invalid_integer));
+    assert(!load_text("empty_route_prefix", strict_prefix +
+        "\"tun\":{\"enabled\":true,\"auto_config\":false,"
+        "\"routes\":[\"10.0.0.0/\"]}}", invalid_integer));
+    assert(!load_text("signed_route_prefix", strict_prefix +
+        "\"tun\":{\"enabled\":true,\"auto_config\":false,"
+        "\"routes\":[\"10.0.0.0/+8\"]}}", invalid_integer));
+
+    tx::ClientConfig ipv6_only;
+    assert(load_text("ipv6_only", strict_prefix +
+        "\"tun\":{\"enabled\":true,\"address\":\"198.18.0.1/30\","
+        "\"addresses\":[\"fd00:1234::1/126\"],\"auto_config\":false}}",
+        ipv6_only));
+    assert(ipv6_only.tun_addresses.size() == 1);
+    assert(ipv6_only.tun_addresses.front() == "fd00:1234::1/126");
+    assert(ipv6_only.tun_address.empty());
+
     tx::ClientConfig explicit_config;
     assert(load_text("asis", config_json("AsIs"), explicit_config));
     assert(explicit_config.router.domain_strategy == "AsIs");

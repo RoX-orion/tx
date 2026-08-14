@@ -4,6 +4,8 @@ include(FetchContent)
 
 option(TX_FETCH_DEPS "Download missing third-party dependencies during configure" ON)
 set(TX_DEPS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps" CACHE PATH "Directory for locally downloaded third-party dependencies")
+set(TX_HEV_LWIP_SOURCE_DIR "" CACHE PATH
+    "Local HEV lwIP source tree (must contain src/core, src/include and src/ports/include)")
 
 if(ANDROID)
     set(TX_DEPS_TRIPLET "${CMAKE_SYSTEM_NAME}-${ANDROID_ABI}")
@@ -128,21 +130,41 @@ endfunction()
 
 function(tx_find_hev_lwip)
     if(TARGET tx::hev_lwip)
+        message(STATUS "Using caller-provided tx::hev_lwip target")
         return()
     endif()
 
-    FetchContent_Declare(
-        hev_lwip
-        URL https://github.com/heiher/lwip/archive/cd3007df7047555399a04e6e40214accfae0d324.tar.gz
-        URL_HASH SHA256=83a7154efaf0a441d79bf208613943bc9f013c5250dcd3794a043dd76de5b8fe
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    )
-    FetchContent_MakeAvailable(hev_lwip)
+    if(TX_HEV_LWIP_SOURCE_DIR)
+        get_filename_component(_tx_hev_source_dir
+            "${TX_HEV_LWIP_SOURCE_DIR}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        foreach(_tx_required_dir src/core src/include src/ports/include)
+            if(NOT IS_DIRECTORY "${_tx_hev_source_dir}/${_tx_required_dir}")
+                message(FATAL_ERROR
+                    "TX_HEV_LWIP_SOURCE_DIR='${_tx_hev_source_dir}' is not a usable "
+                    "HEV lwIP source tree: missing ${_tx_required_dir}.")
+            endif()
+        endforeach()
+        message(STATUS "Using local HEV lwIP: ${_tx_hev_source_dir}")
+    elseif(TX_FETCH_DEPS)
+        FetchContent_Declare(
+            hev_lwip
+            URL https://github.com/heiher/lwip/archive/cd3007df7047555399a04e6e40214accfae0d324.tar.gz
+            URL_HASH SHA256=83a7154efaf0a441d79bf208613943bc9f013c5250dcd3794a043dd76de5b8fe
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(hev_lwip)
+        set(_tx_hev_source_dir "${hev_lwip_SOURCE_DIR}")
+    else()
+        message(FATAL_ERROR
+            "HEV lwIP was not provided. Define a tx::hev_lwip target, set "
+            "TX_HEV_LWIP_SOURCE_DIR to a local source tree, or configure with "
+            "TX_FETCH_DEPS=ON.")
+    endif()
 
-    file(GLOB HEV_LWIP_CORE_SOURCES
-        "${hev_lwip_SOURCE_DIR}/src/core/*.c"
-        "${hev_lwip_SOURCE_DIR}/src/core/ipv4/*.c"
-        "${hev_lwip_SOURCE_DIR}/src/core/ipv6/*.c"
+    file(GLOB HEV_LWIP_CORE_SOURCES CONFIGURE_DEPENDS
+        "${_tx_hev_source_dir}/src/core/*.c"
+        "${_tx_hev_source_dir}/src/core/ipv4/*.c"
+        "${_tx_hev_source_dir}/src/core/ipv6/*.c"
     )
     # altcp is not used; raw tcp*.c is required by the unified TUN frontend.
     list(FILTER HEV_LWIP_CORE_SOURCES EXCLUDE REGEX "/altcp.*\\.c$")
@@ -151,8 +173,8 @@ function(tx_find_hev_lwip)
     target_include_directories(tx_hev_lwip
         PUBLIC
             "${CMAKE_CURRENT_SOURCE_DIR}/src/net/lwip/port"
-            "${hev_lwip_SOURCE_DIR}/src/include"
-            "${hev_lwip_SOURCE_DIR}/src/ports/include"
+            "${_tx_hev_source_dir}/src/include"
+            "${_tx_hev_source_dir}/src/ports/include"
     )
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(tx_hev_lwip PRIVATE -w)

@@ -317,6 +317,9 @@ int main() {
     assert(tx::DnsResolver::response_is_truncated(wire_response));
     wire_response[1] ^= 0x01;
     assert(!tx::DnsResolver::response_matches_query(wire_query, wire_response));
+    auto truncated_record = make_response(wire_query);
+    tx::store_be16(truncated_record.data() + 6, 1);
+    assert(!tx::DnsResolver::response_matches_query(wire_query, truncated_record));
 
     uv_loop_t loop;
     assert(uv_loop_init(&loop) == 0);
@@ -334,7 +337,7 @@ int main() {
         [&](const uint8_t* query, size_t length) {
             assert(query && length == 12);
             query_worker = std::this_thread::get_id() != loop_thread;
-            return std::vector<uint8_t>(query, query + length);
+            return make_response(std::vector<uint8_t>(query, query + length));
         });
 
     bool host_done = false;
@@ -345,6 +348,12 @@ int main() {
             assert(addresses[1] == "192.0.2.1");
             host_done = true;
         });
+    bool numeric_family_done = false;
+    resolver.resolve_host("127.0.0.1", AF_INET6,
+        [&](std::vector<std::string> addresses) {
+            assert(addresses.empty());
+            numeric_family_done = true;
+        });
     uint8_t query[12]{};
     bool query_done = false;
     resolver.resolve(query, sizeof(query), [&](std::vector<uint8_t> response) {
@@ -352,7 +361,7 @@ int main() {
         query_done = true;
     });
     uv_run(&loop, UV_RUN_DEFAULT);
-    assert(host_done && query_done && host_worker && query_worker);
+    assert(host_done && query_done && numeric_family_done && host_worker && query_worker);
 
     tx::DnsResolver async_resolver(&loop);
     bool async_called = false;

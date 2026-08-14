@@ -1,6 +1,7 @@
 #include "tx/geo/geoip.h"
 #include "tx/common/log.h"
 #include "geo_file.h"
+#include "protobuf_reader.h"
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -22,33 +23,23 @@ static std::string to_lower_ascii(std::string s) {
 
 // Read a varint from data, advance position
 static bool read_varint(const uint8_t* data, size_t len, size_t& pos, uint64_t& val) {
-    val = 0;
-    int shift = 0;
-    while (pos < len) {
-        uint8_t b = data[pos++];
-        val |= static_cast<uint64_t>(b & 0x7F) << shift;
-        if ((b & 0x80) == 0) return true;
-        shift += 7;
-        if (shift >= 64) return false; // overflow
-    }
-    return false;
+    return detail::read_proto_varint(data, len, pos, val);
 }
 
 // Read a length-delimited field
 static bool read_length_delimited(const uint8_t* data, size_t len, size_t& pos,
                                    const uint8_t*& field_data, size_t& field_len) {
-    uint64_t flen;
-    if (!read_varint(data, len, pos, flen)) return false;
-    if (pos + flen > len) return false;
-    field_data = data + pos;
-    field_len = static_cast<size_t>(flen);
-    pos += field_len;
-    return true;
+    return detail::read_proto_bytes(data, len, pos, field_data, field_len);
+}
+
+static bool skip_field(const uint8_t* data, size_t len, size_t& pos,
+                       uint32_t wire_type) {
+    return detail::skip_proto_field(data, len, pos, wire_type);
 }
 
 // Parse CIDR message: required bytes ip = 1; required uint32 prefix = 2;
 static bool parse_cidr(const uint8_t* data, size_t len,
-                        const uint8_t*& ip, size_t& ip_len, uint32_t& prefix) {
+                        const uint8_t*& ip, size_t& ip_len, uint64_t& prefix) {
     ip = nullptr; ip_len = 0; prefix = 0;
     size_t pos = 0;
     bool has_ip = false, has_prefix = false;
@@ -70,17 +61,13 @@ static bool parse_cidr(const uint8_t* data, size_t len,
                 {
                     uint64_t v;
                     if (!read_varint(data, len, pos, v)) return false;
-                    prefix = static_cast<uint32_t>(v);
+                    prefix = v;
                     has_prefix = true;
                 }
                 break;
             default:
                 // Skip unknown field
-                if (wire_type == 0) { uint64_t v; read_varint(data, len, pos, v); }
-                else if (wire_type == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-                else if (wire_type == 5) { pos += 4; }
-                else if (wire_type == 1) { pos += 8; }
-                else return false;
+                if (!skip_field(data, len, pos, wire_type)) return false;
         }
     }
     return has_ip && has_prefix;
@@ -90,7 +77,7 @@ static bool parse_cidr(const uint8_t* data, size_t len,
 static bool parse_geoip_entry(const uint8_t* data, size_t len,
                                std::string& country_code,
                                std::vector<std::pair<const uint8_t*, size_t>>& cidrs,
-                               std::vector<uint32_t>& prefixes) {
+                               std::vector<uint64_t>& prefixes) {
     size_t pos = 0;
     bool has_code = false;
 
@@ -113,29 +100,27 @@ static bool parse_geoip_entry(const uint8_t* data, size_t len,
                 if (wire_type != 2) return false;
                 const uint8_t* cd; size_t cl;
                 if (!read_length_delimited(data, len, pos, cd, cl)) return false;
-                const uint8_t* ip; size_t ip_len; uint32_t prefix;
-                if (parse_cidr(cd, cl, ip, ip_len, prefix)) {
-                    cidrs.push_back({ip, ip_len});
-                    prefixes.push_back(prefix);
-                }
+                const uint8_t* ip; size_t ip_len; uint64_t prefix;
+                if (!parse_cidr(cd, cl, ip, ip_len, prefix)) return false;
+                if ((ip_len == 4 && prefix > 32) ||
+                    (ip_len == 16 && prefix > 128) ||
+                    (ip_len != 4 && ip_len != 16)) return false;
+                cidrs.push_back({ip, ip_len});
+                prefixes.push_back(prefix);
                 break;
             }
             default:
-                if (wire_type == 0) { uint64_t v; read_varint(data, len, pos, v); }
-                else if (wire_type == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-                else if (wire_type == 5) { pos += 4; }
-                else if (wire_type == 1) { pos += 8; }
-                else return false;
+                if (!skip_field(data, len, pos, wire_type)) return false;
         }
     }
-    return has_code;
+    return has_code && !country_code.empty();
 }
 
 // Parse GeoIPList: repeated GeoIP entry = 1;
 static bool parse_geoip_list(const uint8_t* data, size_t len,
                               std::function<void(const std::string&,
                                                   const std::vector<std::pair<const uint8_t*, size_t>>&,
-                                                  const std::vector<uint32_t>&)> callback) {
+                                                  const std::vector<uint64_t>&)> callback) {
     size_t pos = 0;
 
     while (pos < len) {
@@ -150,16 +135,13 @@ static bool parse_geoip_list(const uint8_t* data, size_t len,
 
             std::string country;
             std::vector<std::pair<const uint8_t*, size_t>> cidrs;
-            std::vector<uint32_t> prefixes;
-            if (parse_geoip_entry(entry_data, entry_len, country, cidrs, prefixes)) {
-                callback(country, cidrs, prefixes);
-            }
+            std::vector<uint64_t> prefixes;
+            if (!parse_geoip_entry(entry_data, entry_len, country, cidrs, prefixes))
+                return false;
+            callback(country, cidrs, prefixes);
         } else {
-            if (wire_type == 0) { uint64_t v; read_varint(data, len, pos, v); }
-            else if (wire_type == 2) { const uint8_t* d; size_t dl; read_length_delimited(data, len, pos, d, dl); }
-            else if (wire_type == 5) { pos += 4; }
-            else if (wire_type == 1) { pos += 8; }
-            else return false;
+            if (field_num == 1) return false;
+            if (!skip_field(data, len, pos, wire_type)) return false;
         }
     }
     return true;
@@ -186,18 +168,21 @@ bool GeoIpMatcher::parse_geoip(const uint8_t* data, size_t len) {
     bool ok = parse_geoip_list(data, len,
         [this, &count](const std::string& country,
                         const std::vector<std::pair<const uint8_t*, size_t>>& cidrs,
-                        const std::vector<uint32_t>& prefixes) {
+                        const std::vector<uint64_t>& prefixes) {
             const std::string normalized_country = to_lower_ascii(country);
+            if (normalized_country.empty()) return;
+            if (std::find(tag_order_.begin(), tag_order_.end(), normalized_country) ==
+                tag_order_.end()) tag_order_.push_back(normalized_country);
 
             for (size_t i = 0; i < cidrs.size(); i++) {
                 const uint8_t* ip = cidrs[i].first;
                 size_t ip_len = cidrs[i].second;
-                uint32_t prefix = prefixes[i];
+                uint64_t prefix = prefixes[i];
 
-                if (ip_len == 4) {
+                if (ip_len == 4 && prefix <= 32) {
                     tree_v4_.insert(ip, static_cast<uint8_t>(prefix), normalized_country, false);
                     count++;
-                } else if (ip_len == 16) {
+                } else if (ip_len == 16 && prefix <= 128) {
                     tree_v6_.insert(ip, static_cast<uint8_t>(prefix), normalized_country, true);
                     count++;
                 }
@@ -225,13 +210,15 @@ bool GeoIpMatcher::match(const IpAddr& addr, const std::string& country) const {
 }
 
 std::string GeoIpMatcher::lookup(const IpAddr& addr) const {
-    if (addr.family == IpAddr::IPv4) {
-        return tree_v4_.lookup(addr.data.v4, false);
+    for (const auto& tag : tag_order_) {
+        if (match(addr, tag)) return tag;
     }
-    if (addr.is_ipv4_mapped_ipv6()) {
-        return tree_v4_.lookup(addr.data.v6 + 12, false);
-    }
-    return tree_v6_.lookup(addr.data.v6, true);
+    return "";
+}
+
+bool GeoIpMatcher::has_tag(const std::string& tag) const {
+    const std::string normalized = to_lower_ascii(tag);
+    return std::find(tag_order_.begin(), tag_order_.end(), normalized) != tag_order_.end();
 }
 
 } // namespace tx

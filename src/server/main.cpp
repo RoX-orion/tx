@@ -2,21 +2,10 @@
 #include "tx/common/log.h"
 #include "tx/crypto/secret.h"
 
-#include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <exception>
 #include <signal.h>
 #include <vector>
-
-#ifdef _WIN32
-#include <io.h>
-#include <process.h>
-#define TX_WRITE_STDERR(buf, len) _write(2, (buf), static_cast<unsigned int>(len))
-#else
-#include <unistd.h>
-#define TX_WRITE_STDERR(buf, len) write(STDERR_FILENO, (buf), static_cast<size_t>(len))
-#endif
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
@@ -28,31 +17,12 @@ static void print_usage(const char* prog) {
         prog);
 }
 
-static void on_fatal_signal(int signum) {
-    char buf[64];
-    int len = snprintf(buf, sizeof(buf), "TX Server fatal signal: %d\n", signum);
-    if (len > 0) {
-        TX_WRITE_STDERR(buf, len);
-    }
-    _exit(128 + signum);
-}
-
 static void install_crash_handlers() {
 #ifdef SIGPIPE
     // A peer can disappear while data is queued. Surface that through the
     // socket error path instead of terminating every tunnel client.
     signal(SIGPIPE, SIG_IGN);
 #endif
-    signal(SIGSEGV, on_fatal_signal);
-    signal(SIGABRT, on_fatal_signal);
-#ifdef SIGBUS
-    signal(SIGBUS, on_fatal_signal);
-#endif
-    signal(SIGILL, on_fatal_signal);
-    std::set_terminate([]() {
-        TX_ERROR("TX Server terminated by unhandled exception");
-        std::abort();
-    });
 }
 
 int main(int argc, char* argv[]) {
@@ -62,9 +32,11 @@ int main(int argc, char* argv[]) {
     const char* log_level = nullptr;
 
     for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) { print_usage(argv[0]); return 2; }
             config_path = argv[++i];
-        } else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) && i + 1 < argc) {
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
+            if (i + 1 >= argc) { print_usage(argv[0]); return 2; }
             log_level = argv[++i];
         } else if (strcmp(argv[i], "--gen-secret") == 0) {
             std::vector<uint8_t> secret;
@@ -76,6 +48,9 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
+        } else {
+            print_usage(argv[0]);
+            return 2;
         }
     }
 
@@ -84,11 +59,12 @@ int main(int argc, char* argv[]) {
         else if (strcmp(log_level, "info") == 0) tx::set_log_level(tx::LogLevel::Info);
         else if (strcmp(log_level, "warn") == 0) tx::set_log_level(tx::LogLevel::Warn);
         else if (strcmp(log_level, "error") == 0) tx::set_log_level(tx::LogLevel::Error);
+        else { print_usage(argv[0]); return 2; }
     }
 
     tx::ServerConfig config;
     if (!tx::load_server_config(config_path, config)) {
-        TX_FATAL("Failed to load config from: %s", config_path);
+        TX_ERROR("Failed to load config from: %s", config_path);
         return 1;
     }
 
@@ -101,7 +77,7 @@ int main(int argc, char* argv[]) {
     tx::ServerApp app;
 
     if (!app.init(config)) {
-        TX_FATAL("Failed to initialize server");
+        TX_ERROR("Failed to initialize server");
         return 1;
     }
 

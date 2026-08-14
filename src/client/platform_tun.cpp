@@ -35,34 +35,16 @@
 #include <ws2ipdef.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
+#include <io.h>
 #endif
 
 namespace tx {
 
 namespace {
 
+PlatformTunDevice::CommandRunner g_command_runner;
+
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
-
-#if !defined(TX_PLATFORM_ANDROID)
-uint32_t prefix_to_netmask(int prefix) {
-    if (prefix <= 0) return 0;
-    if (prefix >= 32) return 0xffffffffu;
-    return htonl(0xffffffffu << (32 - prefix));
-}
-
-bool parse_ipv4_cidr(const std::string& cidr, in_addr& addr, int& prefix) {
-    const size_t slash = cidr.find('/');
-    if (slash == std::string::npos) return false;
-    std::string ip = cidr.substr(0, slash);
-    std::string prefix_str = cidr.substr(slash + 1);
-    char* end = nullptr;
-    long p = std::strtol(prefix_str.c_str(), &end, 10);
-    if (!end || *end != '\0' || p < 0 || p > 32) return false;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
-    prefix = static_cast<int>(p);
-    return true;
-}
-#endif
 
 class PosixTunDevice final : public PlatformTunDevice {
 public:
@@ -78,6 +60,12 @@ public:
                 close();
                 return false;
             }
+#if !defined(TX_PLATFORM_ANDROID)
+            if (!configure_linux(config, error)) {
+                close();
+                return false;
+            }
+#endif
             return true;
         }
 
@@ -103,8 +91,7 @@ public:
         }
         name_ = ifr.ifr_name;
 
-        if (config.tun_auto_config &&
-            !configure_interface(config, error)) {
+        if (!configure_linux(config, error)) {
             close();
             return false;
         }
@@ -117,6 +104,7 @@ public:
     void close() override {
 #if !defined(TX_PLATFORM_ANDROID)
         remove_policy_routes();
+        remove_addresses();
 #endif
         // The native client takes ownership of a VpnService-provided fd.
         // This gives every startup failure and tx_client_stop() one cleanup
@@ -153,7 +141,7 @@ public:
                 continue;
             }
             if (n < 0 && errno == EINTR) continue;
-            error = std::strerror(errno);
+            error = n == 0 ? "zero-length write" : std::strerror(errno);
             return false;
         }
         return true;
@@ -174,244 +162,190 @@ private:
     }
 
 #if !defined(TX_PLATFORM_ANDROID)
-    bool configure_interface(const ClientConfig& config, std::string& error) {
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) {
-            error = std::string("socket(AF_INET, SOCK_DGRAM) failed: ") + std::strerror(errno);
-            return false;
-        }
-
-        auto close_sock = [&]() { ::close(sock); };
-        ifreq ifr;
-        std::memset(&ifr, 0, sizeof(ifr));
-        std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name_.c_str());
-
-        if (!config.tun_address.empty()) {
-            in_addr interface_addr;
-            int interface_prefix = 0;
-            if (!parse_ipv4_cidr(config.tun_address, interface_addr, interface_prefix)) {
-                error = "tun.address must be an IPv4 CIDR on Linux";
-                close_sock();
-                return false;
-            }
-            sockaddr_in addr;
-            std::memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_addr = interface_addr;
-            std::memcpy(&ifr.ifr_addr, &addr, sizeof(addr));
-            if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-                error = std::string("SIOCSIFADDR failed: ") + std::strerror(errno);
-                close_sock();
-                return false;
-            }
-
-            sockaddr_in mask;
-            std::memset(&mask, 0, sizeof(mask));
-            mask.sin_family = AF_INET;
-            mask.sin_addr.s_addr = prefix_to_netmask(interface_prefix);
-            std::memcpy(&ifr.ifr_netmask, &mask, sizeof(mask));
-            if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
-                error = std::string("SIOCSIFNETMASK failed: ") + std::strerror(errno);
-                close_sock();
-                return false;
-            }
-        }
-
-        ifr.ifr_mtu = config.tun_mtu;
-        if (config.tun_mtu > 0 && ioctl(sock, SIOCSIFMTU, &ifr) < 0) {
-            error = std::string("SIOCSIFMTU failed: ") + std::strerror(errno);
-            close_sock();
-            return false;
-        }
-
-        if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-            error = std::string("SIOCGIFFLAGS failed: ") + std::strerror(errno);
-            close_sock();
-            return false;
-        }
-        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-        if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-            error = std::string("SIOCSIFFLAGS failed: ") + std::strerror(errno);
-            close_sock();
+    bool configure_linux(const ClientConfig& config, std::string& error) {
+        if (config.tun_auto_config && !configure_interface(config, error)) {
             return false;
         }
 
         std::vector<std::string> routes = config.tun_routes;
-        if (config.tun_auto_route && routes.empty() && config.tun_tcp_stack != "lwip") {
-            routes.push_back("0.0.0.0/1");
-            routes.push_back("128.0.0.0/1");
+        if (config.tun_auto_route && routes.empty()) {
+            routes = {"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"};
         }
+        if (!routes.empty() && !install_policy_routes(config, routes, error)) {
+            remove_addresses();
+            return false;
+        }
+        return true;
+    }
 
-        if (config.tun_tcp_stack == "lwip" && config.tun_auto_route) {
-            if (!install_policy_routes(config, routes, error)) {
-                close_sock();
+    bool configure_interface(const ClientConfig& config, std::string& error) {
+        for (const auto& cidr : config.tun_addresses) {
+            const bool ipv6 = cidr.find(':') != std::string::npos;
+            const std::vector<std::string> show = {
+                ipv6 ? "-6" : "-4", "address", "show", "dev", name_, "to", cidr};
+            const CommandResult existing = run_ip(show);
+            if (existing.exit_code != 0) {
+                error = "failed to inspect Linux TUN address: " + cidr;
+                remove_addresses();
                 return false;
             }
-        } else {
-            for (const auto& route : routes) {
-                if (!add_route(sock, route, error)) {
-                    close_sock();
-                    return false;
-                }
+            if (!existing.output.empty()) continue;
+            const std::vector<std::string> add = {
+                ipv6 ? "-6" : "-4", "address", "add", cidr, "dev", name_};
+            if (run_ip(add).exit_code != 0) {
+                error = "failed to add Linux TUN address: " + cidr;
+                remove_addresses();
+                return false;
             }
+            installed_address_undo_.push_back(
+                {ipv6 ? "-6" : "-4", "address", "del", cidr, "dev", name_});
         }
 
-        close_sock();
-        return true;
-    }
-
-    bool add_route(int sock, const std::string& cidr, std::string& error) {
-        in_addr dst;
-        int prefix = 0;
-        if (!parse_ipv4_cidr(cidr, dst, prefix)) {
-            error = "tun.routes only supports IPv4 CIDR on Linux: " + cidr;
+        if (config.tun_mtu > 0 &&
+            run_ip({"link", "set", "dev", name_, "mtu",
+                    std::to_string(config.tun_mtu)}).exit_code != 0) {
+            error = "failed to set Linux TUN MTU";
+            remove_addresses();
+            return false;
+        }
+        if (run_ip({"link", "set", "dev", name_, "up"}).exit_code != 0) {
+            error = "failed to bring Linux TUN interface up";
+            remove_addresses();
             return false;
         }
 
-        rtentry rt;
-        std::memset(&rt, 0, sizeof(rt));
-        sockaddr_in dst_addr;
-        std::memset(&dst_addr, 0, sizeof(dst_addr));
-        dst_addr.sin_family = AF_INET;
-        dst_addr.sin_addr = dst;
-        std::memcpy(&rt.rt_dst, &dst_addr, sizeof(dst_addr));
-
-        sockaddr_in genmask;
-        std::memset(&genmask, 0, sizeof(genmask));
-        genmask.sin_family = AF_INET;
-        genmask.sin_addr.s_addr = prefix_to_netmask(prefix);
-        std::memcpy(&rt.rt_genmask, &genmask, sizeof(genmask));
-
-        rt.rt_flags = RTF_UP;
-        rt.rt_dev = const_cast<char*>(name_.c_str());
-
-        if (ioctl(sock, SIOCADDRT, &rt) < 0) {
-            if (errno == EEXIST) return true;
-            error = "SIOCADDRT failed for " + cidr + ": " + std::strerror(errno);
-            return false;
-        }
         return true;
     }
 
-    static bool run_ip(const std::vector<std::string>& arguments) {
+    static CommandResult run_ip(const std::vector<std::string>& arguments) {
+        if (g_command_runner) return g_command_runner(arguments);
+        int output_pipe[2];
+        if (pipe(output_pipe) != 0) return CommandResult{};
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>("ip"));
         for (const auto& argument : arguments)
             argv.push_back(const_cast<char*>(argument.c_str()));
         argv.push_back(nullptr);
         pid_t child = fork();
-        if (child < 0) return false;
+        if (child < 0) {
+            ::close(output_pipe[0]);
+            ::close(output_pipe[1]);
+            return CommandResult{};
+        }
         if (child == 0) {
+            ::close(output_pipe[0]);
+            dup2(output_pipe[1], STDOUT_FILENO);
+            dup2(output_pipe[1], STDERR_FILENO);
+            ::close(output_pipe[1]);
             execvp("ip", argv.data());
             _exit(127);
         }
+        ::close(output_pipe[1]);
+        CommandResult result;
+        char buffer[1024];
+        for (;;) {
+            const ssize_t count = ::read(output_pipe[0], buffer, sizeof(buffer));
+            if (count > 0) result.output.append(buffer, static_cast<size_t>(count));
+            else if (count < 0 && errno == EINTR) continue;
+            else break;
+        }
+        ::close(output_pipe[0]);
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        return result;
     }
 
     bool install_policy_routes(const ClientConfig& config,
                                std::vector<std::string> routes,
                                std::string& error) {
-        if (routes.empty()) {
-            routes = {"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"};
-        }
         policy_table_ = config.tun_route_table;
         policy_priority_ = config.tun_rule_priority;
-        policy_mark_ = config.tun_bypass_mark;
+        policy_mark_ = config.tun_tcp_stack == "lwip"
+            ? config.tun_bypass_mark : config.tun_redirect_mark;
         const std::string table = std::to_string(policy_table_);
         const std::string priority = std::to_string(policy_priority_);
         const std::string catch_priority = std::to_string(policy_priority_ + 1);
-        const std::string mark = std::to_string(policy_mark_);
+        const std::string mark = std::to_string(policy_mark_) + "/0xffffffff";
         bool need_ipv4 = false;
         bool need_ipv6 = false;
         for (const auto& route : routes) {
             if (route.find(':') != std::string::npos) need_ipv6 = true;
             else need_ipv4 = true;
         }
-        if (need_ipv4) {
-            run_ip({"-4", "rule", "del", "priority", priority, "fwmark", mark,
-                    "lookup", "main"});
-            run_ip({"-4", "rule", "del", "priority", catch_priority,
-                    "lookup", table});
-        }
-        if (need_ipv6) {
-            run_ip({"-6", "rule", "del", "priority", priority, "fwmark", mark,
-                    "lookup", "main"});
-            run_ip({"-6", "rule", "del", "priority", catch_priority,
-                    "lookup", table});
-        }
-        policy_installed_ = true;
-        policy_ipv4_rules_installed_ = false;
-        policy_ipv6_rules_installed_ = false;
-        if (need_ipv4) {
-            if (!run_ip({"-4", "rule", "add", "priority", priority, "fwmark", mark,
-                         "lookup", "main"})) {
-                error = "failed to install Linux IPv4 TUN policy rules";
-                remove_policy_routes();
+        const auto check_empty = [&](const std::vector<std::string>& command,
+                                     const std::string& what) {
+            const CommandResult result = run_ip(command);
+            if (result.exit_code != 0 || !result.output.empty()) {
+                error = "Linux TUN policy conflict: " + what;
                 return false;
             }
-            policy_ipv4_rules_installed_ = true;
-            if (!run_ip({"-4", "rule", "add", "priority", catch_priority,
-                         "lookup", table})) {
-                error = "failed to install Linux IPv4 TUN policy rules";
-                remove_policy_routes();
-                return false;
-            }
-        }
-        if (need_ipv6) {
-            if (!run_ip({"-6", "rule", "add", "priority", priority, "fwmark", mark,
-                         "lookup", "main"})) {
-                error = "failed to install Linux IPv6 TUN policy rules";
-                remove_policy_routes();
-                return false;
-            }
-            policy_ipv6_rules_installed_ = true;
-            if (!run_ip({"-6", "rule", "add", "priority", catch_priority,
-                         "lookup", table})) {
-                error = "failed to install Linux IPv6 TUN policy rules";
-                remove_policy_routes();
-                return false;
-            }
+            return true;
+        };
+        for (const char* family : {"-4", "-6"}) {
+            if ((family[1] == '4' && !need_ipv4) ||
+                (family[1] == '6' && !need_ipv6)) continue;
+            if (!check_empty({family, "rule", "show", "priority", priority},
+                             std::string(family) + " priority " + priority) ||
+                !check_empty({family, "rule", "show", "priority", catch_priority},
+                             std::string(family) + " priority " + catch_priority)) return false;
         }
         for (const auto& route : routes) {
             const bool ipv6 = route.find(':') != std::string::npos;
-            std::vector<std::string> args = {ipv6 ? "-6" : "-4", "route", "replace",
+            const char* family = ipv6 ? "-6" : "-4";
+            if (!check_empty({family, "route", "show", "table", table,
+                              "exact", route}, "route " + route)) return false;
+        }
+
+        for (const auto& route : routes) {
+            const bool ipv6 = route.find(':') != std::string::npos;
+            const char* family = ipv6 ? "-6" : "-4";
+            std::vector<std::string> args = {family, "route", "add",
                                              "table", table, route, "dev", name_};
-            if (!run_ip(args)) {
+            if (run_ip(args).exit_code != 0) {
                 error = "failed to install Linux TUN policy route: " + route;
                 remove_policy_routes();
                 return false;
             }
-            policy_routes_.push_back(route);
+            policy_undo_.push_back({family, "route", "del", "table", table,
+                                    route, "dev", name_});
+        }
+        for (const char* family : {"-4", "-6"}) {
+            if ((family[1] == '4' && !need_ipv4) ||
+                (family[1] == '6' && !need_ipv6)) continue;
+            std::vector<std::string> add_mark = {
+                family, "rule", "add", "priority", priority, "fwmark", mark,
+                "lookup", "main"};
+            if (run_ip(add_mark).exit_code != 0) {
+                error = "failed to install Linux TUN mark bypass rule";
+                remove_policy_routes();
+                return false;
+            }
+            policy_undo_.push_back({family, "rule", "del", "priority", priority,
+                                    "fwmark", mark, "lookup", "main"});
+            std::vector<std::string> add_capture = {
+                family, "rule", "add", "priority", catch_priority, "lookup", table};
+            if (run_ip(add_capture).exit_code != 0) {
+                error = "failed to install Linux TUN capture rule";
+                remove_policy_routes();
+                return false;
+            }
+            policy_undo_.push_back({family, "rule", "del", "priority", catch_priority,
+                                    "lookup", table});
         }
         return true;
     }
 
     void remove_policy_routes() {
-        if (!policy_installed_ && policy_routes_.empty()) return;
-        const std::string table = std::to_string(policy_table_);
-        for (const auto& route : policy_routes_) {
-            const bool ipv6 = route.find(':') != std::string::npos;
-            run_ip({ipv6 ? "-6" : "-4", "route", "del", "table", table,
-                    route, "dev", name_});
-        }
-        if (policy_ipv4_rules_installed_) {
-            run_ip({"-4", "rule", "del", "priority", std::to_string(policy_priority_),
-                    "fwmark", std::to_string(policy_mark_), "lookup", "main"});
-            run_ip({"-4", "rule", "del", "priority", std::to_string(policy_priority_ + 1),
-                    "lookup", table});
-        }
-        if (policy_ipv6_rules_installed_) {
-            run_ip({"-6", "rule", "del", "priority", std::to_string(policy_priority_),
-                    "fwmark", std::to_string(policy_mark_), "lookup", "main"});
-            run_ip({"-6", "rule", "del", "priority", std::to_string(policy_priority_ + 1),
-                    "lookup", table});
-        }
-        policy_routes_.clear();
-        policy_ipv4_rules_installed_ = false;
-        policy_ipv6_rules_installed_ = false;
-        policy_installed_ = false;
+        for (auto it = policy_undo_.rbegin(); it != policy_undo_.rend(); ++it)
+            run_ip(*it);
+        policy_undo_.clear();
+    }
+
+    void remove_addresses() {
+        for (auto it = installed_address_undo_.rbegin();
+             it != installed_address_undo_.rend(); ++it) run_ip(*it);
+        installed_address_undo_.clear();
     }
 #endif
 
@@ -419,13 +353,11 @@ private:
     bool external_fd_ = false;
     std::string name_;
 #if !defined(TX_PLATFORM_ANDROID)
-    bool policy_installed_ = false;
     uint32_t policy_table_ = 20220;
     uint32_t policy_priority_ = 10000;
     uint32_t policy_mark_ = 0x2024;
-    std::vector<std::string> policy_routes_;
-    bool policy_ipv4_rules_installed_ = false;
-    bool policy_ipv6_rules_installed_ = false;
+    std::vector<std::vector<std::string>> policy_undo_;
+    std::vector<std::vector<std::string>> installed_address_undo_;
 #endif
 };
 
@@ -464,9 +396,14 @@ bool parse_ipv4_cidr_win(const std::string& cidr, IN_ADDR& addr, UINT8& prefix) 
     const size_t slash = cidr.find('/');
     if (slash == std::string::npos) return false;
     std::string ip = cidr.substr(0, slash);
+    const std::string prefix_text = cidr.substr(slash + 1);
+    if (prefix_text.empty() ||
+        prefix_text.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
     char* end = nullptr;
-    long p = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
-    if (!end || *end != '\0' || p < 0 || p > 32) return false;
+    long p = std::strtol(prefix_text.c_str(), &end, 10);
+    if (end != prefix_text.c_str() + prefix_text.size() || p < 0 || p > 32) return false;
     sockaddr_in parsed;
     int parsed_len = sizeof(parsed);
     std::memset(&parsed, 0, sizeof(parsed));
@@ -483,9 +420,14 @@ bool parse_ip_cidr_win(const std::string& cidr, SOCKADDR_INET& address, UINT8& p
     const size_t slash = cidr.find('/');
     if (slash == std::string::npos) return false;
     const std::string host = cidr.substr(0, slash);
+    const std::string prefix_text = cidr.substr(slash + 1);
+    if (prefix_text.empty() ||
+        prefix_text.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
     char* end = nullptr;
-    const long parsed_prefix = std::strtol(cidr.substr(slash + 1).c_str(), &end, 10);
-    if (!end || *end != '\0') return false;
+    const long parsed_prefix = std::strtol(prefix_text.c_str(), &end, 10);
+    if (end != prefix_text.c_str() + prefix_text.size()) return false;
     std::memset(&address, 0, sizeof(address));
     if (host.find(':') == std::string::npos) {
         if (parsed_prefix < 0 || parsed_prefix > 32) return false;
@@ -505,6 +447,11 @@ public:
     ~WintunDevice() override { close(); }
 
     bool open(const ClientConfig& config, std::string& error) override {
+        if (config.tun_fd >= 0) {
+            _close(config.tun_fd);
+            error = "Windows does not support starting TUN from an owned CRT fd";
+            return false;
+        }
         name_ = config.tun_name.empty() ? "tx" : config.tun_name;
         snapshot_outbound_interfaces();
         dll_ = LoadLibraryW(L"wintun.dll");
@@ -808,6 +755,14 @@ private:
 #endif
 
 } // namespace
+
+void PlatformTunDevice::set_command_runner_for_testing(CommandRunner runner) {
+    g_command_runner = std::move(runner);
+}
+
+void PlatformTunDevice::reset_command_runner_for_testing() {
+    g_command_runner = CommandRunner();
+}
 
 std::unique_ptr<PlatformTunDevice> PlatformTunDevice::create() {
 #if defined(TX_PLATFORM_WINDOWS)

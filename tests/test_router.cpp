@@ -37,6 +37,20 @@ static void test_lan_detection() {
     assert(loopback.is_loopback());
     assert(loopback.is_lan());
 
+    const char* private_v4[] = {"0.1.2.3", "100.64.0.1", "169.254.2.3",
+                                "198.18.1.1", "224.0.0.1", "255.255.255.255"};
+    for (const char* text : private_v4) {
+        tx::IpAddr address;
+        assert(tx::IpAddr::parse(text, 0, address));
+        assert(router.decide_by_ip(address).outbound_tag == "direct-out");
+    }
+    const char* private_v6[] = {"::", "::1", "fc00::1", "fe80::1", "ff02::1"};
+    for (const char* text : private_v6) {
+        tx::IpAddr address;
+        assert(tx::IpAddr::parse(text, 0, address));
+        assert(router.decide_by_ip(address).outbound_tag == "direct-out");
+    }
+
     printf("OK\n");
 }
 
@@ -125,12 +139,40 @@ static void test_rejects_non_asis_strategy() {
     printf("OK\n");
 }
 
+static void test_geo_references_fail_closed() {
+    tx::RouteRule fallback;
+    fallback.outbound_tag = "proxy-out";
+
+    tx::RouterConfig missing_file;
+    missing_file.geosite_path = "/definitely/missing/geosite.dat";
+    missing_file.rules.push_back(fallback);
+    tx::Router router;
+    assert(!router.load(missing_file));
+
+    tx::RouterConfig missing_site_tag;
+    tx::RouteRule site;
+    site.domains.push_back("geosite:cn");
+    site.outbound_tag = "direct-out";
+    missing_site_tag.rules.push_back(site);
+    missing_site_tag.rules.push_back(fallback);
+    assert(!router.load(missing_site_tag));
+
+    tx::RouterConfig missing_ip_tag;
+    tx::RouteRule ip;
+    ip.ips.push_back("geoip:cn");
+    ip.outbound_tag = "direct-out";
+    missing_ip_tag.rules.push_back(ip);
+    missing_ip_tag.rules.push_back(fallback);
+    assert(!router.load(missing_ip_tag));
+}
+
 int main() {
     printf("=== Router Tests ===\n");
     test_lan_detection();
     test_public_ip();
     test_host_routing();
     test_rejects_non_asis_strategy();
+    test_geo_references_fail_closed();
     printf("All router tests passed!\n");
     return 0;
 }

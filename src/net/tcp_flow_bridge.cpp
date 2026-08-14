@@ -8,6 +8,7 @@ TcpFlowBridge::TcpFlowBridge(TcpStreamPtr left, TcpStreamPtr right)
 bool TcpFlowBridge::forward(const TcpStreamPtr& source,
                             const TcpStreamPtr& destination,
                             Buffer& data, bool& paused) {
+    if (data.empty()) return true;
     if (!source || !destination || source->is_closed() || destination->is_closed())
         return false;
     if (destination->pending_write_bytes() + data.readable() > kHardLimit) {

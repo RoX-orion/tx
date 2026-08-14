@@ -269,7 +269,9 @@ size_t TunnelCodec::build_message(TunnelCmd cmd, SessionId session_id,
         switch (target->type) {
             case AddrType::IPv4: {
                 if (pos + 4 + 2 > out_len) return 0;
-                auto addr = IpAddr::from_string(target->host);
+                IpAddr addr;
+                if (!IpAddr::parse(target->host, 0, addr) || addr.family != IpAddr::IPv4)
+                    return 0;
                 memcpy(out + pos, addr.data.v4, 4);
                 pos += 4;
                 break;
@@ -284,7 +286,9 @@ size_t TunnelCodec::build_message(TunnelCmd cmd, SessionId session_id,
             }
             case AddrType::IPv6: {
                 if (pos + 16 + 2 > out_len) return 0;
-                auto addr = IpAddr::from_string(target->host);
+                IpAddr addr;
+                if (!IpAddr::parse(target->host, 0, addr) || addr.family != IpAddr::IPv6)
+                    return 0;
                 memcpy(out + pos, addr.data.v6, 16);
                 pos += 16;
                 break;

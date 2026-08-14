@@ -115,6 +115,8 @@ private:
     void on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data);
     void on_tunnel_read(TunnelClientPtr client, Buffer& data);
     void on_tunnel_close(TunnelClientPtr client);
+    void close_protocol_violation(TunnelClientPtr client, SessionId sid,
+                                  const char* reason);
 
     // Handle decoded tunnel message
     void handle_connect(TunnelClientPtr client, SessionId sid, const TargetAddr& target);

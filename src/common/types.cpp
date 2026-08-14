@@ -21,7 +21,7 @@ IpAddr IpAddr::from_ipv6(const uint8_t bytes[16], uint16_t port) {
     return addr;
 }
 
-IpAddr IpAddr::from_string(const std::string& str, uint16_t port) {
+bool IpAddr::parse(const std::string& str, uint16_t port, IpAddr& output) {
     IpAddr addr;
     addr.port = port;
 
@@ -29,17 +29,19 @@ IpAddr IpAddr::from_string(const std::string& str, uint16_t port) {
     if (inet_pton(AF_INET, str.c_str(), &v4) == 1) {
         addr.family = IPv4;
         memcpy(addr.data.v4, &v4, 4);
-        return addr;
+        output = addr;
+        return true;
     }
 
     struct in6_addr v6;
     if (inet_pton(AF_INET6, str.c_str(), &v6) == 1) {
         addr.family = IPv6;
         memcpy(addr.data.v6, &v6, 16);
-        return addr;
+        output = addr;
+        return true;
     }
 
-    return addr;
+    return false;
 }
 
 std::string IpAddr::to_string() const {

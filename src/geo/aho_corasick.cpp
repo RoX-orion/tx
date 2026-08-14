@@ -60,19 +60,15 @@ void AhoCorasick::build() {
 
         for (int c = 0; c < 128; c++) {
             int v = states_[u].goto_map[c];
-            if (v == -1) continue;
+            if (v == -1) {
+                states_[u].goto_map[c] =
+                    states_[states_[u].fail_link].goto_map[c];
+                continue;
+            }
 
             queue.push(v);
-
-            // Failure link: follow parent's fail chain
-            int f = states_[u].fail_link;
-            while (states_[f].goto_map[c] == -1 && f != 0) {
-                f = states_[f].fail_link;
-            }
-            states_[v].fail_link = states_[f].goto_map[c];
-            if (states_[v].fail_link == v) {
-                states_[v].fail_link = 0;
-            }
+            states_[v].fail_link =
+                states_[states_[u].fail_link].goto_map[c];
 
             // Merge output from failure link
             auto& fail_out = states_[states_[v].fail_link].output;
@@ -85,15 +81,6 @@ void AhoCorasick::build() {
         }
     }
 
-    // Set all remaining -1 transitions to follow failure chain
-    for (auto& state : states_) {
-        for (int c = 0; c < 128; c++) {
-            if (state.goto_map[c] == -1) {
-                int f = state.fail_link;
-                state.goto_map[c] = states_[f].goto_map[c];
-            }
-        }
-    }
 }
 
 bool AhoCorasick::search(const std::string& text, const std::string& country) const {

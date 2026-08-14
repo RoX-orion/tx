@@ -467,6 +467,10 @@ static void test_encoded_frame_size_preflight() {
 }
 
 int main() {
+    tx::IpAddr parsed;
+    parsed = tx::IpAddr::from_ipv4(203, 0, 113, 1, 99);
+    assert(!tx::IpAddr::parse("not-an-ip", 443, parsed));
+    assert(parsed == tx::IpAddr::from_ipv4(203, 0, 113, 1, 99));
     printf("=== Tunnel Tests ===\n");
     test_handshake_round_trip();
     test_handshake_authentication_failure();

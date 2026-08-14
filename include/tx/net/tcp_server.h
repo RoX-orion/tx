@@ -62,6 +62,7 @@ public:
 
     // Close
     void shutdown_write() override;
+    void close_after_flush();
     void close() override;
     void reset() override { close(); }
     bool is_closed() const override { return closed_; }
@@ -106,6 +107,7 @@ private:
     bool         read_eof_;
     bool         write_shutdown_;
     bool         shutdown_pending_;
+    bool         close_after_flush_;
     ReadCallback read_cb_;
     CloseCallbackS close_cb_;
     WriteDrainCallback write_drain_cb_;

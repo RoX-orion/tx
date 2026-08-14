@@ -451,6 +451,13 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
         return;
     }
 
+    if (!client->session || client->session->is_closed() ||
+        !client->session->send(hello)) {
+        TX_ERROR("Failed to send tunnel server hello");
+        if (client->session && !client->session->is_closed()) client->session->close();
+        return;
+    }
+
     client->codec = TunnelCodec(keys, false);
     stop_handshake_timer(client);
     if (!client->authenticated) {
@@ -462,7 +469,6 @@ void ServerApp::on_tunnel_handshake_read(TunnelClientPtr client, Buffer& data) {
         }
     }
 
-    client->session->send(hello);
     client->handshake_buf.consume(TunnelCodec::kHandshakeSize);
     TX_INFO("Tunnel handshake complete for %s:%u",
             client->session->remote_addr().c_str(), client->session->remote_port());
@@ -524,12 +530,15 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
                 handle_half_close(client, session_id);
                 break;
             case TunnelCmd::ConnectResult:
-                TX_DEBUG("Unexpected CONNECT_RESULT from client for session %u", session_id);
+                close_protocol_violation(client, session_id,
+                                         "unexpected CONNECT_RESULT command");
                 break;
             case TunnelCmd::DnsResponse:
-                TX_DEBUG("Unexpected DNS_RESPONSE from client for session %u", session_id);
+                close_protocol_violation(client, session_id,
+                                         "unexpected DNS_RESPONSE command");
                 break;
         }
+        if (!client->session || client->session->is_closed()) return;
     }
 
     if (client->codec.has_protocol_error()) {
@@ -541,6 +550,14 @@ void ServerApp::on_tunnel_read(TunnelClientPtr client, Buffer& data) {
     }
 }
 
+void ServerApp::close_protocol_violation(TunnelClientPtr client, SessionId sid,
+                                         const char* reason) {
+    TX_ERROR("Tunnel protocol violation for session %u: %s", sid,
+             reason ? reason : "invalid session state");
+    if (client && client->session && !client->session->is_closed())
+        client->session->close();
+}
+
 void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
                                  const TargetAddr& target) {
     if (!client || client->closed) return;
@@ -550,7 +567,8 @@ void ServerApp::handle_connect(TunnelClientPtr client, SessionId sid,
         return;
     }
     if (client->outbounds.find(sid) != client->outbounds.end() ||
-        client->udp_outbounds.find(sid) != client->udp_outbounds.end()) {
+        client->udp_outbounds.find(sid) != client->udp_outbounds.end() ||
+        client->dns_queries.find(sid) != client->dns_queries.end()) {
         TX_ERROR("Duplicate or cross-protocol session ID %u from tunnel client", sid);
         if (client->session && !client->session->is_closed()) client->session->close();
         return;
@@ -722,7 +740,10 @@ void ServerApp::connect_tcp_candidates(
 void ServerApp::handle_data(TunnelClientPtr client, SessionId sid, Buffer& payload) {
     auto it = client->outbounds.find(sid);
     if (it == client->outbounds.end()) {
-        TX_WARN("Data for unknown session %u (%zu bytes)", sid, payload.readable());
+        TX_ERROR("Data references a non-TCP session %u (%zu bytes)",
+                 sid, payload.readable());
+        payload.clear();
+        close_protocol_violation(client, sid, "DATA requires an existing TCP session");
         return;
     }
 
@@ -774,8 +795,9 @@ void ServerApp::handle_udp_packet(TunnelClientPtr client, SessionId sid,
         if (client->session && !client->session->is_closed()) client->session->close();
         return;
     }
-    if (client->outbounds.find(sid) != client->outbounds.end()) {
-        TX_ERROR("UDP packet reuses TCP session ID %u", sid);
+    if (client->outbounds.find(sid) != client->outbounds.end() ||
+        client->dns_queries.find(sid) != client->dns_queries.end()) {
+        TX_ERROR("UDP packet reuses a TCP or DNS session ID %u", sid);
         payload.clear();
         if (client->session && !client->session->is_closed()) client->session->close();
         return;
@@ -1083,23 +1105,27 @@ void ServerApp::handle_disconnect(TunnelClientPtr client, SessionId sid) {
             it->second.remote_session->close();
         }
         client->outbounds.erase(it);
+        resume_inbound_read_if_possible(client);
+        return;
     }
     auto udp_it = client->udp_outbounds.find(sid);
     if (udp_it != client->udp_outbounds.end()) {
         close_udp_outbound(udp_it->second);
         client->udp_outbounds.erase(udp_it);
+        resume_inbound_read_if_possible(client);
+        return;
     }
-    auto dns_it = client->dns_queries.find(sid);
-    if (dns_it != client->dns_queries.end()) {
-        client->dns_queries.erase(dns_it);
-        if (client->pending_dns_queries > 0) --client->pending_dns_queries;
-    }
-    resume_inbound_read_if_possible(client);
+    close_protocol_violation(client, sid,
+                             "DISCONNECT requires an existing TCP or UDP session");
 }
 
 void ServerApp::handle_half_close(TunnelClientPtr client, SessionId sid) {
     auto it = client->outbounds.find(sid);
-    if (it == client->outbounds.end()) return;
+    if (it == client->outbounds.end()) {
+        close_protocol_violation(client, sid,
+                                 "HALF_CLOSE requires an existing TCP session");
+        return;
+    }
     it->second.client_eof = true;
     if (it->second.connected && it->second.remote_session &&
         !it->second.remote_session->is_closed()) {

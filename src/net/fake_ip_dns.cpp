@@ -196,13 +196,17 @@ void FakeIpDns::erase_mapping(std::unordered_map<std::string, Mapping>::iterator
 }
 
 void FakeIpDns::expire_mappings(uint64_t now) {
-    for (auto mapping = forward_.begin(); mapping != forward_.end();) {
-        if (mapping->second.expires_at > now) {
-            ++mapping;
+    // All mappings use the same TTL. touch_mapping() both refreshes the
+    // expiry and moves the entry to the back, so LRU order is also expiry
+    // order. Expiration therefore only visits entries that can be removed.
+    while (!lru_.empty()) {
+        auto mapping = forward_.find(lru_.front());
+        if (mapping == forward_.end()) {
+            lru_.pop_front();
             continue;
         }
-        auto expired = mapping++;
-        erase_mapping(expired);
+        if (mapping->second.expires_at > now) break;
+        erase_mapping(mapping);
     }
 }
 
@@ -346,7 +350,11 @@ bool FakeIpDns::reverse_lookup(const std::string& address, std::string& domain) 
     auto it = reverse_.find(address);
     if (it == reverse_.end()) return false;
     auto mapping = forward_.find(it->second.domain);
-    if (mapping == forward_.end()) return false;
+    if (mapping == forward_.end() || mapping->second.expires_at <= now) {
+        if (mapping != forward_.end()) erase_mapping(mapping);
+        else reverse_.erase(it);
+        return false;
+    }
     touch_mapping(mapping, now);
     domain = mapping->first;
     return true;

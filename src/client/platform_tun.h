@@ -15,6 +15,12 @@ namespace tx {
 
 class PlatformTunDevice {
 public:
+    enum class WriteResult {
+        Written,
+        WouldBlock,
+        Error,
+    };
+
     struct CommandResult {
         int exit_code = -1;
         std::string output;
@@ -35,7 +41,8 @@ public:
         return OutboundSocketPolicy();
     }
     virtual std::ptrdiff_t read_packet(uint8_t* data, size_t len, std::string& error) = 0;
-    virtual bool write_packet(const uint8_t* data, size_t len, std::string& error) = 0;
+    virtual WriteResult write_packet(const uint8_t* data, size_t len,
+                                     std::string& error) = 0;
     virtual bool start_async_reader(uv_loop_t*, std::function<void()>, std::string& error) {
         error = "asynchronous TUN reader is not supported";
         return false;

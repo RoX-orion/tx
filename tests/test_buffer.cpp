@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -66,6 +67,14 @@ static void test_clear_preserves_reusable_capacity() {
 }
 
 static void test_strict_bounds_and_self_append() {
+    tx::Buffer direct(0);
+    direct.reserve_writable(32);
+    assert(direct.writable_bytes() >= 32);
+    std::memset(direct.writable(), 0x5a, 32);
+    direct.commit(32);
+    assert(direct.readable() == 32);
+    assert(direct.data()[31] == 0x5a);
+
     tx::Buffer buffer(1);
     const uint8_t values[] = {1, 2, 3, 4};
     buffer.append(values, sizeof(values));

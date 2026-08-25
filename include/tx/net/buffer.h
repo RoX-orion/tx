@@ -33,6 +33,11 @@ public:
     size_t writable_bytes() const { return buf_.size() - write_pos_; }
     size_t capacity() const { return buf_.size(); }
 
+    // Ensure a caller can fill a contiguous region and commit it once. This
+    // avoids a temporary buffer for codecs that already know their output
+    // size before encoding.
+    void reserve_writable(size_t n) { ensure_writable(n); }
+
     // Advance write position after external write
     void commit(size_t n) {
         if (n > writable_bytes()) throw std::out_of_range("Buffer commit exceeds writable space");

@@ -413,6 +413,43 @@ bool TcpSession::send(Buffer& buf) {
     return true;
 }
 
+bool TcpSession::send(Buffer&& buf) {
+    if (closed_ || write_shutdown_ || shutdown_pending_ || buf.empty()) return false;
+    const size_t len = buf.readable();
+    if (len > write_hard_limit_ || pending_write_bytes_ > write_hard_limit_ - len) {
+        TX_WARN("TCP write hard limit reached: pending=%zu requested=%zu limit=%zu",
+                pending_write_bytes_, len, write_hard_limit_);
+        return false;
+    }
+
+    WriteReq* wr = nullptr;
+    try {
+        wr = new WriteReq{};
+        wr->data = nullptr;
+        wr->owned_buffer.reset(new Buffer(std::move(buf)));
+        wr->buf = uv_buf_init(
+            reinterpret_cast<char*>(const_cast<uint8_t*>(wr->owned_buffer->data())),
+            static_cast<unsigned int>(len));
+        wr->len = len;
+        wr->session = shared_from_this();
+        wr->req.data = wr;
+    } catch (...) {
+        delete wr;
+        TX_WARN("TCP owned write allocation failed for %zu bytes", len);
+        return false;
+    }
+
+    const int status = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&tcp_),
+                                &wr->buf, 1, on_write_free);
+    if (status != 0) {
+        TX_DEBUG("uv_write failed: %s", uv_strerror(status));
+        delete wr;
+        return false;
+    }
+    pending_write_bytes_ += len;
+    return true;
+}
+
 void TcpSession::start_read(ReadCallback cb) {
     if (closed_ || read_eof_) return;
     read_cb_ = std::move(cb);

@@ -25,6 +25,7 @@ public:
     static constexpr size_t kMaxCryptoBytes = 16 * 1024;
 
     QuicSniSniffer();
+    ~QuicSniSniffer();
 
     QuicSniResult feed(const uint8_t* data, size_t len, std::string& host);
     void reset();
@@ -43,6 +44,9 @@ private:
     // value per DCID while this flow is being sniffed so the AEAD nonce is
     // reconstructed according to QUIC's packet-number decoding rules.
     std::unordered_map<std::string, uint64_t> expected_packet_numbers_;
+    // version || DCID -> client Initial key, IV, and header-protection key.
+    // The cache is bounded alongside packet-number spaces.
+    std::unordered_map<std::string, std::vector<uint8_t>> initial_keys_;
     size_t contiguous_bytes_;
     size_t buffered_bytes_;
 };

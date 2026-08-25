@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -116,6 +117,132 @@ void test_conflict_and_partial_rollback() {
     close(descriptors[1]);
 }
 
+void test_reclaims_matching_stale_policy() {
+    int descriptors[2];
+    assert(pipe(descriptors) == 0);
+    bool stale_mark_rule = true;
+    bool stale_capture_rule = true;
+    bool stale_route = true;
+    std::vector<std::string> commands;
+    tx::PlatformTunDevice::set_command_runner_for_testing(
+        [&](const std::vector<std::string>& command) {
+            const std::string text = join(command);
+            commands.push_back(text);
+            if (text == "-4 rule show priority 10000") {
+                return tx::PlatformTunDevice::CommandResult{
+                    0, stale_mark_rule
+                           ? "10000: from all fwmark 0x2024 lookup main\n"
+                           : std::string()};
+            }
+            if (text == "-4 rule show priority 10001") {
+                return tx::PlatformTunDevice::CommandResult{
+                    0, stale_capture_rule
+                           ? "10001: from all lookup 20220\n"
+                           : std::string()};
+            }
+            if (text ==
+                "-4 rule del priority 10000 fwmark 8228/0xffffffff lookup main") {
+                stale_mark_rule = false;
+                return tx::PlatformTunDevice::CommandResult{0, std::string()};
+            }
+            if (text == "-4 rule del priority 10001 lookup 20220") {
+                stale_capture_rule = false;
+                return tx::PlatformTunDevice::CommandResult{0, std::string()};
+            }
+            if (text ==
+                "-4 route show table 20220 exact 0.0.0.0/1") {
+                return tx::PlatformTunDevice::CommandResult{
+                    0, stale_route
+                           ? "0.0.0.0/1 dev tx-test0 scope link\n"
+                           : std::string()};
+            }
+            if (text ==
+                "-4 route del table 20220 0.0.0.0/1 dev tx-test0") {
+                stale_route = false;
+                return tx::PlatformTunDevice::CommandResult{0, std::string()};
+            }
+            return tx::PlatformTunDevice::CommandResult{0, std::string()};
+        });
+
+    auto device = tx::PlatformTunDevice::create();
+    std::string error;
+    assert(device->open(policy_config(descriptors[0]), error));
+    assert(!stale_mark_rule && !stale_capture_rule && !stale_route);
+    const size_t stale_rule_del = find_after(commands,
+        "-4 rule del priority 10000 fwmark 8228/0xffffffff lookup main");
+    const size_t new_rule_add = find_after(commands,
+        "-4 rule add priority 10000 fwmark 8228/0xffffffff lookup main");
+    const size_t stale_route_del = find_after(commands,
+        "-4 route del table 20220 0.0.0.0/1 dev tx-test0");
+    const size_t new_route_add = find_after(commands,
+        "-4 route add table 20220 0.0.0.0/1 dev tx-test0");
+    assert(stale_rule_del < new_rule_add);
+    assert(stale_route_del < new_route_add);
+
+    device->close();
+    close(descriptors[1]);
+}
+
+void test_missing_policy_table_is_clean_start() {
+    int descriptors[2];
+    assert(pipe(descriptors) == 0);
+    std::vector<std::string> commands;
+    tx::PlatformTunDevice::set_command_runner_for_testing(
+        [&](const std::vector<std::string>& command) {
+            const std::string text = join(command);
+            commands.push_back(text);
+            if (text.find("route show table 20220 exact") != std::string::npos) {
+                return tx::PlatformTunDevice::CommandResult{
+                    2, "Error: ipv4: FIB table does not exist.\nDump terminated\n"};
+            }
+            return tx::PlatformTunDevice::CommandResult{0, std::string()};
+        });
+
+    auto device = tx::PlatformTunDevice::create();
+    std::string error;
+    assert(device->open(policy_config(descriptors[0]), error));
+    assert(find_after(commands,
+        "-4 route add table 20220 0.0.0.0/1 dev tx-test0") != commands.size());
+    assert(find_after(commands,
+        "-6 route add table 20220 ::/1 dev tx-test0") != commands.size());
+
+    device->close();
+    close(descriptors[1]);
+}
+
+void test_nonblocking_write_result() {
+    int descriptors[2];
+    assert(pipe(descriptors) == 0);
+    tx::ClientConfig config;
+    config.tun_fd = descriptors[1];
+    config.tun_name = "tx-test-write";
+    config.tun_auto_config = false;
+    config.tun_auto_route = false;
+    config.tun_routes.clear();
+
+    tx::PlatformTunDevice::set_command_runner_for_testing(
+        [](const std::vector<std::string>&) {
+            return tx::PlatformTunDevice::CommandResult{0, std::string()};
+        });
+    auto device = tx::PlatformTunDevice::create();
+    std::string error;
+    assert(device->open(config, error));
+    const uint8_t packet[] = {1, 2, 3};
+    assert(device->write_packet(packet, sizeof(packet), error) ==
+           tx::PlatformTunDevice::WriteResult::Written);
+
+    std::vector<uint8_t> fill(4096, 0);
+    while (write(descriptors[1], fill.data(), fill.size()) > 0) {}
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    error.clear();
+    assert(device->write_packet(packet, sizeof(packet), error) ==
+           tx::PlatformTunDevice::WriteResult::WouldBlock);
+    assert(error.empty());
+
+    device->close();
+    close(descriptors[0]);
+}
+
 void test_system_stack_explicit_routes_without_auto_config() {
     int descriptors[2];
     assert(pipe(descriptors) == 0);
@@ -162,6 +289,9 @@ int main() {
 #if defined(TX_PLATFORM_LINUX)
     test_policy_order_and_cleanup();
     test_conflict_and_partial_rollback();
+    test_reclaims_matching_stale_policy();
+    test_missing_policy_table_is_clean_start();
+    test_nonblocking_write_result();
     test_system_stack_explicit_routes_without_auto_config();
     tx::PlatformTunDevice::reset_command_runner_for_testing();
 #endif

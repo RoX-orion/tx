@@ -315,6 +315,8 @@ struct ClientAppQuicTest {
         const IpAddr fake_target = parse_ip(fake_ip, 443);
         app.handle_lwip_udp_datagram(6, client, fake_target, first, sizeof(first));
         app.handle_lwip_udp_datagram(6, client, fake_target, second, sizeof(second));
+        assert(app.tun_perf_stats_.udp_flow_fast_hits == 1);
+        assert(app.tun_udp_flow_sessions_.find(6) != app.tun_udp_flow_sessions_.end());
 
         while (flow(app, 6).direct_target_resolving) {
             uv_run(app.loop(), UV_RUN_ONCE);
@@ -453,11 +455,13 @@ struct ClientAppQuicTest {
         flow.session_id = app.allocate_session_id();
         assert(flow.session_id != 0);
         flow.kind = ClientApp::UdpFlowKind::Tun;
+        flow.lwip_flow_id = 5;
         flow.quic_sniffer.reset(new QuicSniSniffer());
         flow.quic_pending_packets.push_back(std::vector<uint8_t>{1, 2, 3});
         flow.quic_pending_bytes = 3;
         const std::string key = "tun:lwip:5";
         app.udp_session_keys_[flow.session_id] = key;
+        app.tun_udp_flow_sessions_[5] = flow.session_id;
         app.udp_flows_.emplace(key, std::move(flow));
         app.quic_sniff_active_flows_ = 1;
         app.quic_sniff_pending_bytes_ = 3;
@@ -466,6 +470,32 @@ struct ClientAppQuicTest {
         assert(app.udp_flows_.empty());
         assert(app.quic_sniff_active_flows_ == 0);
         assert(app.quic_sniff_pending_bytes_ == 0);
+        assert(app.tun_udp_flow_sessions_.empty());
+    }
+
+    static void deadline_heap_discards_stale_entries() {
+        ClientApp app;
+        configure(app);
+        ClientApp::UdpFlow flow;
+        flow.session_id = app.allocate_session_id();
+        flow.kind = ClientApp::UdpFlowKind::Tun;
+        flow.quic_sniffer.reset(new QuicSniSniffer());
+        const std::string key = "tun:lwip:10";
+        app.udp_session_keys_[flow.session_id] = key;
+        auto inserted = app.udp_flows_.emplace(key, std::move(flow)).first;
+        const uint64_t now = uv_now(app.loop());
+        app.schedule_udp_deadline(inserted->second,
+                                  ClientApp::UdpDeadlineKind::QuicSniff,
+                                  now + 1000);
+        app.schedule_udp_deadline(inserted->second,
+                                  ClientApp::UdpDeadlineKind::QuicSniff,
+                                  now + 2000);
+        assert(app.udp_deadlines_.size() == 1);
+        assert(app.udp_deadlines_.top().deadline_ms == now + 2000);
+        app.release_tun_quic_sniffer(inserted->second);
+        app.arm_internal_dns_timer();
+        assert(app.udp_deadlines_.empty());
+        app.remove_udp_flow(key, false);
     }
 };
 
@@ -487,6 +517,7 @@ int main() {
     tx::ClientAppQuicTest::network_change_keeps_live_quic_cache();
     tx::ClientAppQuicTest::oversized_first_packet_falls_back_without_buffering();
     tx::ClientAppQuicTest::flow_removal_releases_quic_resources();
+    tx::ClientAppQuicTest::deadline_heap_discards_stale_entries();
     std::printf("client QUIC routing tests passed\n");
     return 0;
 }

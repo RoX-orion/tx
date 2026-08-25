@@ -7,7 +7,9 @@
 #include <unordered_set>
 #include <vector>
 #include <deque>
+#include <queue>
 #include <atomic>
+#include <array>
 #include "platform_tun.h"
 #include "tx/net/tcp_server.h"
 #include "tx/net/buffer.h"
@@ -18,6 +20,7 @@
 #include "tx/net/lwip_udp_stack.h"
 #include "tx/net/fake_ip_dns.h"
 #include "tx/net/tcp_flow_bridge.h"
+#include "tx/net/tun_write_queue.h"
 #include "tx/net/dns_resolver.h"
 #include "tx/router/router.h"
 #include "config.h"
@@ -137,6 +140,11 @@ private:
         Dns,
     };
 
+    enum class UdpDeadlineKind {
+        InternalDns,
+        QuicSniff,
+    };
+
     struct UdpFlow {
         SessionId session_id;
         UdpFlowKind kind = UdpFlowKind::Socks5;
@@ -155,6 +163,9 @@ private:
         // and prevents concurrent datagrams from reordering around DNS.
         TargetAddr direct_resolution_target;
         TargetAddr direct_send_target;
+        TargetAddr direct_cached_target;
+        sockaddr_storage direct_cached_address{};
+        bool direct_cached_address_valid = false;
         bool direct_target_resolving = false;
         std::deque<std::vector<uint8_t>> direct_resolution_packets;
         size_t direct_resolution_bytes = 0;
@@ -177,6 +188,20 @@ private:
         DnsResolver::ResolveCallback dns_callback;
         std::vector<uint8_t> dns_query;
         uint64_t dns_deadline_ms = 0;
+        uint64_t deadline_generation = 0;
+    };
+
+    struct UdpDeadline {
+        uint64_t deadline_ms;
+        SessionId session_id;
+        uint64_t generation;
+        UdpDeadlineKind kind;
+    };
+
+    struct UdpDeadlineLater {
+        bool operator()(const UdpDeadline& left, const UdpDeadline& right) const {
+            return left.deadline_ms > right.deadline_ms;
+        }
     };
 
     struct UdpTunnel {
@@ -214,6 +239,26 @@ private:
         const OutboundConfig* outbound = nullptr;
         uint64_t expires_at_ms = 0;
         uint64_t last_used_at_ms = 0;
+    };
+
+    struct TunPerfStats {
+        uint64_t rx_packets = 0;
+        uint64_t rx_bytes = 0;
+        uint64_t rx_budget_yields = 0;
+        uint64_t udp_flow_fast_hits = 0;
+        uint64_t udp_flow_fast_misses = 0;
+        uint64_t tx_immediate = 0;
+        uint64_t tx_queued = 0;
+        uint64_t tx_would_block = 0;
+        uint64_t tx_dropped = 0;
+        uint64_t tx_errors = 0;
+        size_t tx_max_queued_bytes = 0;
+    };
+
+    enum class TunDrainResult {
+        Empty,
+        BudgetExhausted,
+        Error,
     };
 
     // Accept handlers for HTTP and SOCKS5 listeners
@@ -304,6 +349,10 @@ private:
                                bool notify_peer);
     void discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionId sid);
     void arm_internal_dns_timer();
+    void schedule_udp_deadline(UdpFlow& flow, UdpDeadlineKind kind,
+                               uint64_t deadline_ms);
+    bool resolve_udp_deadline(const UdpDeadline& deadline,
+                              std::string& flow_key, UdpFlow*& flow);
     void stop_internal_dns_timer();
     bool ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& flow,
                                  int target_family);
@@ -352,7 +401,11 @@ private:
     void on_tun_tcp_accept(SessionPtr session);
     void on_lwip_tcp_accept(const std::shared_ptr<LwipTcpStream>& stream,
                             const IpAddr& source, const TargetAddr& target);
-    void drain_tun_packets();
+    TunDrainResult drain_tun_packets();
+    bool write_tun_packet(const uint8_t* data, size_t len);
+    void flush_tun_write_queue();
+    void set_tun_poll_writable(bool enabled);
+    void schedule_tun_retry();
     void handle_tun_packet(const uint8_t* data, size_t len);
     void handle_lwip_udp_datagram(uint64_t flow_id, const IpAddr& source,
                                   const IpAddr& destination,
@@ -424,20 +477,28 @@ private:
     std::unique_ptr<PlatformTunDevice> tun_device_;
     LwipUdpStack       lwip_udp_stack_;
     std::vector<uint8_t> tun_read_buf_;
+    TunWriteQueue      tun_write_queue_;
+    TunPerfStats       tun_perf_stats_;
+    bool               tun_poll_writable_ = false;
+    uint64_t           tun_last_write_warning_ms_ = 0;
     std::unordered_map<std::string, UdpTunnelPtr> udp_tunnels_;
     std::unordered_map<std::string, uint32_t> udp_mux_next_slot_;
     std::unordered_map<std::string, UdpFlow> udp_flows_;
     std::unordered_map<SessionId, std::string> udp_session_keys_;
+    std::unordered_map<uint64_t, SessionId> tun_udp_flow_sessions_;
     std::unordered_map<uint64_t, TunDnsFlow> tun_dns_flows_;
     uint64_t            next_tun_dns_generation_ = 1;
     uv_timer_t         udp_cleanup_timer_;
     bool               udp_cleanup_timer_started_;
     uv_timer_t         internal_dns_timer_;
     bool               internal_dns_timer_initialized_;
+    std::priority_queue<UdpDeadline, std::vector<UdpDeadline>, UdpDeadlineLater>
+        udp_deadlines_;
     size_t             udp_tunnel_pending_bytes_ = 0;
     size_t             quic_sniff_active_flows_ = 0;
     size_t             quic_sniff_pending_bytes_ = 0;
     std::unordered_map<std::string, QuicRouteCacheEntry> quic_route_cache_;
+    std::array<std::unordered_set<std::string>, 256> quic_route_cids_by_first_byte_;
 
     // Active connections by session ID
     std::unordered_map<SessionId, ProxyConnPtr> connections_;

@@ -33,6 +33,13 @@ std::string normalized(std::string s) {
 
 } // namespace
 
+struct AeadCipher::Impl {
+    Impl() : context(EVP_CIPHER_CTX_new()) {}
+    ~Impl() { EVP_CIPHER_CTX_free(context); }
+
+    EVP_CIPHER_CTX* context;
+};
+
 const char* aead_cipher_name(AeadCipherKind kind) {
     switch (kind) {
         case AeadCipherKind::Aes256Gcm:
@@ -57,9 +64,10 @@ bool parse_aead_cipher(const std::string& name, AeadCipherKind& kind) {
 }
 
 AeadCipher::AeadCipher(AeadCipherKind kind, const uint8_t* key, size_t key_len)
-    : kind_(kind) {
+    : kind_(kind), impl_(new Impl) {
     if (!key || key_len != kKeyLen)
         throw std::invalid_argument("AEAD key must be exactly 32 bytes");
+    if (!impl_->context) throw std::runtime_error("Failed to allocate AEAD context");
     memcpy(key_, key, kKeyLen);
 }
 
@@ -84,8 +92,8 @@ int AeadCipher::encrypt(const uint8_t nonce[kNonceLen],
         return -1;
     }
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
+    EVP_CIPHER_CTX* ctx = impl_->context;
+    if (EVP_CIPHER_CTX_reset(ctx) != 1) return -1;
 
     int outlen = 0;
     int tmplen = 0;
@@ -117,9 +125,9 @@ int AeadCipher::encrypt(const uint8_t nonce[kNonceLen],
                                   output + outlen) == 1);
     }
 
-    EVP_CIPHER_CTX_free(ctx);
-
     if (!ok) {
+        OPENSSL_cleanse(output, plaintext_len + kTagLen);
+        EVP_CIPHER_CTX_reset(ctx);
         TX_ERROR("AEAD encryption failed");
         return -1;
     }
@@ -144,8 +152,8 @@ int AeadCipher::decrypt(const uint8_t nonce[kNonceLen],
         return -1;
     }
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
+    EVP_CIPHER_CTX* ctx = impl_->context;
+    if (EVP_CIPHER_CTX_reset(ctx) != 1) return -1;
 
     int outlen = 0;
     int tmplen = 0;
@@ -177,9 +185,9 @@ int AeadCipher::decrypt(const uint8_t nonce[kNonceLen],
     ok = ok && (EVP_DecryptFinal_ex(ctx, plaintext + outlen, &tmplen) == 1);
     outlen += tmplen;
 
-    EVP_CIPHER_CTX_free(ctx);
-
     if (!ok) {
+        OPENSSL_cleanse(plaintext, ciphertext_len);
+        EVP_CIPHER_CTX_reset(ctx);
         TX_ERROR("AEAD decryption failed");
         return -1;
     }

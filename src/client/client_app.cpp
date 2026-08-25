@@ -9,8 +9,11 @@
 #include "tx/common/network.h"
 #include <cstring>
 #include <random>
+#include <new>
 #include <cstdlib>
 #include <array>
+#include <climits>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -76,6 +79,38 @@ constexpr size_t kMaxQuicRouteCacheEntries = 1024;
 constexpr size_t kMaxHttpHandshakeBytes = 64 * 1024;
 constexpr size_t kMaxSocks5HandshakeBytes = 512;
 constexpr uint64_t kProxyHandshakeTimeoutMs = 30000;
+constexpr size_t kTunDrainPacketBudget = 64;
+constexpr size_t kTunDrainByteBudget = 256 * 1024;
+constexpr uint64_t kTunDrainTimeBudgetNs = 1000 * 1000;
+constexpr size_t kTunWritePacketBudget = 64;
+constexpr size_t kTunWriteByteBudget = 256 * 1024;
+constexpr uint64_t kTunWriteTimeBudgetNs = 1000 * 1000;
+
+struct UdpSendRequest {
+    uv_udp_send_t request;
+    uv_buf_t buffer;
+};
+
+UdpSendRequest* allocate_udp_send_request(const uint8_t* data, size_t len) {
+    if ((!data && len != 0) || len > static_cast<size_t>(UINT_MAX) ||
+        len > std::numeric_limits<size_t>::max() - sizeof(UdpSendRequest)) {
+        return nullptr;
+    }
+    void* storage = ::operator new(sizeof(UdpSendRequest) + len, std::nothrow);
+    if (!storage) return nullptr;
+    auto* request = new (storage) UdpSendRequest{};
+    char* payload = reinterpret_cast<char*>(request + 1);
+    if (len != 0) std::memcpy(payload, data, len);
+    request->buffer = uv_buf_init(payload, static_cast<unsigned int>(len));
+    request->request.data = request;
+    return request;
+}
+
+void free_udp_send_request(UdpSendRequest* request) {
+    if (!request) return;
+    request->~UdpSendRequest();
+    ::operator delete(request);
+}
 
 bool append_tunnel_input(Buffer& destination, const Buffer& source) {
     const size_t incoming = source.readable();
@@ -664,6 +699,10 @@ void ClientApp::network_changed_on_loop() {
     const uint64_t now = uv_now(loop_);
     for (auto it = quic_route_cache_.begin(); it != quic_route_cache_.end();) {
         if (!it->second.outbound || it->second.expires_at_ms <= now) {
+            if (!it->first.empty()) {
+                quic_route_cids_by_first_byte_[
+                    static_cast<uint8_t>(it->first[0])].erase(it->first);
+            }
             it = quic_route_cache_.erase(it);
         } else {
             ++it;
@@ -702,6 +741,10 @@ void ClientApp::stop_on_loop() {
     stop_internal_dns_timer();
     stop_udp_cleanup_timer();
     stop_tun_listener();
+    // TcpServer owns an initialized libuv handle even when the transparent
+    // listener was never started (for example after an early TUN failure or
+    // when the lwIP stack is selected). Always close that handle explicitly.
+    tun_tcp_server_.stop();
     stop_udp_listener();
     close_all_udp_tunnels();
     close_all_tun_dns_flows();
@@ -913,19 +956,14 @@ void ClientApp::arm_internal_dns_timer() {
     if (stopping_) return;
 
     uint64_t earliest = 0;
-    for (const auto& item : udp_flows_) {
-        const UdpFlow& flow = item.second;
-        if (flow.kind == UdpFlowKind::InternalDns && flow.dns_deadline_ms != 0) {
-            if (earliest == 0 || flow.dns_deadline_ms < earliest) {
-                earliest = flow.dns_deadline_ms;
-            }
+    while (!udp_deadlines_.empty()) {
+        std::string flow_key;
+        UdpFlow* flow = nullptr;
+        if (resolve_udp_deadline(udp_deadlines_.top(), flow_key, flow)) {
+            earliest = udp_deadlines_.top().deadline_ms;
+            break;
         }
-        if (flow.kind == UdpFlowKind::Tun && flow.quic_sniffer &&
-            flow.quic_sniff_deadline_ms != 0) {
-            if (earliest == 0 || flow.quic_sniff_deadline_ms < earliest) {
-                earliest = flow.quic_sniff_deadline_ms;
-            }
-        }
+        udp_deadlines_.pop();
     }
 
     if (earliest == 0) {
@@ -952,6 +990,41 @@ void ClientApp::arm_internal_dns_timer() {
     }
 }
 
+void ClientApp::schedule_udp_deadline(UdpFlow& flow, UdpDeadlineKind kind,
+                                      uint64_t deadline_ms) {
+    ++flow.deadline_generation;
+    if (flow.deadline_generation == 0) ++flow.deadline_generation;
+    if (kind == UdpDeadlineKind::InternalDns) flow.dns_deadline_ms = deadline_ms;
+    else flow.quic_sniff_deadline_ms = deadline_ms;
+    udp_deadlines_.push(UdpDeadline{
+        deadline_ms, flow.session_id, flow.deadline_generation, kind});
+    arm_internal_dns_timer();
+}
+
+bool ClientApp::resolve_udp_deadline(const UdpDeadline& deadline,
+                                     std::string& flow_key, UdpFlow*& flow) {
+    auto key = udp_session_keys_.find(deadline.session_id);
+    if (key == udp_session_keys_.end()) return false;
+    auto item = udp_flows_.find(key->second);
+    if (item == udp_flows_.end() ||
+        item->second.session_id != deadline.session_id ||
+        item->second.deadline_generation != deadline.generation) {
+        return false;
+    }
+    const uint64_t current = deadline.kind == UdpDeadlineKind::InternalDns
+        ? item->second.dns_deadline_ms : item->second.quic_sniff_deadline_ms;
+    if (current == 0 || current != deadline.deadline_ms) return false;
+    if (deadline.kind == UdpDeadlineKind::InternalDns &&
+        item->second.kind != UdpFlowKind::InternalDns) return false;
+    if (deadline.kind == UdpDeadlineKind::QuicSniff &&
+        (item->second.kind != UdpFlowKind::Tun || !item->second.quic_sniffer)) {
+        return false;
+    }
+    flow_key = key->second;
+    flow = &item->second;
+    return true;
+}
+
 void ClientApp::stop_internal_dns_timer() {
     if (!internal_dns_timer_initialized_) return;
     internal_dns_timer_initialized_ = false;
@@ -959,6 +1032,7 @@ void ClientApp::stop_internal_dns_timer() {
     if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&internal_dns_timer_))) {
         uv_close(reinterpret_cast<uv_handle_t*>(&internal_dns_timer_), nullptr);
     }
+    while (!udp_deadlines_.empty()) udp_deadlines_.pop();
 }
 
 void ClientApp::on_internal_dns_timer(uv_timer_t* timer) {
@@ -966,24 +1040,18 @@ void ClientApp::on_internal_dns_timer(uv_timer_t* timer) {
     if (!app || app->stopping_) return;
 
     const uint64_t now = uv_now(app->loop_);
-    std::vector<std::string> expired_dns;
-    std::vector<std::string> expired_quic;
-    for (const auto& item : app->udp_flows_) {
-        const UdpFlow& flow = item.second;
-        if (flow.kind == UdpFlowKind::InternalDns && flow.dns_deadline_ms != 0 &&
-            now >= flow.dns_deadline_ms) {
-            expired_dns.push_back(item.first);
+    while (!app->udp_deadlines_.empty() &&
+           app->udp_deadlines_.top().deadline_ms <= now) {
+        const UdpDeadline deadline = app->udp_deadlines_.top();
+        app->udp_deadlines_.pop();
+        std::string flow_key;
+        UdpFlow* flow = nullptr;
+        if (!app->resolve_udp_deadline(deadline, flow_key, flow)) continue;
+        if (deadline.kind == UdpDeadlineKind::InternalDns) {
+            app->retry_internal_dns(flow_key, "timeout");
+        } else {
+            app->fallback_tun_quic_to_ip(flow_key);
         }
-        if (flow.kind == UdpFlowKind::Tun && flow.quic_sniffer &&
-            flow.quic_sniff_deadline_ms != 0 && now >= flow.quic_sniff_deadline_ms) {
-            expired_quic.push_back(item.first);
-        }
-    }
-    for (const auto& flow_key : expired_dns) {
-        app->retry_internal_dns(flow_key, "timeout");
-    }
-    for (const auto& flow_key : expired_quic) {
-        app->fallback_tun_quic_to_ip(flow_key);
     }
     app->arm_internal_dns_timer();
 }
@@ -1010,9 +1078,9 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
         tunnel->owner_session_id == sid;
     if (notify_peer && flow.proxied && tunnel && tunnel->connected &&
         tunnel->tunnel_session && !tunnel->tunnel_session->is_closed()) {
-        Buffer encoded;
+        Buffer encoded(64);
         if (tunnel->codec.encode_disconnect(sid, encoded)) {
-            tunnel->tunnel_session->send(encoded);
+            tunnel->tunnel_session->send(std::move(encoded));
         }
     }
 
@@ -1020,6 +1088,7 @@ void ClientApp::remove_udp_flow(const std::string& flow_key, bool notify_peer) {
     release_tun_quic_sniffer(flow);
     clear_tun_quic_pending(flow);
     if (flow.kind == UdpFlowKind::Tun && flow.lwip_flow_id != 0) {
+        tun_udp_flow_sessions_.erase(flow.lwip_flow_id);
         lwip_udp_stack_.close_flow(flow.lwip_flow_id);
     }
     udp_session_keys_.erase(sid);
@@ -1064,8 +1133,13 @@ void ClientApp::cleanup_idle_udp_flows(uint64_t now_ms) {
         remove_udp_flow(flow_key, true);
     }
     for (auto it = quic_route_cache_.begin(); it != quic_route_cache_.end();) {
-        if (it->second.expires_at_ms <= now_ms) it = quic_route_cache_.erase(it);
-        else ++it;
+        if (it->second.expires_at_ms <= now_ms) {
+            if (!it->first.empty()) {
+                quic_route_cids_by_first_byte_[
+                    static_cast<uint8_t>(it->first[0])].erase(it->first);
+            }
+            it = quic_route_cache_.erase(it);
+        } else ++it;
     }
     if (!expired.empty()) {
         TX_DEBUG("Cleaned up %zu idle UDP flows", expired.size());
@@ -1242,27 +1316,57 @@ void ClientApp::send_direct_udp_packet(const std::string& flow_key, UdpFlow& flo
     }
 
     sockaddr_storage target_addr;
-    if (target_to_sockaddr(effective_target, target_addr)) {
+    bool have_target_address = false;
+    if (flow.direct_cached_address_valid &&
+        same_target(flow.direct_cached_target, effective_target)) {
+        target_addr = flow.direct_cached_address;
+        have_target_address = true;
+    } else if (target_to_sockaddr(effective_target, target_addr)) {
+        flow.direct_cached_target = effective_target;
+        flow.direct_cached_address = target_addr;
+        flow.direct_cached_address_valid = true;
+        have_target_address = true;
+    }
+    if (have_target_address) {
         if (!ensure_direct_udp_relay(flow_key, flow, target_addr.ss_family)) {
             return;
         }
 
-        auto* req = new uv_udp_send_t;
-        auto* data_copy = new char[len];
-        memcpy(data_copy, data, len);
-        auto* send_buf = new uv_buf_t;
-        *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(len));
-        req->data = send_buf;
+        uv_buf_t immediate = uv_buf_init(
+            reinterpret_cast<char*>(const_cast<uint8_t*>(data)),
+            static_cast<unsigned int>(len));
+        const int immediate_result = uv_udp_try_send(
+            &flow.direct_relay->handle, &immediate, 1,
+            reinterpret_cast<const sockaddr*>(&target_addr));
+        if (immediate_result == static_cast<int>(len)) {
+            record_traffic(RouteAction::Direct, true, len);
+            return;
+        }
+        if (immediate_result >= 0) {
+            TX_WARN("[Direct][UDP] partial datagram send to %s:%u",
+                    effective_target.host.c_str(), effective_target.port);
+            return;
+        }
+        if (immediate_result != UV_EAGAIN && immediate_result != UV_ENOSYS) {
+            TX_WARN("[Direct][UDP] send failed to %s:%u: %s",
+                    effective_target.host.c_str(), effective_target.port,
+                    uv_strerror(immediate_result));
+            return;
+        }
 
-        int r = uv_udp_send(req, &flow.direct_relay->handle, send_buf, 1,
+        UdpSendRequest* request = allocate_udp_send_request(data, len);
+        if (!request) {
+            TX_WARN("[Direct][UDP] send allocation failed for %zu bytes", len);
+            return;
+        }
+        int r = uv_udp_send(&request->request, &flow.direct_relay->handle,
+                            &request->buffer, 1,
                             reinterpret_cast<const sockaddr*>(&target_addr),
                             ClientApp::on_udp_send_done);
         if (r != 0) {
             TX_WARN("[Direct][UDP] send failed to %s:%u: %s",
                     effective_target.host.c_str(), effective_target.port, uv_strerror(r));
-            delete[] send_buf->base;
-            delete send_buf;
-            delete req;
+            free_udp_send_request(request);
             return;
         }
         record_traffic(RouteAction::Direct, true, len);
@@ -1384,22 +1488,17 @@ void ClientApp::send_udp_response_to_flow(const UdpFlow& flow, const TargetAddr&
         return;
     }
 
-    auto* req = new uv_udp_send_t;
-    auto* data_copy = new char[packet.readable()];
-    memcpy(data_copy, packet.data(), packet.readable());
-    auto* send_buf = new uv_buf_t;
-    *send_buf = uv_buf_init(data_copy, static_cast<unsigned int>(packet.readable()));
-    req->data = send_buf;
+    UdpSendRequest* request = allocate_udp_send_request(
+        packet.data(), packet.readable());
+    if (!request) return;
 
-    int r = uv_udp_send(req, &socks5_udp_, send_buf, 1,
+    int r = uv_udp_send(&request->request, &socks5_udp_, &request->buffer, 1,
                         reinterpret_cast<const sockaddr*>(&flow.client_addr),
                         ClientApp::on_udp_send_done);
     if (r != 0) {
         TX_WARN("[%s][UDP] failed to send response to SOCKS5 client: %s",
                 route == RouteAction::Direct ? "Direct" : "Proxy", uv_strerror(r));
-        delete[] send_buf->base;
-        delete send_buf;
-        delete req;
+        free_udp_send_request(request);
         return;
     }
     record_traffic(route, false, len);
@@ -1631,9 +1730,9 @@ void ClientApp::send_udp_packet(const UdpTunnelPtr& tunnel, SessionId sid,
                 tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
         return;
     }
-    Buffer encoded;
+    Buffer encoded(frame_size);
     if (!tunnel->codec.encode_udp_packet(sid, target, data, len, encoded)) return;
-    if (tunnel->tunnel_session->send(encoded)) {
+    if (tunnel->tunnel_session->send(std::move(encoded))) {
         TX_DEBUG("[UDP-TUNNEL-SEND] sid=%u target=%s:%u bytes=%zu outbound=%s",
                  sid, target.host.c_str(), target.port, len,
                  tunnel->outbound ? tunnel->outbound->tag.c_str() : "unknown");
@@ -1693,9 +1792,9 @@ void ClientApp::send_dns_query(const UdpTunnelPtr& tunnel, SessionId sid,
         TX_WARN("Dropping DNS query: tunnel write backlog limit reached");
         return;
     }
-    Buffer encoded;
+    Buffer encoded(frame_size);
     if (!tunnel->codec.encode_dns_query(sid, data, len, encoded)) return;
-    if (tunnel->tunnel_session->send(encoded)) {
+    if (tunnel->tunnel_session->send(std::move(encoded))) {
         // Do not start the resolver response deadline until the encrypted
         // query has actually been handed to an established tunnel.  A DNS
         // query can otherwise expire during tunnel handshake/retry and hide
@@ -1705,8 +1804,9 @@ void ClientApp::send_dns_query(const UdpTunnelPtr& tunnel, SessionId sid,
             auto current_flow = udp_flows_.find(current->second);
             if (current_flow != udp_flows_.end() &&
                 current_flow->second.kind == UdpFlowKind::InternalDns) {
-                current_flow->second.dns_deadline_ms =
-                    uv_now(loop_) + kInternalDnsResponseTimeoutMs;
+                schedule_udp_deadline(
+                    current_flow->second, UdpDeadlineKind::InternalDns,
+                    uv_now(loop_) + kInternalDnsResponseTimeoutMs);
             }
         }
         TX_DEBUG("[DNS-TUNNEL-SEND] sid=%u bytes=%zu outbound=%s", sid, len,
@@ -1850,14 +1950,14 @@ void ClientApp::start_internal_dns_attempt(const std::string& flow_key) {
     discard_pending_udp_packets(tunnel, flow.session_id);
     // This is only the connection/queueing budget.  send_dns_query() resets
     // the deadline once the encrypted query is actually sent.
-    flow.dns_deadline_ms = uv_now(loop_) + kInternalDnsConnectTimeoutMs;
+    schedule_udp_deadline(flow, UdpDeadlineKind::InternalDns,
+                          uv_now(loop_) + kInternalDnsConnectTimeoutMs);
     flow.last_activity_ms = uv_now(loop_);
     TX_DEBUG("DNS query via TX system resolver outbound=%s bytes=%zu",
              flow.outbound ? flow.outbound->tag.c_str() : "unknown",
              flow.dns_query.size());
     send_dns_query(tunnel, flow.session_id,
                    flow.dns_query.data(), flow.dns_query.size());
-    arm_internal_dns_timer();
 }
 
 void ClientApp::retry_internal_dns(const std::string& flow_key, const char* reason) {
@@ -1874,6 +1974,7 @@ void ClientApp::complete_internal_dns(const std::string& flow_key,
     if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) return;
     auto callback = std::move(it->second.dns_callback);
     it->second.dns_deadline_ms = 0;
+    ++it->second.deadline_generation;
     remove_udp_flow(flow_key, notify_peer);
     if (callback) callback(std::move(response));
 }
@@ -2266,10 +2367,8 @@ void ClientApp::on_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf
 }
 
 void ClientApp::on_udp_send_done(uv_udp_send_t* req, int status) {
-    auto* buf = static_cast<uv_buf_t*>(req->data);
-    delete[] buf->base;
-    delete buf;
-    delete req;
+    auto* request = static_cast<UdpSendRequest*>(req->data);
+    free_udp_send_request(request);
 }
 
 void ClientApp::on_direct_udp_read(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf,
@@ -2346,13 +2445,7 @@ bool ClientApp::start_tun_listener() {
                 on_lwip_tcp_accept(stream, source, target);
             },
             [this](const uint8_t* packet, size_t len) {
-                if (!tun_device_) return false;
-                std::string write_error;
-                const bool written = tun_device_->write_packet(packet, len, write_error);
-                if (!written && !write_error.empty()) {
-                    TX_WARN("TUN write failed: %s", write_error.c_str());
-                }
-                return written;
+                return write_tun_packet(packet, len);
             }, error)) {
         TX_ERROR("Failed to initialize HEV lwIP UDP stack: %s", error.c_str());
         tun_device_->close();
@@ -2458,6 +2551,8 @@ bool ClientApp::start_tun_listener() {
 void ClientApp::stop_tun_listener() {
     if (!tun_started_) return;
     tun_started_ = false;
+    tun_write_queue_.clear();
+    tun_poll_writable_ = false;
     stop_tun_tcp_redirect();
     lwip_udp_stack_.shutdown();
     if (tun_fd_ >= 0) {
@@ -2667,6 +2762,25 @@ bool ClientApp::append_proxy_input(ProxyConnPtr conn, Buffer& data,
 }
 
 bool ClientApp::append_lwip_tcp_data(ProxyConnPtr conn, Buffer& data) {
+    if (conn && !conn->closing && conn->connected && conn->target_dispatched &&
+        conn->proto_buf.empty()) {
+        const size_t bytes = data.readable();
+        if (conn->route == RouteAction::Direct && conn->direct_session) {
+            const bool sent = conn->bridge ? conn->bridge->forward_from_left(data)
+                                           : conn->direct_session->send(data);
+            if (!sent) {
+                if (conn->local_session && !conn->local_session->is_closed()) {
+                    conn->local_session->reset();
+                }
+                return false;
+            }
+            record_traffic(RouteAction::Direct, true, bytes);
+        } else {
+            tunnel_send(conn, data.data(), bytes);
+            data.clear();
+        }
+        return true;
+    }
     return append_proxy_input(conn, data, TcpFlowBridge::kHardLimit,
                               "lwIP TCP pre-connect");
 }
@@ -2831,23 +2945,32 @@ void ClientApp::on_tun_poll(uv_poll_t* handle, int status, int events) {
         TX_WARN("TUN poll error: %s", uv_strerror(status));
         return;
     }
-    if ((events & UV_READABLE) == 0) return;
-    app->drain_tun_packets();
+    if ((events & UV_WRITABLE) != 0) app->flush_tun_write_queue();
+    if ((events & UV_READABLE) != 0) app->drain_tun_packets();
 }
 
 void ClientApp::on_tun_timer(uv_timer_t* timer) {
     auto* app = static_cast<ClientApp*>(timer->data);
     if (!app || !app->tun_started_) return;
     app->lwip_udp_stack_.poll_timers();
-    app->drain_tun_packets();
+    app->flush_tun_write_queue();
+    const TunDrainResult drain_result = app->drain_tun_packets();
     if (app->tun_started_) {
+        uint64_t timeout = app->lwip_udp_stack_.next_timeout_ms();
+        if (!app->tun_write_queue_.empty() ||
+            drain_result == TunDrainResult::BudgetExhausted) {
+            timeout = std::min<uint64_t>(timeout, 1);
+        }
         uv_timer_start(timer, ClientApp::on_tun_timer,
-                       app->lwip_udp_stack_.next_timeout_ms(), 0);
+                       timeout, 0);
     }
 }
 
-void ClientApp::drain_tun_packets() {
-    if (!tun_device_) return;
+ClientApp::TunDrainResult ClientApp::drain_tun_packets() {
+    if (!tun_device_) return TunDrainResult::Empty;
+    const uint64_t started_at = uv_hrtime();
+    size_t packets = 0;
+    size_t bytes = 0;
     for (;;) {
         std::string error;
         std::ptrdiff_t nread = tun_device_->read_packet(tun_read_buf_.data(),
@@ -2862,14 +2985,141 @@ void ClientApp::drain_tun_packets() {
                 TX_INFO("[TUN] input packet=%zu bytes version=%u", static_cast<size_t>(nread),
                         version);
             }
-            handle_tun_packet(tun_read_buf_.data(), static_cast<size_t>(nread));
+            const size_t packet_size = static_cast<size_t>(nread);
+            handle_tun_packet(tun_read_buf_.data(), packet_size);
+            ++packets;
+            bytes += packet_size;
+            ++tun_perf_stats_.rx_packets;
+            tun_perf_stats_.rx_bytes += packet_size;
+            if (packets >= kTunDrainPacketBudget || bytes >= kTunDrainByteBudget ||
+                ((packets & 7u) == 0 &&
+                 uv_hrtime() - started_at >= kTunDrainTimeBudgetNs)) {
+                ++tun_perf_stats_.rx_budget_yields;
+                schedule_tun_retry();
+                return TunDrainResult::BudgetExhausted;
+            }
             continue;
         }
         if (nread < 0 && !error.empty()) {
             TX_WARN("TUN read failed: %s", error.c_str());
+            return TunDrainResult::Error;
         }
-        break;
+        return TunDrainResult::Empty;
     }
+}
+
+void ClientApp::schedule_tun_retry() {
+    if (!tun_timer_started_ || stopping_) return;
+    uv_timer_start(&tun_timer_, ClientApp::on_tun_timer, 1, 0);
+}
+
+void ClientApp::set_tun_poll_writable(bool enabled) {
+    if (tun_fd_ < 0 || tun_poll_writable_ == enabled || !tun_started_) return;
+    const int events = UV_READABLE | (enabled ? UV_WRITABLE : 0);
+    const int status = uv_poll_start(&tun_poll_, events, ClientApp::on_tun_poll);
+    if (status == 0) {
+        tun_poll_writable_ = enabled;
+        return;
+    }
+    TX_WARN("Failed to update TUN poll events: %s", uv_strerror(status));
+    schedule_tun_retry();
+}
+
+bool ClientApp::write_tun_packet(const uint8_t* data, size_t len) {
+    if (!tun_device_ || (!data && len != 0)) return false;
+    const auto queue_packet = [this, data, len]() {
+        if (!tun_write_queue_.push(data, len)) {
+            ++tun_perf_stats_.tx_dropped;
+            const uint64_t now = uv_now(loop_);
+            if (tun_last_write_warning_ms_ == 0 ||
+                now - tun_last_write_warning_ms_ >= 1000) {
+                tun_last_write_warning_ms_ = now;
+                TX_WARN("TUN output queue full: packets=%zu bytes=%zu dropped=%llu",
+                        tun_write_queue_.packet_count(), tun_write_queue_.byte_count(),
+                        static_cast<unsigned long long>(tun_perf_stats_.tx_dropped));
+            }
+            return false;
+        }
+        ++tun_perf_stats_.tx_queued;
+        tun_perf_stats_.tx_max_queued_bytes = std::max(
+            tun_perf_stats_.tx_max_queued_bytes, tun_write_queue_.byte_count());
+        set_tun_poll_writable(true);
+        if (tun_fd_ < 0) schedule_tun_retry();
+        return true;
+    };
+
+    if (!tun_write_queue_.empty()) return queue_packet();
+
+    std::string error;
+    const PlatformTunDevice::WriteResult result =
+        tun_device_->write_packet(data, len, error);
+    if (result == PlatformTunDevice::WriteResult::Written) {
+        ++tun_perf_stats_.tx_immediate;
+        return true;
+    }
+    if (result == PlatformTunDevice::WriteResult::WouldBlock) {
+        ++tun_perf_stats_.tx_would_block;
+        return queue_packet();
+    }
+
+    ++tun_perf_stats_.tx_errors;
+    const uint64_t now = uv_now(loop_);
+    if (tun_last_write_warning_ms_ == 0 || now - tun_last_write_warning_ms_ >= 1000) {
+        tun_last_write_warning_ms_ = now;
+        TX_WARN("TUN write failed: %s (errors=%llu)", error.c_str(),
+                static_cast<unsigned long long>(tun_perf_stats_.tx_errors));
+    }
+    return false;
+}
+
+void ClientApp::flush_tun_write_queue() {
+    if (!tun_device_ || tun_write_queue_.empty()) {
+        set_tun_poll_writable(false);
+        return;
+    }
+
+    const uint64_t started_at = uv_hrtime();
+    size_t packets = 0;
+    size_t bytes = 0;
+    while (!tun_write_queue_.empty()) {
+        const Buffer& packet = tun_write_queue_.front();
+        std::string error;
+        const PlatformTunDevice::WriteResult result =
+            tun_device_->write_packet(packet.data(), packet.readable(), error);
+        if (result == PlatformTunDevice::WriteResult::WouldBlock) {
+            ++tun_perf_stats_.tx_would_block;
+            set_tun_poll_writable(true);
+            if (tun_fd_ < 0) schedule_tun_retry();
+            return;
+        }
+
+        const size_t packet_size = packet.readable();
+        tun_write_queue_.pop();
+        ++packets;
+        bytes += packet_size;
+        if (result == PlatformTunDevice::WriteResult::Written) {
+            ++tun_perf_stats_.tx_immediate;
+        } else {
+            ++tun_perf_stats_.tx_errors;
+            const uint64_t now = uv_now(loop_);
+            if (tun_last_write_warning_ms_ == 0 ||
+                now - tun_last_write_warning_ms_ >= 1000) {
+                tun_last_write_warning_ms_ = now;
+                TX_WARN("Queued TUN write failed: %s (errors=%llu)", error.c_str(),
+                        static_cast<unsigned long long>(tun_perf_stats_.tx_errors));
+            }
+        }
+        if (packets >= kTunWritePacketBudget || bytes >= kTunWriteByteBudget ||
+            ((packets & 7u) == 0 &&
+             uv_hrtime() - started_at >= kTunWriteTimeBudgetNs)) {
+            if (!tun_write_queue_.empty()) {
+                set_tun_poll_writable(true);
+                schedule_tun_retry();
+            }
+            return;
+        }
+    }
+    set_tun_poll_writable(false);
 }
 
 void ClientApp::handle_tun_packet(const uint8_t* data, size_t len) {
@@ -2912,18 +3162,29 @@ bool ClientApp::inherit_tun_quic_route(UdpFlow& flow, const uint8_t* data, size_
         // first byte.  Its length is implicit, so compare it to bounded CIDs
         // learned from the server's long-header responses.
         if ((data[0] & 0x40) == 0) return false;
+        if (len < 2) return false;
         std::vector<std::string> matches;
-        for (auto it = quic_route_cache_.begin(); it != quic_route_cache_.end();) {
+        auto& candidates = quic_route_cids_by_first_byte_[data[1]];
+        // Tests and embedders may seed the private cache directly. Rebuild
+        // this one bucket lazily if it predates the auxiliary index.
+        if (candidates.empty() && !quic_route_cache_.empty()) {
+            for (const auto& item : quic_route_cache_) {
+                if (!item.first.empty() &&
+                    static_cast<uint8_t>(item.first[0]) == data[1]) {
+                    candidates.insert(item.first);
+                }
+            }
+        }
+        for (const auto& known : candidates) {
+            auto it = quic_route_cache_.find(known);
+            if (it == quic_route_cache_.end()) continue;
             if (it->second.expires_at_ms <= now || !it->second.outbound) {
-                it = quic_route_cache_.erase(it);
                 continue;
             }
-            const std::string& known = it->first;
             if (!known.empty() && known.size() <= len - 1 &&
                 std::memcmp(data + 1, known.data(), known.size()) == 0) {
                 matches.push_back(known);
             }
-            ++it;
         }
         // Short headers carry no CID length.  Choosing one of several prefix
         // matches would make routing depend on unordered_map iteration order,
@@ -2935,7 +3196,13 @@ bool ClientApp::inherit_tun_quic_route(UdpFlow& flow, const uint8_t* data, size_
     const auto it = quic_route_cache_.find(cid);
     if (it == quic_route_cache_.end() || it->second.expires_at_ms <= now ||
         !it->second.outbound) {
-        if (it != quic_route_cache_.end()) quic_route_cache_.erase(it);
+        if (it != quic_route_cache_.end()) {
+            if (!it->first.empty()) {
+                quic_route_cids_by_first_byte_[
+                    static_cast<uint8_t>(it->first[0])].erase(it->first);
+            }
+            quic_route_cache_.erase(it);
+        }
         return false;
     }
 
@@ -2967,7 +3234,13 @@ void ClientApp::remember_tun_quic_route(const UdpFlow& flow, const std::string& 
                 victim = it;
             }
         }
-        if (victim != quic_route_cache_.end()) quic_route_cache_.erase(victim);
+        if (victim != quic_route_cache_.end()) {
+            if (!victim->first.empty()) {
+                quic_route_cids_by_first_byte_[
+                    static_cast<uint8_t>(victim->first[0])].erase(victim->first);
+            }
+            quic_route_cache_.erase(victim);
+        }
     }
     QuicRouteCacheEntry entry;
     entry.route_target = flow.route_target;
@@ -2975,6 +3248,7 @@ void ClientApp::remember_tun_quic_route(const UdpFlow& flow, const std::string& 
     entry.last_used_at_ms = uv_now(loop_);
     entry.expires_at_ms = entry.last_used_at_ms + config_.udp_idle_timeout_ms;
     quic_route_cache_[cid] = std::move(entry);
+    quic_route_cids_by_first_byte_[static_cast<uint8_t>(cid[0])].insert(cid);
 }
 
 void ClientApp::remember_tun_quic_response_route(const UdpFlow& flow,
@@ -3022,6 +3296,7 @@ void ClientApp::release_tun_quic_sniffer(UdpFlow& flow) {
         if (quic_sniff_active_flows_ > 0) --quic_sniff_active_flows_;
     }
     flow.quic_sniff_deadline_ms = 0;
+    ++flow.deadline_generation;
 }
 
 void ClientApp::clear_tun_quic_pending(UdpFlow& flow) {
@@ -3089,7 +3364,8 @@ void ClientApp::process_tun_quic_packet(const std::string& flow_key, UdpFlow& fl
         }
         flow.quic_sniffer.reset(new QuicSniSniffer());
         ++quic_sniff_active_flows_;
-        flow.quic_sniff_deadline_ms = uv_now(loop_) + kQuicSniffTimeoutMs;
+        schedule_udp_deadline(flow, UdpDeadlineKind::QuicSniff,
+                              uv_now(loop_) + kQuicSniffTimeoutMs);
     }
 
     flow.quic_pending_packets.emplace_back(data, data + len);
@@ -3115,7 +3391,6 @@ void ClientApp::process_tun_quic_packet(const std::string& flow_key, UdpFlow& fl
         return;
     }
     if (result == QuicSniResult::NeedMore) {
-        arm_internal_dns_timer();
         return;
     }
 
@@ -3128,11 +3403,6 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
                                          const IpAddr& source,
                                          const IpAddr& destination,
                                          const uint8_t* data, size_t len) {
-    TargetAddr target;
-    target.type = destination.family == IpAddr::IPv4 ? AddrType::IPv4 : AddrType::IPv6;
-    target.host = ipaddr_host_string(destination);
-    target.port = destination.port;
-
     if (destination.port == 53) {
         static std::atomic<unsigned> dns_diagnostics{0};
         std::vector<uint8_t> query(data, data + len);
@@ -3224,6 +3494,48 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         return;
     }
 
+    // Existing TUN flows have already completed Fake-IP recovery, QUIC
+    // sniffing, and routing. Resolve them by the stable lwIP flow id before
+    // allocating strings or touching the Fake-IP cache.
+    auto indexed = tun_udp_flow_sessions_.find(lwip_flow_id);
+    if (indexed != tun_udp_flow_sessions_.end()) {
+        auto key = udp_session_keys_.find(indexed->second);
+        if (key != udp_session_keys_.end()) {
+            auto existing = udp_flows_.find(key->second);
+            if (existing != udp_flows_.end() &&
+                existing->second.kind == UdpFlowKind::Tun &&
+                existing->second.lwip_flow_id == lwip_flow_id) {
+                UdpFlow& flow = existing->second;
+                flow.last_activity_ms = uv_now(loop_);
+                if (flow.route_ready) {
+                    ++tun_perf_stats_.udp_flow_fast_hits;
+                    dispatch_tun_udp_packet(key->second, flow, data, len);
+                    return;
+                }
+                if (!flow.fake_ip_target && flow.send_target.port == 443 &&
+                    config_.udp_quic_sniff) {
+                    ++tun_perf_stats_.udp_flow_fast_hits;
+                    if (inherit_tun_quic_route(flow, data, len)) {
+                        dispatch_tun_udp_packet(key->second, flow, data, len);
+                    } else {
+                        process_tun_quic_packet(key->second, flow, data, len);
+                    }
+                    return;
+                }
+            } else {
+                tun_udp_flow_sessions_.erase(indexed);
+            }
+        } else {
+            tun_udp_flow_sessions_.erase(indexed);
+        }
+    }
+    ++tun_perf_stats_.udp_flow_fast_misses;
+
+    TargetAddr target;
+    target.type = destination.family == IpAddr::IPv4 ? AddrType::IPv4 : AddrType::IPv6;
+    target.host = ipaddr_host_string(destination);
+    target.port = destination.port;
+
     const TargetAddr numeric_target = target;
     std::string domain;
     const bool fake_ip = fake_ip_dns_.reverse_lookup(target.host, domain);
@@ -3264,6 +3576,7 @@ void ClientApp::handle_lwip_udp_datagram(uint64_t lwip_flow_id,
         const SessionId session_id = flow.session_id;
         it = udp_flows_.emplace(flow_key, std::move(flow)).first;
         udp_session_keys_[session_id] = flow_key;
+        tun_udp_flow_sessions_[lwip_flow_id] = session_id;
     }
     UdpFlow& flow = it->second;
     flow.last_activity_ms = uv_now(loop_);
@@ -4117,10 +4430,10 @@ bool ClientApp::tunnel_send_connect(ProxyConnPtr conn) {
         return false;
     }
 
-    Buffer encoded;
+    Buffer encoded(512);
     if (!conn->tunnel_codec.encode(TunnelCmd::Connect, conn->session_id,
                                    conn->target, nullptr, 0, encoded) ||
-        !conn->tunnel_session->send(encoded)) {
+        !conn->tunnel_session->send(std::move(encoded))) {
         TX_ERROR("Failed to queue CONNECT frame for session %u", conn->session_id);
         fail_tunnel_connection(conn);
         return false;
@@ -4150,7 +4463,7 @@ void ClientApp::tunnel_send(ProxyConnPtr conn, const uint8_t* data, size_t len) 
         Buffer encoded(frame_size);
         if (!conn->tunnel_codec.encode_data(conn->session_id, data + offset,
                                              chunk, encoded) ||
-            !conn->tunnel_session->send(encoded)) {
+            !conn->tunnel_session->send(std::move(encoded))) {
             fail_proxy_connection(conn);
             return;
         }
@@ -4171,9 +4484,9 @@ void ClientApp::tunnel_send_disconnect(ProxyConnPtr conn) {
         return;
     }
 
-    Buffer encoded;
+    Buffer encoded(64);
     if (conn->tunnel_codec.encode_disconnect(conn->session_id, encoded)) {
-        conn->tunnel_session->send(encoded);
+        conn->tunnel_session->send(std::move(encoded));
     }
 }
 
@@ -4181,9 +4494,9 @@ void ClientApp::tunnel_send_half_close(ProxyConnPtr conn) {
     if (!conn || conn->local_half_close_sent || !conn->connect_result_sent ||
         !conn->tunnel_connected || !conn->tunnel_session ||
         conn->tunnel_session->is_closed()) return;
-    Buffer encoded;
+    Buffer encoded(64);
     if (conn->tunnel_codec.encode_half_close(conn->session_id, encoded)) {
-        if (conn->tunnel_session->send(encoded)) {
+        if (conn->tunnel_session->send(std::move(encoded))) {
             conn->local_half_close_sent = true;
         }
     }

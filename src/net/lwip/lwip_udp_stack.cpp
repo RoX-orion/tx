@@ -59,6 +59,8 @@ namespace {
 
 constexpr size_t kMaxTcpPendingWrite = 16 * 1024 * 1024;
 constexpr size_t kMaxTcpPendingRead = 4 * 1024 * 1024;
+constexpr size_t kTcpWriteHighWatermark = 4 * 1024 * 1024;
+constexpr size_t kTcpWriteLowWatermark = 1024 * 1024;
 std::once_flag g_lwip_init_once;
 // HEV lwIP keeps global protocol state and is not safe to drive from two
 // independent ClientApp loops. Fail initialization explicitly instead of
@@ -148,6 +150,11 @@ void acknowledge(tcp_pcb* pcb, size_t amount) {
 struct LwipTcpStream::Impl {
     enum class Termination { Close, Abort, PcbAlreadyFreed };
 
+    struct PendingWrite {
+        std::vector<uint8_t> bytes;
+        size_t offset = 0;
+    };
+
     tcp_pcb* pcb = nullptr;
     tcp_pcb* identity = nullptr;
     std::weak_ptr<LwipTcpStream> owner;
@@ -160,9 +167,10 @@ struct LwipTcpStream::Impl {
     bool fin_pending = false;
     bool in_lwip_callback = false;
     size_t unacknowledged_receive = 0;
-    std::deque<std::vector<uint8_t>> read_queue;
+    std::deque<Buffer> read_queue;
     size_t queued_bytes = 0;
-    std::deque<std::vector<uint8_t>> write_queue;
+    std::deque<PendingWrite> write_queue;
+    bool write_backpressured = false;
     DataCallback data_callback;
     EventCallback writable_callback;
     EventCallback eof_callback;
@@ -215,29 +223,33 @@ struct LwipTcpStream::Impl {
 
     bool flush() {
         if (!pcb || closed) return false;
+        bool wrote_data = false;
         while (!write_queue.empty()) {
             auto& front = write_queue.front();
             const size_t available = tcp_sndbuf(pcb);
             if (available == 0) break;
+            const size_t remaining = front.bytes.size() - front.offset;
             const u16_t amount = static_cast<u16_t>(
-                std::min<size_t>(std::min<size_t>(front.size(), available), 65535));
+                std::min<size_t>(std::min<size_t>(remaining, available), 65535));
             if (amount == 0) break;
-            err_t result = tcp_write(pcb, front.data(), amount, TCP_WRITE_FLAG_COPY);
+            err_t result = tcp_write(pcb, front.bytes.data() + front.offset,
+                                     amount, TCP_WRITE_FLAG_COPY);
             if (result == ERR_MEM) break;
             if (result != ERR_OK) return false;
+            wrote_data = true;
             queued_bytes -= amount;
-            if (amount == front.size()) {
+            front.offset += amount;
+            if (front.offset == front.bytes.size()) {
                 write_queue.pop_front();
-            } else {
-                front.erase(front.begin(), front.begin() + amount);
             }
         }
-        tcp_output(pcb);
+        if (wrote_data) tcp_output(pcb);
         if (write_queue.empty() && fin_pending) {
             err_t result = tcp_shutdown(pcb, 0, 1);
             if (result == ERR_OK) {
                 fin_pending = false;
                 write_shutdown = true;
+                tcp_output(pcb);
             } else if (result != ERR_MEM) {
                 return false;
             }
@@ -271,31 +283,31 @@ struct LwipTcpStream::Impl {
             self->in_lwip_callback = false;
             return ERR_OK;
         }
-        std::vector<uint8_t> bytes(packet->tot_len);
-        const bool copied = pbuf_copy_partial(packet, bytes.data(), packet->tot_len, 0) ==
+        Buffer data(packet->tot_len);
+        const bool copied = pbuf_copy_partial(packet, data.writable(), packet->tot_len, 0) ==
                             packet->tot_len;
+        if (copied) data.commit(packet->tot_len);
         pbuf_free(packet);
         if (!copied) return ERR_OK;
         if (self->paused) {
-            if (bytes.size() > kMaxTcpPendingRead -
+            if (data.readable() > kMaxTcpPendingRead -
                                    std::min(self->unacknowledged_receive,
                                             kMaxTcpPendingRead)) {
                 self->in_lwip_callback = true;
                 self->terminate(Termination::Abort, ERR_BUF);
                 return ERR_ABRT;
             }
-            self->unacknowledged_receive += bytes.size();
-            self->read_queue.emplace_back(std::move(bytes));
+            self->unacknowledged_receive += data.readable();
+            self->read_queue.emplace_back(std::move(data));
             return ERR_OK;
         }
-        Buffer data(bytes.size());
-        data.append(bytes.data(), bytes.size());
+        const size_t delivered = data.readable();
         auto callback = self->data_callback;
         self->in_lwip_callback = true;
         if (callback) callback(data);
         if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
         self->in_lwip_callback = false;
-        acknowledge(pcb, bytes.size());
+        acknowledge(pcb, delivered);
         return ERR_OK;
     }
 
@@ -308,11 +320,15 @@ struct LwipTcpStream::Impl {
             self->terminate(Termination::Abort, ERR_BUF);
             return ERR_ABRT;
         }
-        auto callback = self->writable_callback;
-        self->in_lwip_callback = true;
-        if (callback) callback();
-        if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
-        self->in_lwip_callback = false;
+        if (self->write_backpressured &&
+            self->queued_bytes <= kTcpWriteLowWatermark) {
+            self->write_backpressured = false;
+            auto callback = self->writable_callback;
+            self->in_lwip_callback = true;
+            if (callback) callback();
+            if (self->closed) return self->aborted ? ERR_ABRT : ERR_OK;
+            self->in_lwip_callback = false;
+        }
         return ERR_OK;
     }
 
@@ -367,6 +383,10 @@ struct LwipUdpStack::Impl {
     static err_t output_packet(netif* interface, pbuf* packet) {
         auto* self = static_cast<Impl*>(interface->state);
         if (!self || !self->output_callback || !packet) return ERR_IF;
+        if (packet->len == packet->tot_len) {
+            return self->output_callback(static_cast<const uint8_t*>(packet->payload),
+                                         packet->tot_len) ? ERR_OK : ERR_IF;
+        }
         std::vector<uint8_t> bytes(packet->tot_len);
         if (pbuf_copy_partial(packet, bytes.data(), packet->tot_len, 0) != packet->tot_len)
             return ERR_BUF;
@@ -388,13 +408,16 @@ struct LwipUdpStack::Impl {
         if (!self || !pcb || !packet) { if (packet) pbuf_free(packet); return; }
         auto flow = self->udp_pcb_flows.find(pcb);
         if (flow == self->udp_pcb_flows.end()) { pbuf_free(packet); return; }
-        std::vector<uint8_t> payload(packet->tot_len);
-        if (pbuf_copy_partial(packet, payload.data(), packet->tot_len, 0) == packet->tot_len &&
+        Buffer payload(packet->tot_len);
+        const bool copied = pbuf_copy_partial(packet, payload.writable(),
+                                              packet->tot_len, 0) == packet->tot_len;
+        if (copied) payload.commit(packet->tot_len);
+        if (copied &&
             self->datagram_callback) {
             self->datagram_callback(flow->second,
                 from_lwip_ip(pcb->remote_ip, pcb->remote_port),
                 from_lwip_ip(pcb->local_ip, pcb->local_port),
-                payload.data(), payload.size());
+                payload.data(), payload.readable());
         }
         pbuf_free(packet);
     }
@@ -623,8 +646,13 @@ bool LwipTcpStream::write(const uint8_t* data, size_t len) {
     if (len > kMaxTcpPendingWrite ||
         impl_->queued_bytes > kMaxTcpPendingWrite - len) { reset(); return false; }
     if (len) {
-        impl_->write_queue.emplace_back(data, data + len);
+        Impl::PendingWrite pending;
+        pending.bytes.assign(data, data + len);
+        impl_->write_queue.emplace_back(std::move(pending));
         impl_->queued_bytes += len;
+        if (impl_->queued_bytes >= kTcpWriteHighWatermark) {
+            impl_->write_backpressured = true;
+        }
     }
     if (!impl_->flush()) { reset(); return false; }
     return true;
@@ -639,15 +667,14 @@ void LwipTcpStream::resume_read() {
     if (!impl_ || impl_->closed) return;
     impl_->paused = false;
     while (impl_->pcb && !impl_->closed && !impl_->paused && !impl_->read_queue.empty()) {
-        std::vector<uint8_t> bytes = std::move(impl_->read_queue.front());
+        Buffer data = std::move(impl_->read_queue.front());
         impl_->read_queue.pop_front();
-        Buffer data(bytes.size());
-        data.append(bytes.data(), bytes.size());
+        const size_t delivered = data.readable();
         auto callback = impl_->data_callback;
         if (callback) callback(data);
         if (impl_->closed) return;
-        acknowledge(impl_->pcb, bytes.size());
-        impl_->unacknowledged_receive -= bytes.size();
+        acknowledge(impl_->pcb, delivered);
+        impl_->unacknowledged_receive -= delivered;
     }
     if (impl_->pcb && !impl_->closed && !impl_->paused &&
         impl_->read_queue.empty() && impl_->pending_eof) {

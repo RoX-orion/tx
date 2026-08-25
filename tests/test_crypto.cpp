@@ -189,6 +189,42 @@ static void test_aead_chacha20_poly1305() {
     printf("OK\n");
 }
 
+static void test_aead_context_reuse_after_authentication_failure() {
+    printf("  test_aead_context_reuse_after_authentication_failure... ");
+    uint8_t key[tx::AeadCipher::kKeyLen] = {};
+    uint8_t nonce[tx::AeadCipher::kNonceLen] = {};
+    const uint8_t aad[] = {1, 2, 3};
+    const uint8_t plaintext[] = {4, 5, 6, 7};
+
+    for (auto kind : {tx::AeadCipherKind::Aes256Gcm,
+                      tx::AeadCipherKind::ChaCha20Poly1305}) {
+        tx::AeadCipher cipher(kind, key, sizeof(key));
+        uint8_t encrypted[64] = {};
+        const int encrypted_len = cipher.encrypt(
+            nonce, aad, sizeof(aad), plaintext, sizeof(plaintext),
+            encrypted, sizeof(encrypted));
+        assert(encrypted_len == static_cast<int>(sizeof(plaintext) +
+                                                 tx::AeadCipher::kTagLen));
+
+        uint8_t bad_tag[tx::AeadCipher::kTagLen];
+        std::memcpy(bad_tag, encrypted + sizeof(plaintext), sizeof(bad_tag));
+        bad_tag[0] ^= 1;
+        uint8_t decrypted[64];
+        std::memset(decrypted, 0xa5, sizeof(decrypted));
+        assert(cipher.decrypt(nonce, aad, sizeof(aad), encrypted,
+                              sizeof(plaintext), bad_tag,
+                              decrypted, sizeof(decrypted)) == -1);
+        for (size_t i = 0; i < sizeof(plaintext); ++i) assert(decrypted[i] == 0);
+
+        assert(cipher.decrypt(nonce, aad, sizeof(aad), encrypted,
+                              sizeof(plaintext), encrypted + sizeof(plaintext),
+                              decrypted, sizeof(decrypted)) ==
+               static_cast<int>(sizeof(plaintext)));
+        assert(std::memcmp(decrypted, plaintext, sizeof(plaintext)) == 0);
+    }
+    printf("OK\n");
+}
+
 int main() {
     printf("=== Crypto Tests ===\n");
     test_key_derive();
@@ -198,6 +234,7 @@ int main() {
     test_empty_plaintext();
     test_secret_parse();
     test_aead_chacha20_poly1305();
+    test_aead_context_reuse_after_authentication_failure();
     test_crypto_input_bounds();
     printf("All crypto tests passed!\n");
     return 0;

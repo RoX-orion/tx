@@ -46,6 +46,7 @@ tx_add_test(http_proxy)
 tx_add_test(router)
 tx_add_test(tunnel)
 tx_add_test(tun_packet)
+tx_add_test(tun_write_queue)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
     tx_add_test(platform_tun)
     target_sources(test_platform_tun PRIVATE

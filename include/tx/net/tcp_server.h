@@ -50,6 +50,7 @@ public:
     // Send data
     bool send(const uint8_t* data, size_t len);
     bool send(Buffer& buf);
+    bool send(Buffer&& buf);
     bool write(const uint8_t* data, size_t len) override { return send(data, len); }
     bool write(Buffer& data) override { return send(data); }
 
@@ -130,6 +131,7 @@ private:
         uv_write_t req;
         uv_buf_t   buf;
         char*      data;
+        std::unique_ptr<Buffer> owned_buffer;
         size_t     len;
         SessionPtr session;
     };

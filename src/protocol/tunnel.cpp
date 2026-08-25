@@ -27,6 +27,21 @@ constexpr size_t TunnelCodec::kHandshakeSize;
 
 namespace {
 
+class SensitiveBufferGuard {
+public:
+    SensitiveBufferGuard(uint8_t* data, size_t maximum)
+        : data_(data), length_(maximum) {}
+    ~SensitiveBufferGuard() {
+        if (data_ && length_ != 0) OPENSSL_cleanse(data_, length_);
+    }
+
+    void set_length(size_t length) { length_ = length; }
+
+private:
+    uint8_t* data_;
+    size_t length_;
+};
+
 // v3 uses a distinct handshake marker so an older peer is rejected before keys
 // are established rather than after the first encrypted frame.
 static constexpr uint8_t kHandshakeMagic[] = {'T', 'X', 'V', '3'};
@@ -354,6 +369,7 @@ bool TunnelCodec::encode(TunnelCmd cmd, SessionId session_id,
     }
 
     uint8_t plaintext[kMaxPlaintextSize];
+    SensitiveBufferGuard plaintext_guard(plaintext, sizeof(plaintext));
     size_t msg_len = build_message(cmd, session_id, &target,
                                     payload, payload_len,
                                     plaintext, sizeof(plaintext));
@@ -361,6 +377,7 @@ bool TunnelCodec::encode(TunnelCmd cmd, SessionId session_id,
         TX_ERROR("Tunnel message build failed");
         return false;
     }
+    plaintext_guard.set_length(msg_len);
 
     const uint32_t frame_len = static_cast<uint32_t>(msg_len + AeadCipher::kOverhead);
     uint8_t nonce[AeadCipher::kNonceLen];
@@ -371,20 +388,19 @@ bool TunnelCodec::encode(TunnelCmd cmd, SessionId session_id,
     }
     build_aad(send_direction_, send_seq_, frame_len, aad);
 
-    uint8_t encrypted[kMaxEncryptedFrameSize];
+    out.reserve_writable(expected_frame_size);
+    uint8_t* frame = out.writable();
     int enc_len = send_cipher_->encrypt(nonce, aad, sizeof(aad),
                                         plaintext, msg_len,
-                                        encrypted, sizeof(encrypted));
-    OPENSSL_cleanse(plaintext, sizeof(plaintext));
+                                        frame + kLenPrefixSize,
+                                        out.writable_bytes() - kLenPrefixSize);
     if (enc_len < 0) {
         TX_ERROR("Tunnel encrypt failed");
         return false;
     }
 
-    uint8_t len_buf[kLenPrefixSize];
-    store_be32(len_buf, static_cast<uint32_t>(enc_len));
-    out.append(len_buf, kLenPrefixSize);
-    out.append(encrypted, static_cast<size_t>(enc_len));
+    store_be32(frame, static_cast<uint32_t>(enc_len));
+    out.commit(kLenPrefixSize + static_cast<size_t>(enc_len));
     ++send_seq_;
     return true;
 }
@@ -506,6 +522,7 @@ bool TunnelCodec::decode(Buffer& in,
     build_aad(recv_direction_, recv_seq_, frame_len, aad);
 
     uint8_t plaintext[kMaxPlaintextSize];
+    SensitiveBufferGuard plaintext_guard(plaintext, ciphertext_len);
     int pt_len = recv_cipher_->decrypt(nonce, aad, sizeof(aad),
                                        enc_data, ciphertext_len, tag,
                                        plaintext, sizeof(plaintext));
@@ -515,6 +532,7 @@ bool TunnelCodec::decode(Buffer& in,
         in.clear();
         return false;
     }
+    plaintext_guard.set_length(static_cast<size_t>(pt_len));
     ++recv_seq_;
 
     size_t pos = 0;
@@ -621,7 +639,6 @@ bool TunnelCodec::decode(Buffer& in,
         payload.append(plaintext + pos, static_cast<size_t>(pt_len) - pos);
     }
 
-    OPENSSL_cleanse(plaintext, sizeof(plaintext));
     in.consume(kLenPrefixSize + frame_len);
     return true;
 }

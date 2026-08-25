@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
 
 namespace tx {
 
@@ -1147,7 +1148,7 @@ bool ServerApp::send_tunnel_frame(TunnelClientPtr client, Buffer& encoded,
         client->session->close();
         return false;
     }
-    if (!client->session->send(encoded)) {
+    if (!client->session->send(std::move(encoded))) {
         TX_WARN("Failed to send %s of %zu bytes to tunnel", frame_name ? frame_name : "frame",
                 len);
         if (!client->session->is_closed()) {

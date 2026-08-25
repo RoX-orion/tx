@@ -131,20 +131,23 @@ public:
         }
     }
 
-    bool write_packet(const uint8_t* data, size_t len, std::string& error) override {
-        if (fd_ < 0) return false;
-        size_t written = 0;
-        while (written < len) {
-            ssize_t n = ::write(fd_, data + written, len - written);
-            if (n > 0) {
-                written += static_cast<size_t>(n);
-                continue;
-            }
-            if (n < 0 && errno == EINTR) continue;
-            error = n == 0 ? "zero-length write" : std::strerror(errno);
-            return false;
+    WriteResult write_packet(const uint8_t* data, size_t len,
+                             std::string& error) override {
+        if (fd_ < 0) {
+            error = "TUN device is closed";
+            return WriteResult::Error;
         }
-        return true;
+        for (;;) {
+            const ssize_t n = ::write(fd_, data, len);
+            if (n == static_cast<ssize_t>(len)) return WriteResult::Written;
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return WriteResult::WouldBlock;
+            }
+            if (n >= 0) error = "partial TUN packet write";
+            else error = std::strerror(errno);
+            return WriteResult::Error;
+        }
     }
 
 private:
@@ -237,6 +240,10 @@ private:
             dup2(output_pipe[1], STDOUT_FILENO);
             dup2(output_pipe[1], STDERR_FILENO);
             ::close(output_pipe[1]);
+            // Keep iproute2 diagnostics stable because the policy-table
+            // existence check below has to distinguish an absent table from
+            // a real inspection failure.
+            setenv("LC_ALL", "C", 1);
             execvp("ip", argv.data());
             _exit(127);
         }
@@ -273,28 +280,85 @@ private:
             if (route.find(':') != std::string::npos) need_ipv6 = true;
             else need_ipv4 = true;
         }
-        const auto check_empty = [&](const std::vector<std::string>& command,
-                                     const std::string& what) {
-            const CommandResult result = run_ip(command);
-            if (result.exit_code != 0 || !result.output.empty()) {
-                error = "Linux TUN policy conflict: " + what;
+        const auto reclaim_rule = [&](const char* family,
+                                      const std::string& rule_priority,
+                                      const std::vector<std::string>& exact_delete,
+                                      const std::string& what) {
+            const std::vector<std::string> show = {
+                family, "rule", "show", "priority", rule_priority};
+            CommandResult result = run_ip(show);
+            if (result.exit_code != 0) {
+                error = "failed to inspect Linux TUN policy rule: " + what;
                 return false;
             }
-            return true;
+            if (result.output.empty()) return true;
+
+            // A crashed or older client can leave policy rules behind after
+            // its non-persistent TUN interface has disappeared. Delete only
+            // the rule that exactly matches this configuration, then inspect
+            // the priority again so unrelated rules remain a hard conflict.
+            if (run_ip(exact_delete).exit_code == 0) {
+                result = run_ip(show);
+                if (result.exit_code != 0) {
+                    error = "failed to inspect Linux TUN policy rule: " + what;
+                    return false;
+                }
+                if (result.output.empty()) {
+                    TX_WARN("Removed stale Linux TUN policy rule: %s", what.c_str());
+                    return true;
+                }
+            }
+
+            error = "Linux TUN policy conflict: " + what;
+            return false;
         };
         for (const char* family : {"-4", "-6"}) {
             if ((family[1] == '4' && !need_ipv4) ||
                 (family[1] == '6' && !need_ipv6)) continue;
-            if (!check_empty({family, "rule", "show", "priority", priority},
-                             std::string(family) + " priority " + priority) ||
-                !check_empty({family, "rule", "show", "priority", catch_priority},
-                             std::string(family) + " priority " + catch_priority)) return false;
+            if (!reclaim_rule(
+                    family, priority,
+                    {family, "rule", "del", "priority", priority, "fwmark", mark,
+                     "lookup", "main"},
+                    std::string(family) + " priority " + priority) ||
+                !reclaim_rule(
+                    family, catch_priority,
+                    {family, "rule", "del", "priority", catch_priority,
+                     "lookup", table},
+                    std::string(family) + " priority " + catch_priority)) return false;
         }
         for (const auto& route : routes) {
             const bool ipv6 = route.find(':') != std::string::npos;
             const char* family = ipv6 ? "-6" : "-4";
-            if (!check_empty({family, "route", "show", "table", table,
-                              "exact", route}, "route " + route)) return false;
+            const std::vector<std::string> show = {
+                family, "route", "show", "table", table, "exact", route};
+            CommandResult result = run_ip(show);
+            // iproute2 reports ENOENT for a table that has never contained a
+            // route. That is the expected clean-start state, not a conflict.
+            if (result.exit_code != 0 &&
+                result.output.find("FIB table does not exist") == std::string::npos) {
+                error = "failed to inspect Linux TUN policy route: " + route;
+                return false;
+            }
+            if (result.exit_code == 0 && !result.output.empty()) {
+                const CommandResult removed = run_ip(
+                    {family, "route", "del", "table", table, route, "dev", name_});
+                if (removed.exit_code == 0) {
+                    result = run_ip(show);
+                    if ((result.exit_code == 0 && result.output.empty()) ||
+                        (result.exit_code != 0 &&
+                         result.output.find("FIB table does not exist") !=
+                             std::string::npos)) {
+                        TX_WARN("Removed stale Linux TUN policy route: %s", route.c_str());
+                        continue;
+                    }
+                    if (result.exit_code != 0) {
+                        error = "failed to inspect Linux TUN policy route: " + route;
+                        return false;
+                    }
+                }
+                error = "Linux TUN policy conflict: route " + route;
+                return false;
+            }
         }
 
         for (const auto& route : routes) {
@@ -595,15 +659,19 @@ public:
         return static_cast<std::ptrdiff_t>(packet_size);
     }
 
-    bool write_packet(const uint8_t* data, size_t len, std::string& error) override {
+    WriteResult write_packet(const uint8_t* data, size_t len,
+                             std::string& error) override {
         BYTE* packet = allocate_send_packet_(session_, static_cast<DWORD>(len));
         if (!packet) {
+            if (GetLastError() == ERROR_BUFFER_OVERFLOW) {
+                return WriteResult::WouldBlock;
+            }
             error = "WintunAllocateSendPacket failed";
-            return false;
+            return WriteResult::Error;
         }
         std::memcpy(packet, data, len);
         send_packet_(session_, packet);
-        return true;
+        return WriteResult::Written;
     }
 
 private:

@@ -213,7 +213,9 @@ enum class PacketParseResult {
 PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
                                   std::vector<uint8_t>& plaintext,
                                   size_t& consumed,
-                                  std::unordered_map<std::string, uint64_t>& expected_numbers) {
+                                  std::unordered_map<std::string, uint64_t>& expected_numbers,
+                                  std::unordered_map<std::string,
+                                                     std::vector<uint8_t>>& key_cache) {
     consumed = 0;
     if (!data || len < 7) return PacketParseResult::NotQuic;
     const uint8_t first = data[0];
@@ -233,6 +235,8 @@ PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
     }
     const uint8_t* dcid = data + pos;
     const std::string dcid_key(reinterpret_cast<const char*>(dcid), dcid_len);
+    std::string cache_key(reinterpret_cast<const char*>(data + 1), 4);
+    cache_key.append(reinterpret_cast<const char*>(dcid), dcid_len);
     pos += dcid_len;
     if (pos >= len) return PacketParseResult::Malformed;
     const uint8_t scid_len = data[pos++];
@@ -261,13 +265,39 @@ PacketParseResult decrypt_initial(const uint8_t* data, size_t len,
     uint8_t iv[12] = {0};
     uint8_t hp_key[16] = {0};
     uint8_t mask[kAesBlockSize] = {0};
-    bool ok = hkdf_extract(labels.salt, labels.salt_len, dcid, dcid_len, initial_secret) &&
-              hkdf_expand_label(initial_secret, "client in", client_secret,
-                                sizeof(client_secret)) &&
-              hkdf_expand_label(client_secret, labels.key_label, key, sizeof(key)) &&
-              hkdf_expand_label(client_secret, labels.iv_label, iv, sizeof(iv)) &&
-              hkdf_expand_label(client_secret, labels.hp_label, hp_key, sizeof(hp_key)) &&
-              aes_ecb_mask(hp_key, data + packet_number_offset + 4, mask);
+    bool ok = false;
+    auto cached = key_cache.find(cache_key);
+    if (cached != key_cache.end() && cached->second.size() == 44) {
+        std::memcpy(key, cached->second.data(), sizeof(key));
+        std::memcpy(iv, cached->second.data() + sizeof(key), sizeof(iv));
+        std::memcpy(hp_key, cached->second.data() + sizeof(key) + sizeof(iv),
+                    sizeof(hp_key));
+        ok = true;
+    } else {
+        ok = hkdf_extract(labels.salt, labels.salt_len, dcid, dcid_len, initial_secret) &&
+             hkdf_expand_label(initial_secret, "client in", client_secret,
+                               sizeof(client_secret)) &&
+             hkdf_expand_label(client_secret, labels.key_label, key, sizeof(key)) &&
+             hkdf_expand_label(client_secret, labels.iv_label, iv, sizeof(iv)) &&
+             hkdf_expand_label(client_secret, labels.hp_label, hp_key, sizeof(hp_key));
+        if (ok) {
+            if (key_cache.size() >= kMaxInitialPacketNumberSpaces) {
+                for (auto& item : key_cache) {
+                    if (!item.second.empty()) {
+                        OPENSSL_cleanse(item.second.data(), item.second.size());
+                    }
+                }
+                key_cache.clear();
+            }
+            std::vector<uint8_t> material;
+            material.reserve(44);
+            material.insert(material.end(), key, key + sizeof(key));
+            material.insert(material.end(), iv, iv + sizeof(iv));
+            material.insert(material.end(), hp_key, hp_key + sizeof(hp_key));
+            key_cache.emplace(cache_key, std::move(material));
+        }
+    }
+    ok = ok && aes_ecb_mask(hp_key, data + packet_number_offset + 4, mask);
     OPENSSL_cleanse(initial_secret, sizeof(initial_secret));
     OPENSSL_cleanse(client_secret, sizeof(client_secret));
     OPENSSL_cleanse(hp_key, sizeof(hp_key));
@@ -359,11 +389,19 @@ bool skip_ack_frame(const uint8_t* data, size_t len, size_t& pos, bool ecn) {
 QuicSniSniffer::QuicSniSniffer()
     : started_(false), contiguous_bytes_(0), buffered_bytes_(0) {}
 
+QuicSniSniffer::~QuicSniSniffer() { reset(); }
+
 void QuicSniSniffer::reset() {
     started_ = false;
     std::vector<uint8_t>().swap(crypto_);
     std::vector<uint8_t>().swap(present_);
     expected_packet_numbers_.clear();
+    for (auto& item : initial_keys_) {
+        if (!item.second.empty()) {
+            OPENSSL_cleanse(item.second.data(), item.second.size());
+        }
+    }
+    initial_keys_.clear();
     contiguous_bytes_ = 0;
     buffered_bytes_ = 0;
 }
@@ -413,7 +451,7 @@ QuicSniResult QuicSniSniffer::feed(const uint8_t* data, size_t len, std::string&
         size_t packet_len = 0;
         const PacketParseResult packet_result = decrypt_initial(
             data + packet_offset, len - packet_offset, plaintext, packet_len,
-            expected_packet_numbers_);
+            expected_packet_numbers_, initial_keys_);
         if (packet_result != PacketParseResult::Initial) {
             // Later packets in a coalesced datagram can be Handshake or
             // 0-RTT packets. Once an Initial was parsed, they simply provide

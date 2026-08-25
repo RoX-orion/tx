@@ -18,6 +18,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 option(TX_BUILD_APPS "Build tx_client and tx_server executables" ON)
 option(TX_BUILD_TESTS "Build unit tests" ON)
 option(TX_BUILD_SHARED "Build shared library (for Android)" OFF)
+option(TX_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 
 if(ANDROID)
     set(TX_BUILD_APPS OFF CACHE BOOL "Build tx_client and tx_server executables" FORCE)
@@ -172,6 +173,10 @@ endif()
 if(TX_BUILD_TESTS AND NOT ANDROID)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(TX_BUILD_BENCHMARKS AND NOT ANDROID)
+    add_subdirectory(benchmarks)
 endif()
 
 # Install

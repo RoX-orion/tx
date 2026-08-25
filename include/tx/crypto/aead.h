@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,8 +43,11 @@ public:
                 uint8_t* plaintext, size_t plaintext_len);
 
 private:
+    struct Impl;
+
     AeadCipherKind kind_;
     uint8_t key_[kKeyLen];
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace tx

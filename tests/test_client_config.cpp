@@ -108,6 +108,12 @@ int main() {
         "\"listen\":{\"http\":{\"port\":70000}}}", invalid_integer));
     assert(!load_text("float_capacity", strict_prefix +
         "\"dns\":{\"cache_capacity\":1.5}}", invalid_integer));
+    assert(!load_text("mapping_ttl_too_short", strict_prefix +
+        "\"dns\":{\"cache_ttl\":60,\"mapping_ttl\":59}}", invalid_integer));
+    tx::ClientConfig equal_dns_ttls;
+    assert(load_text("equal_dns_ttls", strict_prefix +
+        "\"dns\":{\"cache_ttl\":60,\"mapping_ttl\":60}}", equal_dns_ttls));
+    assert(equal_dns_ttls.dns_cache_ttl == equal_dns_ttls.dns_mapping_ttl);
     assert(!load_text("wrong_bool", strict_prefix +
         "\"udp\":{\"quic_sniff\":\"true\"}}", invalid_integer));
     assert(!load_text("empty_route_prefix", strict_prefix +

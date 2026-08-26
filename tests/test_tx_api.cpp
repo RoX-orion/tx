@@ -1,4 +1,5 @@
 #include "tx_api.h"
+#include "tx/common/log.h"
 
 #include <cassert>
 #include <atomic>
@@ -18,6 +19,25 @@
 
 static tx_handle_t fake_handle(uintptr_t value) {
     return reinterpret_cast<tx_handle_t>(value);
+}
+
+static void test_log_level_concurrency() {
+    std::atomic<bool> start{false};
+    const auto writer = [&start](tx::LogLevel first, tx::LogLevel second) {
+        while (!start.load(std::memory_order_acquire)) {}
+        for (unsigned i = 0; i < 100000; ++i)
+            tx::set_log_level((i & 1u) == 0 ? first : second);
+    };
+    std::thread first(writer, tx::LogLevel::Debug, tx::LogLevel::Warn);
+    std::thread second(writer, tx::LogLevel::Info, tx::LogLevel::Error);
+    start.store(true, std::memory_order_release);
+    for (unsigned i = 0; i < 100000; ++i) {
+        const tx::LogLevel level = tx::get_log_level();
+        assert(level >= tx::LogLevel::Debug && level <= tx::LogLevel::Off);
+    }
+    first.join();
+    second.join();
+    tx::set_log_level(tx::LogLevel::Info);
 }
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || defined(TX_PLATFORM_APPLE)
@@ -157,6 +177,7 @@ static void test_stop_from_hook_is_nonblocking() {
 #endif
 
 int main() {
+    test_log_level_concurrency();
     tx_traffic_stats_t stats{};
     const tx_handle_t fake = fake_handle(1);
     const tx_client_config_t bad_client = {"/definitely/missing/tx-client.json", nullptr};

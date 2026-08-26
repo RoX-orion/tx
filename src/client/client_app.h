@@ -345,8 +345,7 @@ private:
     void start_internal_dns_attempt(const std::string& flow_key);
     void retry_internal_dns(const std::string& flow_key, const char* reason);
     void complete_internal_dns(const std::string& flow_key,
-                               std::vector<uint8_t> response,
-                               bool notify_peer);
+                               std::vector<uint8_t> response);
     void discard_pending_udp_packets(const UdpTunnelPtr& tunnel, SessionId sid);
     void arm_internal_dns_timer();
     void schedule_udp_deadline(UdpFlow& flow, UdpDeadlineKind kind,

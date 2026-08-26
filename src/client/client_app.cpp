@@ -571,20 +571,12 @@ bool ClientApp::init(const ClientConfig& config) {
             ? config_.tun_bypass_mark : config_.tun_redirect_mark;
         dns_requires_physical_network = true;
     }
+#elif defined(TX_PLATFORM_WINDOWS)
+    // Wintun installs split default routes. Physical DNS must keep using the
+    // interfaces captured before those routes are added.
+    dns_requires_physical_network = config_.tun_enabled &&
+        (config_.tun_auto_route || !config_.tun_routes.empty());
 #endif
-    const auto direct_address_filter = [this](const std::string& address) {
-        return fake_ip_dns_.contains_address(address);
-    };
-    std::shared_ptr<DnsNetworkProvider> physical_dns_provider;
-#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_WINDOWS)
-    physical_dns_provider = create_platform_dns_network_provider(
-        dns_bypass_mark, dns_requires_physical_network);
-#else
-    (void)dns_requires_physical_network;
-#endif
-#if defined(TX_PLATFORM_ANDROID)
-    // The client has no configured DNS upstream. dns_resolver_ is only a
-    // routing facade; direct_dns_resolver_ is the physical-Network resolver.
     dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
                             DnsResolver::HostResolveHook(),
                             DnsResolver::QueryHook(),
@@ -593,26 +585,6 @@ bool ClientApp::init(const ClientConfig& config) {
                                 resolve_dns_via_tunnel(std::move(query),
                                                        std::move(callback));
                             });
-    direct_dns_resolver_.configure({}, socket_protector_, 0,
-                                   host_resolver_, dns_query_,
-                                   DnsResolver::AsyncQueryHook(),
-                                   physical_dns_provider,
-                                   direct_address_filter);
-#else
-    dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
-                            DnsResolver::HostResolveHook(),
-                            DnsResolver::QueryHook(),
-                            [this](std::vector<uint8_t> query,
-                                   DnsResolver::ResolveCallback callback) {
-                                resolve_dns_via_tunnel(std::move(query),
-                                                       std::move(callback));
-                            });
-    direct_dns_resolver_.configure({}, socket_protector_, dns_bypass_mark,
-                                   host_resolver_, dns_query_,
-                                   DnsResolver::AsyncQueryHook(),
-                                   physical_dns_provider,
-                                   direct_address_filter);
-#endif
 
     // Load router
     if (!router_.load(config.router)) {
@@ -629,15 +601,45 @@ bool ClientApp::init(const ClientConfig& config) {
                 tun_fd_, config_.tun_mtu,
                 config_.tun_tcp_stack.c_str(),
                 config_.tun_udp_stack.c_str());
-        if (!config_.tun_auto_redirect) {
-            if (!start_proxy_listeners()) {
-                return false;
-            }
-            TX_INFO("  TUN proxy bridge enabled for TCP/SOCKS compatibility");
-        }
-    } else {
+    }
+
+    // The Windows provider must be constructed only after Wintun has saved
+    // the pre-route physical interface indices in outbound_socket_policy_.
+    DnsSocketBinding fixed_dns_binding;
+#if defined(TX_PLATFORM_WINDOWS)
+    if (dns_requires_physical_network) {
+        fixed_dns_binding.ipv4_interface = outbound_socket_policy_.ipv4_interface;
+        fixed_dns_binding.ipv6_interface = outbound_socket_policy_.ipv6_interface;
+    }
+#endif
+    std::shared_ptr<DnsNetworkProvider> physical_dns_provider;
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_WINDOWS)
+    physical_dns_provider = create_platform_dns_network_provider(
+        dns_bypass_mark, dns_requires_physical_network, fixed_dns_binding);
+#else
+    (void)dns_requires_physical_network;
+    (void)fixed_dns_binding;
+#endif
+    const auto direct_address_filter = [this](const std::string& address) {
+        return fake_ip_dns_.contains_address(address);
+    };
+#if defined(TX_PLATFORM_ANDROID)
+    const uint32_t direct_dns_bypass_mark = 0;
+#else
+    const uint32_t direct_dns_bypass_mark = dns_bypass_mark;
+#endif
+    direct_dns_resolver_.configure({}, socket_protector_, direct_dns_bypass_mark,
+                                   host_resolver_, dns_query_,
+                                   DnsResolver::AsyncQueryHook(),
+                                   physical_dns_provider,
+                                   direct_address_filter);
+
+    if (!config_.tun_enabled || !config_.tun_auto_redirect) {
         if (!start_proxy_listeners()) {
             return false;
+        }
+        if (config_.tun_enabled) {
+            TX_INFO("  TUN proxy bridge enabled for TCP/SOCKS compatibility");
         }
     }
     if (!start_udp_cleanup_timer()) {
@@ -1259,7 +1261,8 @@ bool ClientApp::ensure_direct_udp_relay(const std::string& flow_key, UdpFlow& fl
         const uint32_t interface_index = target_family == AF_INET6
             ? outbound_socket_policy_.ipv6_interface
             : outbound_socket_policy_.ipv4_interface;
-        DWORD index = htonl(interface_index);
+        const DWORD index =
+            windows_unicast_interface_value(target_family, interface_index);
         int level = target_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
         int option = target_family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
         if (setsockopt(socket_fd, level, option,
@@ -1943,7 +1946,7 @@ void ClientApp::start_internal_dns_attempt(const std::string& flow_key) {
 
     UdpTunnelPtr tunnel = get_udp_tunnel(flow.outbound, UdpTunnelKind::Dns);
     if (!tunnel) {
-        complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
+        complete_internal_dns(flow_key, std::vector<uint8_t>());
         return;
     }
     flow.udp_tunnel_key = tunnel->key;
@@ -1964,18 +1967,20 @@ void ClientApp::retry_internal_dns(const std::string& flow_key, const char* reas
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) return;
     TX_WARN("TX system DNS query failed (%s)", reason ? reason : "unknown");
-    complete_internal_dns(flow_key, std::vector<uint8_t>(), false);
+    complete_internal_dns(flow_key, std::vector<uint8_t>());
 }
 
 void ClientApp::complete_internal_dns(const std::string& flow_key,
-                                      std::vector<uint8_t> response,
-                                      bool notify_peer) {
+                                      std::vector<uint8_t> response) {
     auto it = udp_flows_.find(flow_key);
     if (it == udp_flows_.end() || it->second.kind != UdpFlowKind::InternalDns) return;
     auto callback = std::move(it->second.dns_callback);
     it->second.dns_deadline_ms = 0;
     ++it->second.deadline_generation;
-    remove_udp_flow(flow_key, notify_peer);
+    // DnsResponse completes the server-side SID before it reaches us. Sending
+    // DISCONNECT here would therefore target an already-finished DNS query and
+    // make the server close the shared DNS tunnel as a protocol violation.
+    remove_udp_flow(flow_key, false);
     if (callback) callback(std::move(response));
 }
 
@@ -2095,7 +2100,7 @@ void ClientApp::on_udp_tunnel_read(const UdpTunnelPtr& tunnel, Buffer& data) {
                     retry_internal_dns(flow_key, "mismatched DNS response");
                 } else {
                     record_traffic(RouteAction::Proxy, false, response.size());
-                    complete_internal_dns(flow_key, std::move(response), true);
+                    complete_internal_dns(flow_key, std::move(response));
                 }
             } else if (cmd == TunnelCmd::Disconnect) {
                 retry_internal_dns(flow_key, "remote DNS session closed");

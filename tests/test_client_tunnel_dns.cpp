@@ -269,6 +269,70 @@ void test_dns_waits_for_server_failover() {
     assert(result == expected);
 }
 
+void test_completed_dns_query_keeps_shared_tunnel_alive() {
+    const uint16_t port = reserve_tcp_port();
+    auto fast_query = make_query("fast.example");
+    auto slow_query = make_query("slow.example");
+    slow_query[1] = 0x35;
+    const auto fast_response = response_for(fast_query);
+    const auto slow_response = response_for(slow_query);
+
+    tx::ServerApp server;
+    tx::ServerConfig server_config;
+    server_config.listen_host = "127.0.0.1";
+    server_config.listen_port = port;
+    server_config.psk.assign(32, 0x42);
+    assert(server.init(server_config));
+    std::atomic<unsigned> server_queries{0};
+    tx::ServerAppDnsTest::configure_query_hook(server,
+        [&server_queries](const uint8_t* data, size_t len) {
+            ++server_queries;
+            std::vector<uint8_t> query(data, data + len);
+            if (query.size() >= 2 && query[1] == 0x35) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+            return response_for(query);
+        });
+    std::thread server_thread([&server]() { server.run(); });
+
+    tx::ClientApp client;
+    assert(client.init(config_for("full:example", tx::OutboundType::Tx, port)));
+    std::vector<uint8_t> fast_result;
+    std::vector<uint8_t> slow_result;
+    std::atomic<unsigned> callbacks{0};
+    std::atomic<bool> done{false};
+    const auto finish = [&client, &callbacks, &done]() {
+        if (callbacks.fetch_add(1) + 1 == 2) {
+            done.store(true);
+            client.stop();
+        }
+    };
+    tx::ClientAppDnsTest::resolve(client, fast_query,
+        [&fast_result, &finish](std::vector<uint8_t> response) {
+            fast_result = std::move(response);
+            finish();
+        });
+    tx::ClientAppDnsTest::resolve(client, slow_query,
+        [&slow_result, &finish](std::vector<uint8_t> response) {
+            slow_result = std::move(response);
+            finish();
+        });
+    std::thread client_thread([&client]() { client.run(); });
+
+    for (unsigned i = 0; i < 100 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!done.load()) client.stop();
+    client_thread.join();
+    server.stop();
+    server_thread.join();
+
+    assert(done.load());
+    assert(callbacks.load() == 2);
+    assert(server_queries.load() == 2);
+    assert(fast_result == fast_response);
+    assert(slow_result == slow_response);
+}
+
 void test_android_physical_network_address_family_filter() {
     tx::ClientApp app(tx::SocketProtectCallback(), tx::DnsResolver::HostResolveHook(),
                       tx::DnsResolver::QueryHook(),
@@ -295,6 +359,7 @@ int main() {
     test_android_tx_server_requires_numeric_host();
     test_dns_tunnel_is_separate();
     test_dns_waits_for_server_failover();
+    test_completed_dns_query_keeps_shared_tunnel_alive();
     test_android_physical_network_address_family_filter();
     std::printf("client tunnel DNS tests passed\n");
     return 0;

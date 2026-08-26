@@ -553,7 +553,12 @@ public:
 
         get_adapter_luid_(adapter_, &luid_);
         if (config.tun_auto_config &&
-            !configure_interface(config, error)) {
+            !configure_addresses(config, error)) {
+            close();
+            return false;
+        }
+        if ((config.tun_auto_route || !config.tun_routes.empty()) &&
+            !configure_routes(config, error)) {
             close();
             return false;
         }
@@ -743,7 +748,7 @@ private:
         return reinterpret_cast<T>(GetProcAddress(dll_, name));
     }
 
-    bool configure_interface(const ClientConfig& config, std::string& error) {
+    bool configure_addresses(const ClientConfig& config, std::string& error) {
         for (const auto& cidr : config.tun_addresses) {
             SOCKADDR_INET interface_addr{};
             UINT8 interface_prefix = 0;
@@ -764,6 +769,10 @@ private:
             if (r == NO_ERROR) installed_addresses_.push_back(row);
         }
 
+        return true;
+    }
+
+    bool configure_routes(const ClientConfig& config, std::string& error) {
         std::vector<std::string> routes = config.tun_routes;
         if (config.tun_auto_route && routes.empty()) {
             routes = {"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"};

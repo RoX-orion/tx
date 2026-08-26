@@ -1,6 +1,7 @@
 #include "tx/net/dns_resolver.h"
 #include "tx/net/dns_network_provider.h"
 #include "tx/common/endian.h"
+#include "tx/common/network.h"
 
 #include <cassert>
 #include <chrono>
@@ -12,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -52,7 +53,7 @@ std::vector<uint8_t> make_a_response(const std::vector<uint8_t>& query,
     return response;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 bool is_loopback(const std::string& address) {
     in_addr address4{};
     if (inet_pton(AF_INET, address.c_str(), &address4) == 1)
@@ -308,6 +309,8 @@ void test_address_filter() {
 } // namespace
 
 int main() {
+    assert(tx::windows_unicast_interface_value(AF_INET, 12) == htonl(12));
+    assert(tx::windows_unicast_interface_value(AF_INET6, 12) == 12);
     const auto wire_query = make_query();
     auto wire_response = make_response(wire_query);
     assert(tx::DnsResolver::response_matches_query(wire_query, wire_response));
@@ -380,8 +383,10 @@ int main() {
     });
     assert(async_called && async_done);
     assert(uv_loop_close(&loop) == 0);
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     test_first_success_and_validation();
+#endif
+#if defined(__linux__)
     test_platform_dns_provider_policy();
 #endif
     test_address_filter();

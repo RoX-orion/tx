@@ -16,7 +16,8 @@
 
 #include <openssl/rand.h>
 
-#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID)
+#if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
+    defined(TX_PLATFORM_APPLE)
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
@@ -232,7 +233,7 @@ bool response_contains_filtered_address(
 } // namespace
 
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
-    defined(TX_PLATFORM_WINDOWS)
+    defined(TX_PLATFORM_APPLE) || defined(TX_PLATFORM_WINDOWS)
 namespace {
 
 #if defined(TX_PLATFORM_WINDOWS)
@@ -316,7 +317,8 @@ bool configure_socket(DnsSocket fd, int family,
     const uint32_t interface_index = family == AF_INET6
         ? binding.ipv6_interface : binding.ipv4_interface;
     if (interface_index != 0) {
-        const DWORD network_index = htonl(interface_index);
+        const DWORD network_index =
+            windows_unicast_interface_value(family, interface_index);
         const int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
         const int option = family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
         if (setsockopt(fd, level, option,
@@ -755,7 +757,16 @@ bool resolve_tcp(const DnsEndpoint& upstream, const std::vector<uint8_t>& query,
                 dns_socket_error());
         return false;
     }
-    bool ok = configure_socket(fd, address.ss_family, protector, binding);
+    bool ok = true;
+#if defined(TX_PLATFORM_APPLE)
+    const int no_sigpipe = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
+                   sizeof(no_sigpipe)) != 0) {
+        TX_WARN("SO_NOSIGPIPE failed for DNS TCP socket: %s", std::strerror(errno));
+        ok = false;
+    }
+#endif
+    ok = ok && configure_socket(fd, address.ss_family, protector, binding);
     set_dns_socket_timeout(fd, 100);
     if (ok && !connect_with_timeout(fd, reinterpret_cast<sockaddr*>(&address),
                                     address_len, 1000, cancelled)) {
@@ -978,7 +989,7 @@ void DnsResolver::on_work(uv_work_t* work) {
         return;
     }
 #if defined(TX_PLATFORM_LINUX) || defined(TX_PLATFORM_ANDROID) || \
-    defined(TX_PLATFORM_WINDOWS)
+    defined(TX_PLATFORM_APPLE) || defined(TX_PLATFORM_WINDOWS)
     // uv_queue_work already uses libuv's bounded worker pool. Do all upstream
     // attempts in that worker instead of spawning two native threads per DNS
     // request, which allowed a burst of queries to exhaust process resources.

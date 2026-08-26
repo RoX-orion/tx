@@ -7,6 +7,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <utility>
 
 #if defined(TX_PLATFORM_LINUX)
 #include <arpa/inet.h>
@@ -379,14 +380,15 @@ private:
 #if defined(TX_PLATFORM_WINDOWS)
 
 bool append_windows_endpoint(const sockaddr* address, int length,
-                             std::vector<DnsEndpoint>& endpoints) {
+                             std::vector<DnsEndpoint>& endpoints,
+                             bool allow_loopback) {
     if (!address || (address->sa_family != AF_INET && address->sa_family != AF_INET6))
         return false;
-    if (address->sa_family == AF_INET &&
+    if (!allow_loopback && address->sa_family == AF_INET &&
         (ntohl(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr) >> 24) == 127) {
         return false;
     }
-    if (address->sa_family == AF_INET6 &&
+    if (!allow_loopback && address->sa_family == AF_INET6 &&
         IN6_IS_ADDR_LOOPBACK(&reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr)) {
         return false;
     }
@@ -407,23 +409,31 @@ bool append_windows_endpoint(const sockaddr* address, int length,
 
 class WindowsDnsNetworkProvider final : public SnapshotProviderBase {
 public:
+    WindowsDnsNetworkProvider(bool require_physical_network,
+                              DnsSocketBinding fixed_socket_binding)
+        : require_physical_network_(require_physical_network),
+          fixed_socket_binding_(std::move(fixed_socket_binding)) {}
+
     DnsNetworkSnapshot snapshot() const override {
         DnsNetworkSnapshot result;
-        sockaddr_in destination4{};
-        destination4.sin_family = AF_INET;
-        InetPtonA(AF_INET, "8.8.8.8", &destination4.sin_addr);
-        DWORD interface4 = 0;
-        GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination4),
-                           &interface4);
-        result.socket_binding.ipv4_interface = interface4;
+        DWORD interface4 = fixed_socket_binding_.ipv4_interface;
+        DWORD interface6 = fixed_socket_binding_.ipv6_interface;
+        if (!require_physical_network_) {
+            sockaddr_in destination4{};
+            destination4.sin_family = AF_INET;
+            InetPtonA(AF_INET, "8.8.8.8", &destination4.sin_addr);
+            GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination4),
+                               &interface4);
 
-        sockaddr_in6 destination6{};
-        destination6.sin6_family = AF_INET6;
-        InetPtonA(AF_INET6, "2001:4860:4860::8888", &destination6.sin6_addr);
-        DWORD interface6 = 0;
-        GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination6),
-                           &interface6);
-        result.socket_binding.ipv6_interface = interface6;
+            sockaddr_in6 destination6{};
+            destination6.sin6_family = AF_INET6;
+            InetPtonA(AF_INET6, "2001:4860:4860::8888", &destination6.sin6_addr);
+            GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&destination6),
+                               &interface6);
+        } else {
+            result.socket_binding.ipv4_interface = interface4;
+            result.socket_binding.ipv6_interface = interface6;
+        }
 
         ULONG buffer_size = 15000;
         std::vector<uint8_t> buffer(buffer_size);
@@ -441,18 +451,20 @@ public:
         if (status == NO_ERROR) {
             for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
                 if (adapter->OperStatus != IfOperStatusUp) continue;
-                const bool selected =
-                    (result.socket_binding.ipv4_interface != 0 &&
-                     adapter->IfIndex == result.socket_binding.ipv4_interface) ||
-                    (result.socket_binding.ipv6_interface != 0 &&
-                     adapter->Ipv6IfIndex == result.socket_binding.ipv6_interface);
-                if (!selected) continue;
+                const bool selected4 = interface4 != 0 && adapter->IfIndex == interface4;
+                const bool selected6 = interface6 != 0 &&
+                    adapter->Ipv6IfIndex == interface6;
+                if (!selected4 && !selected6) continue;
                 for (auto* dns = adapter->FirstDnsServerAddress; dns; dns = dns->Next) {
-                    if (dns->Address.lpSockaddr)
-                        append_windows_endpoint(
-                            dns->Address.lpSockaddr,
-                            static_cast<int>(dns->Address.iSockaddrLength),
-                            result.endpoints);
+                    const sockaddr* address = dns->Address.lpSockaddr;
+                    if (!address ||
+                        (address->sa_family == AF_INET && !selected4) ||
+                        (address->sa_family == AF_INET6 && !selected6)) {
+                        continue;
+                    }
+                    append_windows_endpoint(
+                        address, static_cast<int>(dns->Address.iSockaddrLength),
+                        result.endpoints, !require_physical_network_);
                 }
             }
         }
@@ -460,6 +472,10 @@ public:
     }
 
     void invalidate() override { invalidate_snapshot(); }
+
+private:
+    bool require_physical_network_;
+    DnsSocketBinding fixed_socket_binding_;
 };
 
 #endif
@@ -467,16 +483,19 @@ public:
 } // namespace
 
 std::shared_ptr<DnsNetworkProvider> create_platform_dns_network_provider(
-    uint32_t bypass_mark, bool require_physical_network) {
+    uint32_t bypass_mark, bool require_physical_network,
+    DnsSocketBinding fixed_socket_binding) {
 #if defined(TX_PLATFORM_LINUX)
+    (void)fixed_socket_binding;
     return std::make_shared<LinuxDnsNetworkProvider>(bypass_mark, require_physical_network);
 #elif defined(TX_PLATFORM_WINDOWS)
     (void)bypass_mark;
-    (void)require_physical_network;
-    return std::make_shared<WindowsDnsNetworkProvider>();
+    return std::make_shared<WindowsDnsNetworkProvider>(
+        require_physical_network, std::move(fixed_socket_binding));
 #else
     (void)bypass_mark;
     (void)require_physical_network;
+    (void)fixed_socket_binding;
     return nullptr;
 #endif
 }

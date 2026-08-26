@@ -302,6 +302,10 @@ bool ClientConfig::validate() const {
         TX_ERROR("dns.mapping_ttl must be between 1 and 604800 seconds");
         return false;
     }
+    if (dns_mapping_ttl < dns_cache_ttl) {
+        TX_ERROR("dns.mapping_ttl must be greater than or equal to dns.cache_ttl");
+        return false;
+    }
     if (dns_cache_capacity == 0 || dns_cache_capacity > 1000000) {
         TX_ERROR("dns.cache_capacity must be between 1 and 1000000");
         return false;

@@ -121,7 +121,7 @@ bool ensure_outbound_socket(uv_tcp_t* tcp, int family,
     if (!index) return true;
     SOCKET socket_fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (socket_fd == INVALID_SOCKET) return false;
-    DWORD network_index = htonl(index);
+    const DWORD network_index = windows_unicast_interface_value(family, index);
     int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
     int option = family == AF_INET6 ? IPV6_UNICAST_IF : IP_UNICAST_IF;
     if (setsockopt(socket_fd, level, option,

@@ -1,4 +1,5 @@
 #include "tx/common/log.h"
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -9,11 +10,11 @@
 
 namespace tx {
 
-static LogLevel g_level = LogLevel::Info;
+static std::atomic<LogLevel> g_level{LogLevel::Info};
 static FILE* g_log_file = nullptr;
 
-void set_log_level(LogLevel level) { g_level = level; }
-LogLevel get_log_level() { return g_level; }
+void set_log_level(LogLevel level) { g_level.store(level, std::memory_order_relaxed); }
+LogLevel get_log_level() { return g_level.load(std::memory_order_relaxed); }
 void set_log_file(FILE* fp) { g_log_file = fp; }
 
 static const char* level_str(LogLevel level) {

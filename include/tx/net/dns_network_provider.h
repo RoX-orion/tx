@@ -41,8 +41,11 @@ public:
 
 // Creates the platform physical-network provider used by client direct DNS.
 // Android deliberately returns nullptr: its Network-bound resolver hooks are
-// the platform backend and are injected through ClientApp instead.
+// the platform backend and are injected through ClientApp instead. On Windows
+// fixed_socket_binding carries the physical interfaces captured before Wintun
+// installs its routes.
 std::shared_ptr<DnsNetworkProvider> create_platform_dns_network_provider(
-    uint32_t bypass_mark = 0, bool require_physical_network = false);
+    uint32_t bypass_mark = 0, bool require_physical_network = false,
+    DnsSocketBinding fixed_socket_binding = DnsSocketBinding());
 
 } // namespace tx
